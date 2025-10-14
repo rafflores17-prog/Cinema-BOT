@@ -1,4 +1,4 @@
-# ================= BOT DE CINEMA v2.3 (Links Corrigidos) =================
+# ================= BOT DE CINEMA v3.0 (com Banco de Dados PostgreSQL) =================
 import html
 import requests
 import random
@@ -7,34 +7,92 @@ import threading
 import json
 import logging
 import os
+import psycopg2
+from urllib.parse import urlparse
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
 # ================= CONFIGURAÇÕES =================
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY")
+DATABASE_URL = os.environ.get("DATABASE_URL") # Nova variável para o banco de dados
 
-if not TOKEN or not TMDB_API_KEY:
-    print("ERRO CRÍTICO: As variáveis de ambiente TELEGRAM_TOKEN e TMDB_API_KEY não foram definidas!")
+if not all([TOKEN, TMDB_API_KEY, DATABASE_URL]):
+    print("ERRO CRÍTICO: Verifique as variáveis de ambiente TELEGRAM_TOKEN, TMDB_API_KEY e DATABASE_URL!")
     exit()
 
-# CORREÇÃO AQUI: URL sem formatação de markdown
 TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w500"
-SUBSCRIBED_FILE = "subscribed_chats.json"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(message)s")
 
-# ================= CARREGAMENTO DE DADOS =================
-try:
-    with open(SUBSCRIBED_FILE, "r", encoding="utf-8") as f:
-        subscribed_chats = set(json.load(f))
-except (FileNotFoundError, json.JSONDecodeError):
-    subscribed_chats = set()
+# ================= FUNÇÕES DO BANCO DE DADOS =================
+def get_db_connection():
+    """Cria e retorna uma conexão com o banco de dados."""
+    result = urlparse(DATABASE_URL)
+    conn = psycopg2.connect(
+        dbname=result.path[1:],
+        user=result.username,
+        password=result.password,
+        host=result.hostname,
+        port=result.port
+    )
+    return conn
 
-def salvar_chats():
-    with open(SUBSCRIBED_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(subscribed_chats), f)
+def setup_database():
+    """Cria a tabela de chats se ela não existir."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS subscribed_chats (
+            chat_id BIGINT PRIMARY KEY
+        );
+    ''')
+    conn.commit()
+    cur.close()
+    conn.close()
+    logging.info("Banco de dados verificado/configurado com sucesso.")
 
+def add_chat_to_db(chat_id):
+    """Adiciona um novo chat_id ao banco de dados."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO subscribed_chats (chat_id) VALUES (%s) ON CONFLICT (chat_id) DO NOTHING;", (chat_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logging.error(f"Erro ao adicionar chat {chat_id} ao DB: {e}")
+
+def get_all_chats_from_db():
+    """Retorna uma lista de todos os chat_ids inscritos."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT chat_id FROM subscribed_chats;")
+        chats = [item[0] for item in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return chats
+    except Exception as e:
+        logging.error(f"Erro ao buscar chats do DB: {e}")
+        return []
+
+def remove_chat_from_db(chat_id):
+    """Remove um chat_id do banco de dados."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM subscribed_chats WHERE chat_id = %s;", (chat_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        logging.info(f"Chat {chat_id} removido do DB.")
+    except Exception as e:
+        logging.error(f"Erro ao remover chat {chat_id} do DB: {e}")
+
+
+# (O resto do seu código, com a lógica de filmes, continua aqui... nada foi alterado)
 # ================= LISTAS E DADOS =================
 CATEGORIAS = ["now_playing", "popular", "upcoming", "top_rated"]
 GENEROS = {
@@ -46,7 +104,6 @@ def escape_html(text: str) -> str: return html.escape(text or "")
 def cortar_texto(texto: str, limite: int = 350) -> str: return texto[:limite] + ("..." if len(texto) > limite else "")
 
 def make_tmdb_request(endpoint, params):
-    # CORREÇÃO AQUI: URL sem formatação de markdown
     base_url = "https://api.themoviedb.org/3"
     full_url = f"{base_url}/{endpoint}"
     default_params = {"api_key": TMDB_API_KEY, "language": "pt-BR"}
@@ -65,7 +122,6 @@ def get_trailer_link(movie_id):
     videos = data["results"]
     for video in videos:
         if video["site"] == "YouTube" and video["type"] == "Trailer" and video.get("official"):
-            # CORREÇÃO AQUI: URL sem formatação de markdown
             return f"https://www.youtube.com/watch?v={video['key']}"
     for video in videos:
         if video["site"] == "YouTube" and video["type"] == "Trailer":
@@ -104,7 +160,6 @@ def format_movie_message(movie):
     genre_ids = movie.get("genre_ids", [])
     genres_str = ", ".join([GENEROS.get(gid, "") for gid in genre_ids if gid in GENEROS]) or "N/A"
     stars = "⭐" * round(rating / 2) + "☆" * (5 - round(rating / 2))
-    # CORREÇÃO AQUI: URL sem formatação de markdown
     return (f"🎬 <b>{title}</b>\n\n{stars} ({rating:.1f}/10)\n📅 <b>Lançamento:</b> {release_date}\n🎭 <b>Gêneros:</b> {genres_str}\n\n📖 <b>Sinopse:</b>\n{overview}\n\n🔗 https://www.themoviedb.org/movie/{movie.get('id', '')}")
 
 def format_series_message(series):
@@ -113,7 +168,6 @@ def format_series_message(series):
     overview = cortar_texto(escape_html(series.get("overview", "Sinopse não disponível.")))
     first_air_date = series.get("first_air_date", "Data desconhecida")
     stars = "⭐" * round(rating / 2) + "☆" * (5 - round(rating / 2))
-    # CORREÇÃO AQUI: URL sem formatação de markdown
     return (f"📺 <b>{title}</b>\n\n{stars} ({rating:.1f}/10)\n📅 <b>Estreia:</b> {first_air_date}\n\n📖 <b>Sinopse:</b>\n{overview}\n\n🔗 https://www.themoviedb.org/tv/{series.get('id', '')}")
 
 async def send_movie_info(context: ContextTypes.DEFAULT_TYPE, chat_id: int, movie: dict):
@@ -142,8 +196,7 @@ async def send_series_info(context: ContextTypes.DEFAULT_TYPE, chat_id: int, ser
         logging.error(f"Erro ao enviar info de série: {e}")
 
 async def start_cinema(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    subscribed_chats.add(update.message.chat.id)
-    salvar_chats()
+    add_chat_to_db(update.message.chat.id) # MODIFICADO
     keyboard = [['🎬 Filmes em Cartaz', '🌟 Populares'], ['🚀 Em Breve', '🏆 Melhores Avaliados'],
                 ['📺 Séries Populares', '🎲 Sugestão Aleatória'], ['🔍 Buscar Filme', '🎭 Por Gênero']]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -227,8 +280,9 @@ async def filmes_por_genero(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ ID deve ser número. Exemplo: /genero 28", parse_mode='HTML')
 
 async def agendador_job(context: ContextTypes.DEFAULT_TYPE):
+    subscribed_chats = get_all_chats_from_db() # MODIFICADO
     logging.info(f"Agendador a executar para {len(subscribed_chats)} chats.")
-    for chat_id in list(subscribed_chats):
+    for chat_id in subscribed_chats:
         try:
             suggestion = get_random_movie()
             if suggestion:
@@ -237,11 +291,11 @@ async def agendador_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.error(f"Erro no agendador para o chat {chat_id}: {e}")
             if "Forbidden" in str(e) or "bot was blocked" in str(e):
-                logging.info(f"A remover o chat {chat_id} por estar bloqueado.")
-                subscribed_chats.discard(chat_id)
-                salvar_chats()
+                remove_chat_from_db(chat_id) # MODIFICADO
 
 def main():
+    setup_database() # Garante que a tabela existe ao iniciar
+    
     application = Application.builder().token(TOKEN).build()
     
     application.add_handler(CommandHandler(['start', 'cinema'], start_cinema))
@@ -260,7 +314,7 @@ def main():
     job_queue = application.job_queue
     job_queue.run_repeating(agendador_job, interval=10800, first=10)
     
-    logging.info("🎬 A iniciar o Bot de Cinema (v2.3 com Links Corrigidos)...")
+    logging.info("🎬 A iniciar o Bot de Cinema (v3.0 com Banco de Dados)...")
     application.run_polling()
 
 if __name__ == "__main__":

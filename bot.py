@@ -1,4 +1,4 @@
-# ================= BOT DE CINEMA CORRIGIDO PARA A NOVA BIBLIOTECA =================
+# ================= BOT DE CINEMA v2.0 (com Trailers) =================
 import html
 import requests
 import random
@@ -7,8 +7,8 @@ import threading
 import json
 import logging
 import os
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
 # ================= CONFIGURAÇÕES =================
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -41,10 +41,10 @@ GENEROS = {
 }
 MENSAGENS_BOAS_VINDAS = ["🎉 Bem-vindo(a), {nome}!", "🌟 Olá {nome}! Seja muito bem-vindo(a) ao grupo!"]
 
-# ... (O resto das suas funções, como make_tmdb_request, format_movie_message, etc., continuam iguais)
 def escape_html(text: str) -> str: return html.escape(text or "")
 def cortar_texto(texto: str, limite: int = 350) -> str: return texto[:limite] + ("..." if len(texto) > limite else "")
 
+# ================= FUNÇÕES DE API (com adição para trailers) =================
 def make_tmdb_request(endpoint, params):
     base_url = "https://api.themoviedb.org/3"
     full_url = f"{base_url}/{endpoint}"
@@ -57,6 +57,15 @@ def make_tmdb_request(endpoint, params):
     except requests.exceptions.RequestException as e:
         logging.error(f"Erro de conexão com TMDB: {e}")
         return None
+
+def get_trailer_link(movie_id):
+    """Busca o link do trailer de um filme no YouTube."""
+    data = make_tmdb_request(f"movie/{movie_id}/videos", {})
+    if data and data.get("results"):
+        for video in data["results"]:
+            if video["site"] == "YouTube" and video["type"] == "Trailer" and video.get("official"):
+                return f"https://www.youtube.com/watch?v={video['key']}"
+    return None
 
 def get_movies_by_category(category, limit=5):
     data = make_tmdb_request(f"movie/{category}", {"region": "BR", "page": 1})
@@ -79,6 +88,7 @@ def get_popular_series(limit=5):
     data = make_tmdb_request("tv/popular", {"page": 1})
     return data.get("results", [])[:limit] if data else []
 
+# ================= FUNÇÕES DE FORMATAÇÃO E ENVIO =================
 def format_movie_message(movie):
     title = escape_html(movie.get("title", "Título desconhecido"))
     rating = movie.get("vote_average", 0)
@@ -101,14 +111,21 @@ async def send_movie_info(context: ContextTypes.DEFAULT_TYPE, chat_id: int, movi
     try:
         caption = format_movie_message(movie)
         poster_path = movie.get("poster_path")
+        movie_id = movie.get("id")
+
+        # CRIA O BOTÃO DE TRAILER
+        keyboard = [[InlineKeyboardButton("🎬 Ver Trailer", callback_data=f"trailer_{movie_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
         if poster_path:
-            await context.bot.send_photo(chat_id, f"{TMDB_IMAGE_BASE_URL}{poster_path}", caption=caption, parse_mode='HTML')
+            await context.bot.send_photo(chat_id, f"{TMDB_IMAGE_BASE_URL}{poster_path}", caption=caption, parse_mode='HTML', reply_markup=reply_markup)
         else:
-            await context.bot.send_message(chat_id, caption, parse_mode='HTML')
+            await context.bot.send_message(chat_id, caption, parse_mode='HTML', reply_markup=reply_markup)
     except Exception as e:
         logging.error(f"Erro ao enviar info de filme: {e}")
 
 async def send_series_info(context: ContextTypes.DEFAULT_TYPE, chat_id: int, series: dict):
+    # (Função de séries permanece a mesma por enquanto, sem botão de trailer)
     try:
         caption = format_series_message(series)
         poster_path = series.get("poster_path")
@@ -119,7 +136,7 @@ async def send_series_info(context: ContextTypes.DEFAULT_TYPE, chat_id: int, ser
     except Exception as e:
         logging.error(f"Erro ao enviar info de série: {e}")
 
-# ================= COMANDOS =================
+# ================= HANDLERS DE COMANDOS E BOTÕES =================
 async def start_cinema(update: Update, context: ContextTypes.DEFAULT_TYPE):
     subscribed_chats.add(update.message.chat.id)
     salvar_chats()
@@ -129,6 +146,20 @@ async def start_cinema(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🎬 <b>Bot de Cinema!</b>\n\nBem-vindo(a)! Use os botões para explorar.",
                                     parse_mode='HTML', reply_markup=reply_markup)
 
+# NOVA FUNÇÃO PARA LIDAR COM O CLIQUE NO BOTÃO DE TRAILER
+async def trailer_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer() # Responde ao clique
+    
+    movie_id = query.data.split('_')[1] # Pega o ID do filme (ex: 'trailer_12345')
+    trailer_link = get_trailer_link(movie_id)
+
+    if trailer_link:
+        await query.message.reply_text(f"Aqui está o trailer:\n{trailer_link}")
+    else:
+        await query.message.reply_text("Desculpe, não consegui encontrar um trailer para este filme.")
+
+# (O resto dos seus comandos continuam aqui...)
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for new_user in update.message.new_chat_members:
         nome = escape_html(new_user.first_name)
@@ -145,7 +176,6 @@ async def send_movie_list(update: Update, context: ContextTypes.DEFAULT_TYPE, ca
     else:
         await update.message.reply_text(f"❌ Não foi possível encontrar filmes para {title}.")
 
-# ... Handlers ...
 async def lancamentos(update: Update, context: ContextTypes.DEFAULT_TYPE): await send_movie_list(update, context, "now_playing", "Filmes em Cartaz")
 async def populares(update: Update, context: ContextTypes.DEFAULT_TYPE): await send_movie_list(update, context, "popular", "Filmes Populares")
 async def em_breve(update: Update, context: ContextTypes.DEFAULT_TYPE): await send_movie_list(update, context, "upcoming", "Filmes em Breve")
@@ -228,7 +258,7 @@ def main():
     application.add_handler(CommandHandler('filme', buscar_filme))
     application.add_handler(CommandHandler('genero', filmes_por_genero))
 
-    # Mensagens de texto (botões)
+    # Mensagens de texto (botões de menu)
     application.add_handler(MessageHandler(filters.Regex('^🎬 Filmes em Cartaz$'), lancamentos))
     application.add_handler(MessageHandler(filters.Regex('^🌟 Populares$'), populares))
     application.add_handler(MessageHandler(filters.Regex('^🚀 Em Breve$'), em_breve))
@@ -238,15 +268,20 @@ def main():
     application.add_handler(MessageHandler(filters.Regex('^🔍 Buscar Filme$'), prompt_buscar_filme))
     application.add_handler(MessageHandler(filters.Regex('^🎭 Por Gênero$'), listar_generos))
     
+    # ADICIONA O HANDLER PARA O BOTÃO DE TRAILER
+    application.add_handler(CallbackQueryHandler(trailer_button_handler, pattern='^trailer_'))
+    
     # Outros eventos
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
 
     # Agendador
     job_queue = application.job_queue
-    job_queue.run_repeating(agendador_job, interval=10800, first=10) # Roda a cada 3h, começa em 10s
+    job_queue.run_repeating(agendador_job, interval=10800, first=10)
     
-    logging.info("🎬 Iniciando Bot de Cinema (versão corrigida)...")
+    logging.info("🎬 Iniciando Bot de Cinema (v2.0 com Trailers)...")
     application.run_polling()
 
 if __name__ == "__main__":
     main()
+
+

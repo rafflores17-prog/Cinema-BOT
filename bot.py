@@ -1,73 +1,50 @@
-# ================= BOT DE CINEMA MELHORADO E SEGURO =================
+# ================= BOT DE CINEMA CORRIGIDO PARA A NOVA BIBLIOTECA =================
 import html
 import requests
-import telebot
 import random
 import time
 import threading
 import json
 import logging
 import os
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ================= CONFIGURAÇÕES =================
-# As chaves secretas agora são lidas das variáveis de ambiente do Railway
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY")
 
 if not TOKEN or not TMDB_API_KEY:
-    print("ERRO CRÍTICO: As variáveis de ambiente TELEGRAM_TOKEN e TMDB_API_KEY não foram definidas!")
+    print("ERRO CRÍTICO: Variáveis de ambiente TELEGRAM_TOKEN e TMDB_API_KEY não definidas!")
     exit()
 
 TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w500"
 SUBSCRIBED_FILE = "subscribed_chats.json"
 
-# ================= LOGGING =================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - [%(levelname)s] - %(message)s",
-    handlers=[logging.StreamHandler()] # No Railway, é melhor usar StreamHandler para ver os logs no painel
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(message)s")
 
-# ================= BOT PRINCIPAL =================
-bot = telebot.TeleBot(TOKEN)
-
-# ================= VARIÁVEIS GLOBAIS =================
-if os.path.exists(SUBSCRIBED_FILE):
-    try:
-        with open(SUBSCRIBED_FILE, "r", encoding="utf-8") as f:
-            subscribed_chats = set(json.load(f))
-    except (json.JSONDecodeError, FileNotFoundError):
-        subscribed_chats = set()
-else:
+# ================= CARREGAMENTO DE DADOS =================
+try:
+    with open(SUBSCRIBED_FILE, "r", encoding="utf-8") as f:
+        subscribed_chats = set(json.load(f))
+except (FileNotFoundError, json.JSONDecodeError):
     subscribed_chats = set()
 
 def salvar_chats():
     with open(SUBSCRIBED_FILE, "w", encoding="utf-8") as f:
         json.dump(list(subscribed_chats), f)
 
-# (O resto do seu código, com toda a lógica de filmes, continua aqui... nada foi alterado)
-# ================= LISTAS E CONFIGURAÇÕES =================
+# ================= LISTAS E DADOS =================
 CATEGORIAS = ["now_playing", "popular", "upcoming", "top_rated"]
 GENEROS = {
-    28: "Ação", 12: "Aventura", 16: "Animação", 35: "Comédia",
-    80: "Crime", 99: "Documentário", 18: "Drama", 10751: "Família",
-    14: "Fantasia", 36: "História", 27: "Terror", 10402: "Música",
-    9648: "Mistério", 10749: "Romance", 878: "Ficção Científica",
-    10770: "Filme de TV", 53: "Thriller", 10752: "Guerra", 37: "Faroeste"
+    28: "Ação", 12: "Aventura", 16: "Animação", 35: "Comédia", 80: "Crime", 99: "Documentário", 18: "Drama", 10751: "Família", 14: "Fantasia", 36: "História", 27: "Terror", 10402: "Música", 9648: "Mistério", 10749: "Romance", 878: "Ficção Científica", 10770: "Filme de TV", 53: "Thriller", 10752: "Guerra", 37: "Faroeste"
 }
-MENSAGENS_BOAS_VINDAS = [
-    "🎉 Bem-vindo(a), {nome}! Que alegria ter você aqui!",
-    "🌟 Olá {nome}! Seja muito bem-vindo(a) ao grupo!",
-]
+MENSAGENS_BOAS_VINDAS = ["🎉 Bem-vindo(a), {nome}!", "🌟 Olá {nome}! Seja muito bem-vindo(a) ao grupo!"]
 
-# ================= FUNÇÕES DE SEGURANÇA =================
-def escape_html(text: str) -> str:
-    return html.escape(text or "")
+# ... (O resto das suas funções, como make_tmdb_request, format_movie_message, etc., continuam iguais)
+def escape_html(text: str) -> str: return html.escape(text or "")
+def cortar_texto(texto: str, limite: int = 350) -> str: return texto[:limite] + ("..." if len(texto) > limite else "")
 
-def cortar_texto(texto: str, limite: int = 350) -> str:
-    return texto[:limite] + ("..." if len(texto) > limite else "")
-
-# ================= FUNÇÕES DE API =================
 def make_tmdb_request(endpoint, params):
     base_url = "https://api.themoviedb.org/3"
     full_url = f"{base_url}/{endpoint}"
@@ -102,7 +79,6 @@ def get_popular_series(limit=5):
     data = make_tmdb_request("tv/popular", {"page": 1})
     return data.get("results", [])[:limit] if data else []
 
-# ================= FUNÇÕES DE FORMATAÇÃO =================
 def format_movie_message(movie):
     title = escape_html(movie.get("title", "Título desconhecido"))
     rating = movie.get("vote_average", 0)
@@ -111,14 +87,7 @@ def format_movie_message(movie):
     genre_ids = movie.get("genre_ids", [])
     genres_str = ", ".join([GENEROS.get(gid, "") for gid in genre_ids if gid in GENEROS]) or "N/A"
     stars = "⭐" * round(rating / 2) + "☆" * (5 - round(rating / 2))
-    return (
-        f"🎬 <b>{title}</b>\n\n"
-        f"{stars} ({rating:.1f}/10)\n"
-        f"📅 <b>Lançamento:</b> {release_date}\n"
-        f"🎭 <b>Gêneros:</b> {genres_str}\n\n"
-        f"📖 <b>Sinopse:</b>\n{overview}\n\n"
-        f"🔗 https://www.themoviedb.org/movie/{movie.get('id', '')}"
-    )
+    return (f"🎬 <b>{title}</b>\n\n{stars} ({rating:.1f}/10)\n📅 <b>Lançamento:</b> {release_date}\n🎭 <b>Gêneros:</b> {genres_str}\n\n📖 <b>Sinopse:</b>\n{overview}\n\n🔗 https://www.themoviedb.org/movie/{movie.get('id', '')}")
 
 def format_series_message(series):
     title = escape_html(series.get("name", "Título desconhecido"))
@@ -126,158 +95,158 @@ def format_series_message(series):
     overview = cortar_texto(escape_html(series.get("overview", "Sinopse não disponível.")))
     first_air_date = series.get("first_air_date", "Data desconhecida")
     stars = "⭐" * round(rating / 2) + "☆" * (5 - round(rating / 2))
-    return (
-        f"📺 <b>{title}</b>\n\n"
-        f"{stars} ({rating:.1f}/10)\n"
-        f"📅 <b>Estreia:</b> {first_air_date}\n\n"
-        f"📖 <b>Sinopse:</b>\n{overview}\n\n"
-        f"🔗 https://www.themoviedb.org/tv/{series.get('id', '')}"
-    )
+    return (f"📺 <b>{title}</b>\n\n{stars} ({rating:.1f}/10)\n📅 <b>Estreia:</b> {first_air_date}\n\n📖 <b>Sinopse:</b>\n{overview}\n\n🔗 https://www.themoviedb.org/tv/{series.get('id', '')}")
 
-def send_movie_info(chat_id, movie):
+async def send_movie_info(context: ContextTypes.DEFAULT_TYPE, chat_id: int, movie: dict):
     try:
         caption = format_movie_message(movie)
         poster_path = movie.get("poster_path")
         if poster_path:
-            bot.send_photo(chat_id, f"{TMDB_IMAGE_BASE_URL}{poster_path}", caption=caption, parse_mode='HTML')
+            await context.bot.send_photo(chat_id, f"{TMDB_IMAGE_BASE_URL}{poster_path}", caption=caption, parse_mode='HTML')
         else:
-            bot.send_message(chat_id, caption, parse_mode='HTML')
+            await context.bot.send_message(chat_id, caption, parse_mode='HTML')
     except Exception as e:
         logging.error(f"Erro ao enviar info de filme: {e}")
 
-def send_series_info(chat_id, series):
+async def send_series_info(context: ContextTypes.DEFAULT_TYPE, chat_id: int, series: dict):
     try:
         caption = format_series_message(series)
         poster_path = series.get("poster_path")
         if poster_path:
-            bot.send_photo(chat_id, f"{TMDB_IMAGE_BASE_URL}{poster_path}", caption=caption, parse_mode='HTML')
+            await context.bot.send_photo(chat_id, f"{TMDB_IMAGE_BASE_URL}{poster_path}", caption=caption, parse_mode='HTML')
         else:
-            bot.send_message(chat_id, caption, parse_mode='HTML')
+            await context.bot.send_message(chat_id, caption, parse_mode='HTML')
     except Exception as e:
         logging.error(f"Erro ao enviar info de série: {e}")
 
-# ================= AGENDADOR =================
-def agendador_cinema():
-    while True:
-        time.sleep(10800)  # 3h
-        logging.info(f"Agendador rodando para {len(subscribed_chats)} chats.")
-        for chat_id in list(subscribed_chats):
-            try:
-                suggestion = get_random_movie()
-                if suggestion:
-                    send_movie_info(chat_id, suggestion)
-                    time.sleep(1)
-            except Exception as e:
-                logging.error(f"Erro no agendador para chat {chat_id}: {e}")
-                if "Forbidden" in str(e) or "bot was blocked" in str(e):
-                    logging.info(f"Removendo chat {chat_id} por estar bloqueado.")
-                    subscribed_chats.discard(chat_id)
-                    salvar_chats()
-
 # ================= COMANDOS =================
-@bot.message_handler(commands=['start', 'cinema'])
-def start_cinema(message):
-    subscribed_chats.add(message.chat.id)
+async def start_cinema(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    subscribed_chats.add(update.message.chat.id)
     salvar_chats()
-    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add('🎬 Filmes em Cartaz', '🌟 Populares', '🚀 Em Breve', '🏆 Melhores Avaliados',
-               '📺 Séries Populares', '🎲 Sugestão Aleatória', '🔍 Buscar Filme', '🎭 Por Gênero')
-    bot.send_message(message.chat.id, "🎬 <b>Bot de Cinema!</b>\n\nBem-vindo(a)! Use os botões para explorar.",
-                     parse_mode='HTML', reply_markup=markup)
+    keyboard = [['🎬 Filmes em Cartaz', '🌟 Populares'], ['🚀 Em Breve', '🏆 Melhores Avaliados'],
+                ['📺 Séries Populares', '🎲 Sugestão Aleatória'], ['🔍 Buscar Filme', '🎭 Por Gênero']]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    await update.message.reply_text("🎬 <b>Bot de Cinema!</b>\n\nBem-vindo(a)! Use os botões para explorar.",
+                                    parse_mode='HTML', reply_markup=reply_markup)
 
-@bot.message_handler(content_types=['new_chat_members'])
-def welcome_new_member(message):
-    for new_user in message.new_chat_members:
+async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    for new_user in update.message.new_chat_members:
         nome = escape_html(new_user.first_name)
         msg = random.choice(MENSAGENS_BOAS_VINDAS).format(nome=nome)
-        bot.send_message(message.chat.id, msg)
+        await update.message.reply_text(msg)
 
-def send_movie_list(message, category, title):
-    bot.send_message(message.chat.id, f"Buscando <b>{title}</b>...", parse_mode='HTML')
+async def send_movie_list(update: Update, context: ContextTypes.DEFAULT_TYPE, category: str, title: str):
+    await update.message.reply_text(f"Buscando <b>{title}</b>...", parse_mode='HTML')
     movies = get_movies_by_category(category)
     if movies:
         for movie in movies:
-            send_movie_info(message.chat.id, movie)
+            await send_movie_info(context, update.message.chat.id, movie)
             time.sleep(1)
     else:
-        bot.send_message(message.chat.id, f"❌ Não foi possível encontrar filmes para {title}.")
+        await update.message.reply_text(f"❌ Não foi possível encontrar filmes para {title}.")
 
-# Handlers de categorias
-@bot.message_handler(regexp="🎬 Filmes em Cartaz")
-def lancamentos(message): send_movie_list(message, "now_playing", "Filmes em Cartaz")
-@bot.message_handler(regexp="🌟 Populares")
-def populares(message): send_movie_list(message, "popular", "Filmes Populares")
-@bot.message_handler(regexp="🚀 Em Breve")
-def em_breve(message): send_movie_list(message, "upcoming", "Filmes em Breve")
-@bot.message_handler(regexp="🏆 Melhores Avaliados")
-def top_avaliados(message): send_movie_list(message, "top_rated", "Melhores Avaliados")
-@bot.message_handler(regexp="🎲 Sugestão Aleatória")
-def sugerir_filme(message):
+# ... Handlers ...
+async def lancamentos(update: Update, context: ContextTypes.DEFAULT_TYPE): await send_movie_list(update, context, "now_playing", "Filmes em Cartaz")
+async def populares(update: Update, context: ContextTypes.DEFAULT_TYPE): await send_movie_list(update, context, "popular", "Filmes Populares")
+async def em_breve(update: Update, context: ContextTypes.DEFAULT_TYPE): await send_movie_list(update, context, "upcoming", "Filmes em Breve")
+async def top_avaliados(update: Update, context: ContextTypes.DEFAULT_TYPE): await send_movie_list(update, context, "top_rated", "Melhores Avaliados")
+
+async def sugerir_filme(update: Update, context: ContextTypes.DEFAULT_TYPE):
     movie = get_random_movie()
-    if movie: send_movie_info(message.chat.id, movie)
-    else: bot.send_message(message.chat.id, "❌ Nenhuma sugestão encontrada.")
+    if movie: await send_movie_info(context, update.message.chat.id, movie)
+    else: await update.message.reply_text("❌ Nenhuma sugestão encontrada.")
 
-@bot.message_handler(regexp="📺 Séries Populares")
-def series_populares(message):
+async def series_populares(update: Update, context: ContextTypes.DEFAULT_TYPE):
     series_list = get_popular_series()
     if series_list:
         for s in series_list:
-            send_series_info(message.chat.id, s)
+            await send_series_info(context, update.message.chat.id, s)
             time.sleep(1)
     else:
-        bot.send_message(message.chat.id, "❌ Não consegui buscar séries populares.")
+        await update.message.reply_text("❌ Não consegui buscar séries populares.")
 
-@bot.message_handler(regexp="🔍 Buscar Filme")
-def prompt_buscar_filme(message):
-    bot.send_message(message.chat.id, "Use: <code>/filme [nome]</code>", parse_mode='HTML')
+async def prompt_buscar_filme(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Use: <code>/filme [nome]</code>", parse_mode='HTML')
 
-@bot.message_handler(commands=['filme'])
-def buscar_filme(message):
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        bot.reply_to(message, "⚠️ Exemplo: <code>/filme Matrix</code>", parse_mode='HTML')
+async def buscar_filme(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("⚠️ Exemplo: <code>/filme Matrix</code>", parse_mode='HTML')
         return
-    nome = args[1]
+    nome = " ".join(context.args)
     movies = search_movie(nome)
     if movies:
-        send_movie_info(message.chat.id, movies[0])
+        await send_movie_info(context, update.message.chat.id, movies[0])
     else:
-        bot.send_message(message.chat.id, f"❌ Nenhum filme chamado '{escape_html(nome)}'.")
+        await update.message.reply_text(f"❌ Nenhum filme chamado '{escape_html(nome)}'.")
 
-@bot.message_handler(regexp="🎭 Por Gênero")
-def listar_generos(message):
+async def listar_generos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lista = "\n".join([f"• {nome} (<code>{gid}</code>)" for gid, nome in GENEROS.items()])
-    bot.send_message(message.chat.id,
-                     f"🎭 <b>Gêneros Disponíveis:</b>\n\n{lista}\n\nUse: <code>/genero [ID]</code>",
-                     parse_mode='HTML')
+    await update.message.reply_text(f"🎭 <b>Gêneros Disponíveis:</b>\n\n{lista}\n\nUse: <code>/genero [ID]</code>", parse_mode='HTML')
 
-@bot.message_handler(commands=['genero'])
-def filmes_por_genero(message):
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "⚠️ Exemplo: <code>/genero 28</code>", parse_mode='HTML')
+async def filmes_por_genero(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("⚠️ Exemplo: <code>/genero 28</code>", parse_mode='HTML')
         return
     try:
-        gid = int(args[1])
+        gid = int(context.args[0])
         nome = GENEROS.get(gid)
         if not nome:
-            bot.reply_to(message, "❌ ID inválido. Veja /generos", parse_mode='HTML')
+            await update.message.reply_text("❌ ID inválido. Veja /generos", parse_mode='HTML')
             return
         movies = get_movies_by_genre(gid)
         if movies:
             for movie in movies:
-                send_movie_info(message.chat.id, movie)
+                await send_movie_info(context, update.message.chat.id, movie)
                 time.sleep(1)
         else:
-            bot.send_message(message.chat.id, f"❌ Nenhum filme de {nome}.")
-    except ValueError:
-        bot.reply_to(message, "❌ ID deve ser número. Exemplo: /genero 28", parse_mode='HTML')
+            await update.message.reply_text(f"❌ Nenhum filme de {nome}.")
+    except (ValueError, IndexError):
+        await update.message.reply_text("❌ ID deve ser número. Exemplo: /genero 28", parse_mode='HTML')
+
+# ================= AGENDADOR =================
+async def agendador_job(context: ContextTypes.DEFAULT_TYPE):
+    logging.info(f"Agendador rodando para {len(subscribed_chats)} chats.")
+    for chat_id in list(subscribed_chats):
+        try:
+            suggestion = get_random_movie()
+            if suggestion:
+                await send_movie_info(context, chat_id, suggestion)
+                time.sleep(1)
+        except Exception as e:
+            logging.error(f"Erro no agendador para chat {chat_id}: {e}")
+            if "Forbidden" in str(e) or "bot was blocked" in str(e):
+                logging.info(f"Removendo chat {chat_id} por estar bloqueado.")
+                subscribed_chats.discard(chat_id)
+                salvar_chats()
 
 # ================= INICIALIZAÇÃO =================
+def main():
+    application = Application.builder().token(TOKEN).build()
+    
+    # Comandos
+    application.add_handler(CommandHandler(['start', 'cinema'], start_cinema))
+    application.add_handler(CommandHandler('filme', buscar_filme))
+    application.add_handler(CommandHandler('genero', filmes_por_genero))
+
+    # Mensagens de texto (botões)
+    application.add_handler(MessageHandler(filters.Regex('^🎬 Filmes em Cartaz$'), lancamentos))
+    application.add_handler(MessageHandler(filters.Regex('^🌟 Populares$'), populares))
+    application.add_handler(MessageHandler(filters.Regex('^🚀 Em Breve$'), em_breve))
+    application.add_handler(MessageHandler(filters.Regex('^🏆 Melhores Avaliados$'), top_avaliados))
+    application.add_handler(MessageHandler(filters.Regex('^🎲 Sugestão Aleatória$'), sugerir_filme))
+    application.add_handler(MessageHandler(filters.Regex('^📺 Séries Populares$'), series_populares))
+    application.add_handler(MessageHandler(filters.Regex('^🔍 Buscar Filme$'), prompt_buscar_filme))
+    application.add_handler(MessageHandler(filters.Regex('^🎭 Por Gênero$'), listar_generos))
+    
+    # Outros eventos
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
+
+    # Agendador
+    job_queue = application.job_queue
+    job_queue.run_repeating(agendador_job, interval=10800, first=10) # Roda a cada 3h, começa em 10s
+    
+    logging.info("🎬 Iniciando Bot de Cinema (versão corrigida)...")
+    application.run_polling()
+
 if __name__ == "__main__":
-    logging.info("🎬 Iniciando Bot de Cinema (versão segura)...")
-    threading.Thread(target=agendador_cinema, daemon=True).start()
-    logging.info("⏰ Agendador ativado.")
-    bot.infinity_polling(skip_pending=True, timeout=20)
-
-
+    main()

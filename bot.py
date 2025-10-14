@@ -1,4 +1,4 @@
-# ================= BOT DE CINEMA v2.2 (com Preview de Trailer) =================
+# ================= BOT DE CINEMA v2.3 (Links Corrigidos) =================
 import html
 import requests
 import random
@@ -18,7 +18,8 @@ if not TOKEN or not TMDB_API_KEY:
     print("ERRO CRÍTICO: As variáveis de ambiente TELEGRAM_TOKEN e TMDB_API_KEY não foram definidas!")
     exit()
 
-TMDB_IMAGE_BASE_URL = "[https://image.tmdb.org/t/p/w500](https://image.tmdb.org/t/p/w500)"
+# CORREÇÃO AQUI: URL sem formatação de markdown
+TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w500"
 SUBSCRIBED_FILE = "subscribed_chats.json"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(message)s")
@@ -34,7 +35,6 @@ def salvar_chats():
     with open(SUBSCRIBED_FILE, "w", encoding="utf-8") as f:
         json.dump(list(subscribed_chats), f)
 
-# (O resto do código, com a lógica de filmes, continua aqui...)
 # ================= LISTAS E DADOS =================
 CATEGORIAS = ["now_playing", "popular", "upcoming", "top_rated"]
 GENEROS = {
@@ -46,7 +46,8 @@ def escape_html(text: str) -> str: return html.escape(text or "")
 def cortar_texto(texto: str, limite: int = 350) -> str: return texto[:limite] + ("..." if len(texto) > limite else "")
 
 def make_tmdb_request(endpoint, params):
-    base_url = "[https://api.themoviedb.org/3](https://api.themoviedb.org/3)"
+    # CORREÇÃO AQUI: URL sem formatação de markdown
+    base_url = "https://api.themoviedb.org/3"
     full_url = f"{base_url}/{endpoint}"
     default_params = {"api_key": TMDB_API_KEY, "language": "pt-BR"}
     all_params = {**default_params, **params}
@@ -64,13 +65,14 @@ def get_trailer_link(movie_id):
     videos = data["results"]
     for video in videos:
         if video["site"] == "YouTube" and video["type"] == "Trailer" and video.get("official"):
-            return f"[https://www.youtube.com/watch?v=](https://www.youtube.com/watch?v=){video['key']}"
+            # CORREÇÃO AQUI: URL sem formatação de markdown
+            return f"https://www.youtube.com/watch?v={video['key']}"
     for video in videos:
         if video["site"] == "YouTube" and video["type"] == "Trailer":
-            return f"[https://www.youtube.com/watch?v=](https://www.youtube.com/watch?v=){video['key']}"
+            return f"https://www.youtube.com/watch?v={video['key']}"
     for video in videos:
         if video["site"] == "YouTube" and video["type"] == "Teaser":
-            return f"[https://www.youtube.com/watch?v=](https://www.youtube.com/watch?v=){video['key']}"
+            return f"https://www.youtube.com/watch?v={video['key']}"
     return None
 
 def get_movies_by_category(category, limit=5):
@@ -102,7 +104,8 @@ def format_movie_message(movie):
     genre_ids = movie.get("genre_ids", [])
     genres_str = ", ".join([GENEROS.get(gid, "") for gid in genre_ids if gid in GENEROS]) or "N/A"
     stars = "⭐" * round(rating / 2) + "☆" * (5 - round(rating / 2))
-    return (f"🎬 <b>{title}</b>\n\n{stars} ({rating:.1f}/10)\n📅 <b>Lançamento:</b> {release_date}\n🎭 <b>Gêneros:</b> {genres_str}\n\n📖 <b>Sinopse:</b>\n{overview}\n\n🔗 [https://www.themoviedb.org/movie/](https://www.themoviedb.org/movie/){movie.get('id', '')}")
+    # CORREÇÃO AQUI: URL sem formatação de markdown
+    return (f"🎬 <b>{title}</b>\n\n{stars} ({rating:.1f}/10)\n📅 <b>Lançamento:</b> {release_date}\n🎭 <b>Gêneros:</b> {genres_str}\n\n📖 <b>Sinopse:</b>\n{overview}\n\n🔗 https://www.themoviedb.org/movie/{movie.get('id', '')}")
 
 def format_series_message(series):
     title = escape_html(series.get("name", "Título desconhecido"))
@@ -110,7 +113,8 @@ def format_series_message(series):
     overview = cortar_texto(escape_html(series.get("overview", "Sinopse não disponível.")))
     first_air_date = series.get("first_air_date", "Data desconhecida")
     stars = "⭐" * round(rating / 2) + "☆" * (5 - round(rating / 2))
-    return (f"📺 <b>{title}</b>\n\n{stars} ({rating:.1f}/10)\n📅 <b>Estreia:</b> {first_air_date}\n\n📖 <b>Sinopse:</b>\n{overview}\n\n🔗 [https://www.themoviedb.org/tv/](https://www.themoviedb.org/tv/){series.get('id', '')}")
+    # CORREÇÃO AQUI: URL sem formatação de markdown
+    return (f"📺 <b>{title}</b>\n\n{stars} ({rating:.1f}/10)\n📅 <b>Estreia:</b> {first_air_date}\n\n📖 <b>Sinopse:</b>\n{overview}\n\n🔗 https://www.themoviedb.org/tv/{series.get('id', '')}")
 
 async def send_movie_info(context: ContextTypes.DEFAULT_TYPE, chat_id: int, movie: dict):
     try:
@@ -151,7 +155,6 @@ async def trailer_button_handler(update: Update, context: ContextTypes.DEFAULT_T
     movie_id = query.data.split('_')[1]
     trailer_link = get_trailer_link(movie_id)
     if trailer_link:
-        # AQUI ESTÁ A MUDANÇA: Adicionamos disable_web_page_preview=False
         await query.message.reply_text(f"Aqui está o trailer:\n{trailer_link}", disable_web_page_preview=False)
     else:
         await query.message.reply_text("Desculpe, não consegui encontrar um trailer para este filme.")
@@ -224,7 +227,7 @@ async def filmes_por_genero(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ ID deve ser número. Exemplo: /genero 28", parse_mode='HTML')
 
 async def agendador_job(context: ContextTypes.DEFAULT_TYPE):
-    logging.info(f"Agendador rodando para {len(subscribed_chats)} chats.")
+    logging.info(f"Agendador a executar para {len(subscribed_chats)} chats.")
     for chat_id in list(subscribed_chats):
         try:
             suggestion = get_random_movie()
@@ -232,9 +235,9 @@ async def agendador_job(context: ContextTypes.DEFAULT_TYPE):
                 await send_movie_info(context, chat_id, suggestion)
                 time.sleep(1)
         except Exception as e:
-            logging.error(f"Erro no agendador para chat {chat_id}: {e}")
+            logging.error(f"Erro no agendador para o chat {chat_id}: {e}")
             if "Forbidden" in str(e) or "bot was blocked" in str(e):
-                logging.info(f"Removendo chat {chat_id} por estar bloqueado.")
+                logging.info(f"A remover o chat {chat_id} por estar bloqueado.")
                 subscribed_chats.discard(chat_id)
                 salvar_chats()
 
@@ -257,7 +260,7 @@ def main():
     job_queue = application.job_queue
     job_queue.run_repeating(agendador_job, interval=10800, first=10)
     
-    logging.info("🎬 Iniciando Bot de Cinema (v2.2 com Preview de Trailer)...")
+    logging.info("🎬 A iniciar o Bot de Cinema (v2.3 com Links Corrigidos)...")
     application.run_polling()
 
 if __name__ == "__main__":

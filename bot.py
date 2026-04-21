@@ -1,4 +1,4 @@
-# ================= BOT DE CINEMA v3.7 (VERSÃO COMPLETA CORRIGIDA) =================
+# ================= BOT DE CINEMA v3.8 (FIX LINKS & TORRENT) =================
 import html
 import requests
 import random
@@ -20,7 +20,7 @@ GENEROS = {28: "Ação", 12: "Aventura", 16: "Animação", 35: "Comédia", 80: "
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(message)s")
 
-# ================= BANCO DE DADOS =================
+# ================= DB =================
 def get_db_connection():
     res = urlparse(DATABASE_URL)
     return psycopg2.connect(dbname=res.path[1:], user=res.username, password=res.password, host=res.hostname, port=res.port)
@@ -39,7 +39,28 @@ def add_chat_to_db(chat_id):
         conn.commit(); cur.close(); conn.close()
     except: pass
 
-# ================= FUNÇÕES DE BUSCA TMDB =================
+# ================= LINKS =================
+def get_stream_link(tmdb_id, is_tv=False):
+    # SuperEmbed é mais estável para visualização mobile
+    if is_tv:
+        return f"https://multiembed.mov/?video_id={tmdb_id}&tmdb=1"
+    return f"https://superembed.xyz/movie/{tmdb_id}"
+
+def get_torrent_magnet(title):
+    try:
+        # Limpa o título para melhorar a busca
+        clean_title = "".join(c for c in title if c.isalnum() or c==' ')
+        q = requests.utils.quote(clean_title)
+        url = f"https://yts.mx/api/v2/list_movies.json?query_term={q}&limit=1"
+        res = requests.get(url, timeout=10).json()
+        if res.get('data', {}).get('movie_count', 0) > 0:
+            movie = res['data']['movies'][0]
+            hash_code = movie['torrents'][0]['hash']
+            return f"magnet:?xt=urn:btih:{hash_code}&dn={q}"
+    except: return None
+    return None
+
+# ================= TMDB =================
 def make_tmdb_request(endpoint, params={}):
     base = "https://api.themoviedb.org/3"
     p = {"api_key": TMDB_API_KEY, "language": "pt-BR", **params}
@@ -48,23 +69,6 @@ def make_tmdb_request(endpoint, params={}):
         return r.json()
     except: return None
 
-# ================= LINKS EXTERNOS =================
-def get_stream_link(tmdb_id, is_tv=False):
-    tipo = "tv" if is_tv else "filme"
-    return f"https://embed.warezcdn.net/{tipo}/{tmdb_id}"
-
-def get_torrent_magnet(title):
-    try:
-        q = requests.utils.quote(title)
-        url = f"https://yts.mx/api/v2/list_movies.json?query_term={q}&limit=1"
-        res = requests.get(url, timeout=10).json()
-        if res.get('data', {}).get('movie_count', 0) > 0:
-            movie = res['data']['movies'][0]
-            return f"magnet:?xt=urn:btih:{movie['torrents'][0]['hash']}&dn={q}"
-    except: return None
-    return None
-
-# ================= ENVIO DE CONTEÚDO =================
 async def send_item_info(context, chat_id, item, is_tv=False):
     if not item: return
     iid = item.get("id")
@@ -73,18 +77,19 @@ async def send_item_info(context, chat_id, item, is_tv=False):
                f"⭐ {item.get('vote_average', 0):.1f}/10\n"
                f"📖 {item.get('overview', 'Sem sinopse')[:300]}...")
     
-    keyboard = [[InlineKeyboardButton("🎬 Ver Trailer", callback_data=f"trailer_{'tv' if is_tv else 'mv'}_{iid}")]]
-    keyboard.append([InlineKeyboardButton("📺 Assistir Online", url=get_stream_link(iid, is_tv))])
+    keyboard = [
+        [InlineKeyboardButton("🎬 Ver Trailer", callback_data=f"trailer_{'tv' if is_tv else 'mv'}_{iid}")],
+        [InlineKeyboardButton("📺 Assistir Online", url=get_stream_link(iid, is_tv))]
+    ]
     
     if not is_tv:
         keyboard[1].append(InlineKeyboardButton("📥 Torrent", callback_data=f"torrent_{iid}"))
     
     post = item.get("poster_path")
-    reply_markup = InlineKeyboardMarkup(keyboard)
     if post:
-        await context.bot.send_photo(chat_id, f"{TMDB_IMAGE_BASE_URL}{post}", caption=caption, parse_mode='HTML', reply_markup=reply_markup)
+        await context.bot.send_photo(chat_id, f"{TMDB_IMAGE_BASE_URL}{post}", caption=caption, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
     else:
-        await context.bot.send_message(chat_id, caption, parse_mode='HTML', reply_markup=reply_markup)
+        await context.bot.send_message(chat_id, caption, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
 
 # ================= HANDLERS =================
 async def handle_text(update, context):
@@ -92,24 +97,24 @@ async def handle_text(update, context):
     chat_id = update.effective_chat.id
     
     if text == '🎬 Filmes em Cartaz':
-        data = make_tmdb_request("movie/now_playing", {"region": "BR"})
-        for m in data.get('results', [])[:3]: await send_item_info(context, chat_id, m)
+        d = make_tmdb_request("movie/now_playing", {"region": "BR"})
+        for m in d.get('results', [])[:3]: await send_item_info(context, chat_id, m)
     elif text == '🌟 Populares':
-        data = make_tmdb_request("movie/popular", {"region": "BR"})
-        for m in data.get('results', [])[:3]: await send_item_info(context, chat_id, m)
+        d = make_tmdb_request("movie/popular", {"region": "BR"})
+        for m in d.get('results', [])[:3]: await send_item_info(context, chat_id, m)
     elif text == '🚀 Em Breve':
-        data = make_tmdb_request("movie/upcoming", {"region": "BR"})
-        for m in data.get('results', [])[:3]: await send_item_info(context, chat_id, m)
+        d = make_tmdb_request("movie/upcoming", {"region": "BR"})
+        for m in d.get('results', [])[:3]: await send_item_info(context, chat_id, m)
     elif text == '🏆 Melhores Avaliados':
-        data = make_tmdb_request("movie/top_rated", {"region": "BR"})
-        for m in data.get('results', [])[:3]: await send_item_info(context, chat_id, m)
+        d = make_tmdb_request("movie/top_rated", {"region": "BR"})
+        for m in d.get('results', [])[:3]: await send_item_info(context, chat_id, m)
     elif text == '📺 Séries Populares':
-        data = make_tmdb_request("tv/popular")
-        for s in data.get('results', [])[:3]: await send_item_info(context, chat_id, s, is_tv=True)
+        d = make_tmdb_request("tv/popular")
+        for s in d.get('results', [])[:3]: await send_item_info(context, chat_id, s, is_tv=True)
     elif text == '🎲 Sugestão Aleatória':
         cat = random.choice(CATEGORIAS)
-        data = make_tmdb_request(f"movie/{cat}", {"page": random.randint(1, 5)})
-        if data.get('results'): await send_item_info(context, chat_id, random.choice(data['results']))
+        d = make_tmdb_request(f"movie/{cat}", {"page": random.randint(1, 5)})
+        if d.get('results'): await send_item_info(context, chat_id, random.choice(d['results']))
     elif text == '🎭 Por Gênero':
         lista = "\n".join([f"• {n} (<code>{g}</code>)" for g, n in GENEROS.items()])
         await update.message.reply_text(f"🎭 <b>Gêneros:</b>\n\n{lista}\n\nUse: /genero [ID]", parse_mode='HTML')
@@ -119,26 +124,23 @@ async def handle_text(update, context):
 async def callback_handler(update, context):
     query = update.callback_query; await query.answer()
     parts = query.data.split("_")
-    action = parts[0]
-    
-    if action == "trailer":
+    if parts[0] == "trailer":
         tipo, iid = parts[1], parts[2]
         path = f"tv/{iid}/videos" if tipo == "tv" else f"movie/{iid}/videos"
         d = make_tmdb_request(path)
         link = next((f"https://youtube.com/watch?v={v['key']}" for v in d.get('results', []) if v['type'] == 'Trailer'), None)
         await query.message.reply_text(f"🎥 Trailer: {link}" if link else "❌ Não encontrado.")
-    
-    elif action == "torrent":
+    elif parts[0] == "torrent":
         movie = make_tmdb_request(f"movie/{parts[1]}")
         magnet = get_torrent_magnet(movie.get('title'))
         if magnet: await query.message.reply_text(f"📥 <b>Magnet Link:</b>\n\n<code>{magnet}</code>", parse_mode='HTML')
-        else: await query.message.reply_text("❌ Torrent não encontrado.")
+        else: await query.message.reply_text("❌ Não encontrei torrents ativos (YTS) para este filme.")
 
 async def start(update, context):
     add_chat_to_db(update.effective_chat.id)
     kb = [['🎬 Filmes em Cartaz', '🌟 Populares'], ['🚀 Em Breve', '🏆 Melhores Avaliados'], 
           ['📺 Séries Populares', '🎲 Sugestão Aleatória'], ['🔍 Buscar Filme', '🎭 Por Gênero']]
-    await update.message.reply_text("🎬 <b>CineSky V3.7 Ativado!</b>", parse_mode='HTML', reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    await update.message.reply_text("🎬 <b>CineSky V3.8 Ativado!</b>", parse_mode='HTML', reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
 
 def main():
     setup_database()

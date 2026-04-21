@@ -13,12 +13,13 @@ from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKe
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
 # ================= CONFIGURAÇÕES =================
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TMDB_API_KEY = os.environ.get("TMDB_API_KEY")
-DATABASE_URL = os.environ.get("DATABASE_URL") # Nova variável para o banco de dados
+# Variáveis fixadas diretamente no código para evitar erros de ambiente
+TOKEN = "8158367501:AAFDh-On-TklycKt2aj9WxUvQjWvxrH_U-Y"
+TMDB_API_KEY = "c90fb79a2f7d756a49bee848bce5f413"
+DATABASE_URL = "postgresql://neondb_owner:npg_uc8fRtixQZ6U@ep-orange-band-anlv6zu6-pooler.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
 if not all([TOKEN, TMDB_API_KEY, DATABASE_URL]):
-    print("ERRO CRÍTICO: Verifique as variáveis de ambiente TELEGRAM_TOKEN, TMDB_API_KEY e DATABASE_URL!")
+    print("ERRO CRÍTICO: Verifique se as chaves estão preenchidas no código!")
     exit()
 
 TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w500"
@@ -91,8 +92,6 @@ def remove_chat_from_db(chat_id):
     except Exception as e:
         logging.error(f"Erro ao remover chat {chat_id} do DB: {e}")
 
-
-# (O resto do seu código, com a lógica de filmes, continua aqui... nada foi alterado)
 # ================= LISTAS E DADOS =================
 CATEGORIAS = ["now_playing", "popular", "upcoming", "top_rated"]
 GENEROS = {
@@ -196,7 +195,7 @@ async def send_series_info(context: ContextTypes.DEFAULT_TYPE, chat_id: int, ser
         logging.error(f"Erro ao enviar info de série: {e}")
 
 async def start_cinema(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    add_chat_to_db(update.message.chat.id) # MODIFICADO
+    add_chat_to_db(update.message.chat.id)
     keyboard = [['🎬 Filmes em Cartaz', '🌟 Populares'], ['🚀 Em Breve', '🏆 Melhores Avaliados'],
                 ['📺 Séries Populares', '🎲 Sugestão Aleatória'], ['🔍 Buscar Filme', '🎭 Por Gênero']]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -280,7 +279,7 @@ async def filmes_por_genero(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ ID deve ser número. Exemplo: /genero 28", parse_mode='HTML')
 
 async def agendador_job(context: ContextTypes.DEFAULT_TYPE):
-    subscribed_chats = get_all_chats_from_db() # MODIFICADO
+    subscribed_chats = get_all_chats_from_db()
     logging.info(f"Agendador a executar para {len(subscribed_chats)} chats.")
     for chat_id in subscribed_chats:
         try:
@@ -291,7 +290,7 @@ async def agendador_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.error(f"Erro no agendador para o chat {chat_id}: {e}")
             if "Forbidden" in str(e) or "bot was blocked" in str(e):
-                remove_chat_from_db(chat_id) # MODIFICADO
+                remove_chat_from_db(chat_id)
 
 def main():
     setup_database() # Garante que a tabela existe ao iniciar

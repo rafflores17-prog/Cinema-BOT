@@ -1,4 +1,4 @@
-# ================= BOT DE CINEMA v4.0 (REVISÃO COMPLETA) =================
+# ================= BOT DE CINEMA v4.1 (ÉPOCAS & BUSCA INTELIGENTE) =================
 import html
 import requests
 import random
@@ -14,16 +14,33 @@ TMDB_API_KEY = "c90fb79a2f7d756a49bee848bce5f413"
 DATABASE_URL = "postgresql://neondb_owner:npg_uc8fRtixQZ6U@ep-orange-band-anlv6zu6-pooler.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
 TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w500"
-# Dicionário de Gêneros para o Menu Inteligente
-GENEROS_MENU = {"Ação": 28, "Comédia": 35, "Terror": 27, "Animação": 16, "Ficção": 878, "Suspense": 53}
+
+# Dicionários de Configuração Visual
+GENEROS_MENU = {"🔥 Ação": 28, "🤡 Comédia": 35, "👻 Terror": 27, "🛸 Ficção": 878, "🕵️ Suspense": 53, "🧸 Animação": 16}
+EPOCAS_MENU = {"🎸 Anos 80": (1980, 1989), "💾 Anos 90": (1990, 1999), "💿 Anos 2000": (2000, 2010), "🆕 Recentes": (2020, 2026)}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(message)s")
 
-# ================= DB & AUX =================
+# ================= BANCO DE DADOS =================
 def get_db_connection():
     res = urlparse(DATABASE_URL)
     return psycopg2.connect(dbname=res.path[1:], user=res.username, password=res.password, host=res.hostname, port=res.port)
 
+def setup_database():
+    try:
+        conn = get_db_connection(); cur = conn.cursor()
+        cur.execute('CREATE TABLE IF NOT EXISTS subscribed_chats (chat_id BIGINT PRIMARY KEY);')
+        conn.commit(); cur.close(); conn.close()
+    except: pass
+
+def add_chat_to_db(chat_id):
+    try:
+        conn = get_db_connection(); cur = conn.cursor()
+        cur.execute("INSERT INTO subscribed_chats (chat_id) VALUES (%s) ON CONFLICT (chat_id) DO NOTHING;", (chat_id,))
+        conn.commit(); cur.close(); conn.close()
+    except: pass
+
+# ================= TMDB & BUSCA =================
 def make_tmdb_request(endpoint, params={}):
     base = "https://api.themoviedb.org/3"
     p = {"api_key": TMDB_API_KEY, "language": "pt-BR", **params}
@@ -32,37 +49,41 @@ def make_tmdb_request(endpoint, params={}):
         return r.json()
     except: return None
 
-# ================= ENVIO DE CONTEÚDO =================
 async def send_item_info(context, chat_id, item, is_tv=False):
     if not item: return
     iid = item.get("id")
     title = item.get("name") if is_tv else item.get("title")
+    rating = item.get("vote_average", 0)
+    stars = "⭐" * round(rating / 2)
+    
     caption = (f"{'📺' if is_tv else '🎬'} <b>{html.escape(title)}</b>\n\n"
-               f"⭐ {item.get('vote_average', 0):.1f}/10\n"
-               f"📖 {item.get('overview', 'Sem sinopse')[:300]}...")
+               f"{stars} ({rating:.1f}/10)\n"
+               f"📖 {item.get('overview', 'Sinopse não disponível.')[:280]}...")
     
     q_online = quote(f"assistir {title} dublado online")
-    q_torrent = quote(f"baixar {title} torrent dublado 1080p")
+    q_torrent = quote(f"{title} download torrent dublado 1080p")
     
     keyboard = [
-        [InlineKeyboardButton("🎬 Ver Trailer", callback_data=f"tr_{'tv' if is_tv else 'mv'}_{iid}")],
-        [InlineKeyboardButton("📺 Assistir Online", url=f"https://duckduckgo.com/?q={q_online}")],
-        [InlineKeyboardButton("📥 Buscar Torrent", url=f"https://duckduckgo.com/?q={q_torrent}")]
+        [InlineKeyboardButton("🎬 Ver Trailer (YouTube)", callback_data=f"tr_{'tv' if is_tv else 'mv'}_{iid}")],
+        [InlineKeyboardButton("📺 Assistir Online", url=f"https://duckduckgo.com/?q={q_online}"),
+         InlineKeyboardButton("📥 Buscar Torrent", url=f"https://duckduckgo.com/?q={q_torrent}")]
     ]
     
     post = item.get("poster_path")
     markup = InlineKeyboardMarkup(keyboard)
-    if post:
-        await context.bot.send_photo(chat_id, f"{TMDB_IMAGE_BASE_URL}{post}", caption=caption, parse_mode='HTML', reply_markup=markup)
-    else:
-        await context.bot.send_message(chat_id, caption, parse_mode='HTML', reply_markup=markup)
+    try:
+        if post:
+            await context.bot.send_photo(chat_id, f"{TMDB_IMAGE_BASE_URL}{post}", caption=caption, parse_mode='HTML', reply_markup=markup)
+        else:
+            await context.bot.send_message(chat_id, caption, parse_mode='HTML', reply_markup=markup)
+    except: pass
 
-# ================= HANDLERS =================
+# ================= HANDLERS DE TEXTO =================
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat_id = update.effective_chat.id
     
-    if text == '🎬 Filmes em Cartaz':
+    if text == '🎥 Em Cartaz':
         d = make_tmdb_request("movie/now_playing", {"region": "BR"})
         for m in d.get('results', [])[:3]: await send_item_info(context, chat_id, m)
     
@@ -79,39 +100,73 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for s in d.get('results', [])[:3]: await send_item_info(context, chat_id, s, is_tv=True)
         
     elif text == '🎭 Por Gênero':
-        # Cria botões para os gêneros em vez de pedir ID
         btns = [[InlineKeyboardButton(n, callback_data=f"gen_{i}")] for n, i in GENEROS_MENU.items()]
-        await update.message.reply_text("Escolha um gênero:", reply_markup=InlineKeyboardMarkup(btns))
+        await update.message.reply_text("✨ <b>Escolha um Gênero:</b>", parse_mode='HTML', reply_markup=InlineKeyboardMarkup(btns))
         
-    elif text == '🎲 Aleatório':
-        d = make_tmdb_request("movie/top_rated", {"page": random.randint(1, 10)})
+    elif text == '🎞️ Por Época':
+        btns = [[InlineKeyboardButton(n, callback_data=f"era_{n}")] for n in EPOCAS_MENU.keys()]
+        await update.message.reply_text("⏳ <b>Escolha uma Época:</b>", parse_mode='HTML', reply_markup=InlineKeyboardMarkup(btns))
+        
+    elif text == '🎲 Sugestão':
+        d = make_tmdb_request("movie/top_rated", {"page": random.randint(1, 20)})
         if d.get('results'): await send_item_info(context, chat_id, random.choice(d['results']))
 
+    elif text == '🔍 Buscar':
+        await update.message.reply_text("⌨️ Digite: <code>/filme Nome do Filme</code>", parse_mode='HTML')
+
+# ================= CALLBACKS (BOTÕES INLINE) =================
 async def callback_handler(update, context):
     query = update.callback_query; await query.answer()
-    data = query.data
+    data = query.data; chat_id = query.message.chat_id
     
     if data.startswith("tr_"):
-        parts = data.split("_")
-        path = f"{'tv' if parts[1]=='tv' else 'movie'}/{parts[2]}/videos"
+        p = data.split("_")
+        path = f"{'tv' if p[1]=='tv' else 'movie'}/{p[2]}/videos"
         v = make_tmdb_request(path)
         link = next((f"https://youtube.com/watch?v={i['key']}" for i in v.get('results', []) if i['type'] == 'Trailer'), None)
-        await query.message.reply_text(f"🎥 Trailer: {link}" if link else "❌ Não encontrado.")
+        await query.message.reply_text(f"🎥 Trailer: {link}" if link else "❌ Trailer não disponível.")
         
     elif data.startswith("gen_"):
         gid = data.split("_")[1]
-        d = make_tmdb_request("discover/movie", {"with_genres": gid})
-        for m in d.get('results', [])[:3]: await send_item_info(context, chat_id=query.message.chat_id, item=m)
+        d = make_tmdb_request("discover/movie", {"with_genres": gid, "page": random.randint(1, 5)})
+        if d.get('results'):
+            filmes = d.get('results')
+            random.shuffle(filmes)
+            for m in filmes[:3]: await send_item_info(context, chat_id, m)
 
+    elif data.startswith("era_"):
+        era_nome = data.split("_")[1]
+        inicio, fim = EPOCAS_MENU[era_nome]
+        ano_sorteado = random.randint(inicio, fim)
+        d = make_tmdb_request("discover/movie", {"primary_release_year": ano_sorteado, "sort_by": "popularity.desc", "page": random.randint(1, 3)})
+        if d.get('results'):
+            filmes = d.get('results')
+            random.shuffle(filmes)
+            await context.bot.send_message(chat_id, f"🎬 <b>Garimpando clássicos de {ano_sorteado}...</b>", parse_mode='HTML')
+            for m in filmes[:3]: await send_item_info(context, chat_id, m)
+
+# ================= START & MAIN =================
 async def start(update, context):
-    kb = [['🎬 Filmes em Cartaz', '🚀 Em Breve'], ['🌟 Populares', '📺 Séries'], ['🎭 Por Gênero', '🎲 Aleatório']]
-    await update.message.reply_text("🎬 <b>CineSky V4.0</b>", parse_mode='HTML', reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    add_chat_to_db(update.effective_chat.id)
+    kb = [
+        ['🎥 Em Cartaz', '🚀 Em Breve'],
+        ['🌟 Populares', '📺 Séries'],
+        ['🎭 Por Gênero', '🎞️ Por Época'],
+        ['🎲 Sugestão', '🔍 Buscar']
+    ]
+    await update.message.reply_text(
+        "🎬 <b>Bem-vindo ao CineSky V4.1</b>\n\nO bot mais completo para os amantes de cinema!",
+        parse_mode='HTML', reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
+    )
 
 def main():
+    setup_database()
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('filme', lambda u, c: send_item_info(c, u.effective_chat.id, make_tmdb_request("search/movie", {"query": " ".join(c.args)}).get('results', [None])[0]) if c.args else None))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(callback_handler))
+    logging.info("CineSky v4.1 Online!")
     app.run_polling()
 
 if __name__ == "__main__": main()

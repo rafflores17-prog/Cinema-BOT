@@ -1,4 +1,4 @@
-# ================= BOT DE CINEMA v4.6 (FIX DEPLOY) =================
+# ================= BOT DE CINEMA v4.7 (CINE MEGA EXCLUSIVE) =================
 import html
 import requests
 import random
@@ -60,13 +60,13 @@ async def send_item_info(context, chat_id, item, is_tv=False):
                f"{stars} ({rating:.1f}/10)\n"
                f"📖 {item.get('overview', 'Sinopse não disponível.')[:280]}...")
     
+    # Link direto para o seu site Cine Mega
     link_assistir = f"{SITE_URL}/filme/{iid}"
-    q_torrent = quote(f"{title} download torrent dublado 1080p")
     
+    # BOTÕES: Removido o botão Torrent para focar no seu site
     keyboard = [
         [InlineKeyboardButton("🚀 ASSISTIR ONLINE (Cine Mega)", url=link_assistir)],
-        [InlineKeyboardButton("🎬 Trailer", callback_data=f"tr_{'tv' if is_tv else 'mv'}_{iid}"),
-         InlineKeyboardButton("📥 Torrent", url=f"https://duckduckgo.com/?q={q_torrent}")]
+        [InlineKeyboardButton("🎬 Ver Trailer (YouTube)", callback_data=f"tr_{'tv' if is_tv else 'mv'}_{iid}")]
     ]
     
     post = item.get("poster_path")
@@ -78,7 +78,7 @@ async def send_item_info(context, chat_id, item, is_tv=False):
             await context.bot.send_message(chat_id, caption, parse_mode='HTML', reply_markup=markup)
     except: pass
 
-# ================= HANDLERS =================
+# ================= HANDLERS DE TEXTO =================
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat_id = update.effective_chat.id
@@ -107,31 +107,42 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == '🔍 Buscar':
         await update.message.reply_text("⌨️ Digite: <code>/filme Nome do Filme</code>", parse_mode='HTML')
 
+# ================= CALLBACKS (GÊNERO E ÉPOCA) =================
 async def callback_handler(update, context):
     query = update.callback_query; await query.answer()
     data = query.data; chat_id = query.message.chat_id
+    
     if data.startswith("tr_"):
         p = data.split("_")
         v = make_tmdb_request(f"{'tv' if p[1]=='tv' else 'movie'}/{p[2]}/videos")
         link = next((f"https://youtube.com/watch?v={i['key']}" for i in v.get('results', []) if i['type'] == 'Trailer'), None)
         await query.message.reply_text(f"🎥 Trailer: {link}" if link else "❌ Trailer não disponível.")
+        
     elif data.startswith("gen_"):
         gid = data.split("_")[1]
         d = make_tmdb_request("discover/movie", {"with_genres": gid, "page": random.randint(1, 5)})
-        if d.get('results'):
-            for m in d.get('results')[:3]: await send_item_info(context, chat_id, m)
+        if d and d.get('results'):
+            filmes = d.get('results'); random.shuffle(filmes)
+            for m in filmes[:3]: await send_item_info(context, chat_id, m)
 
-# ================= COMANDO AVISO GERAL (FIXED) =================
+    elif data.startswith("era_"):
+        era_nome = data.split("_")[1]
+        inicio, fim = EPOCAS_MENU[era_nome]
+        ano_sorteado = random.randint(inicio, fim)
+        # Busca os 10 filmes mais populares do ano sorteado para garantir qualidade
+        d = make_tmdb_request("discover/movie", {"primary_release_year": ano_sorteado, "sort_by": "popularity.desc", "page": 1})
+        if d and d.get('results'):
+            await context.bot.send_message(chat_id, f"🎞️ <b>Buscando os melhores de {ano_sorteado}...</b>", parse_mode='HTML')
+            filmes = d.get('results')[:10]; random.shuffle(filmes)
+            for m in filmes[:3]: await send_item_info(context, chat_id, m)
+
+# ================= COMANDOS EXTRAS =================
 async def avisogeral(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Comando manual: /avisogeral Texto do Aviso
     msg = " ".join(context.args)
-    if not msg: 
-        await update.message.reply_text("Digite a mensagem após o comando.")
-        return
+    if not msg: return
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT chat_id FROM subscribed_chats")
-    chats = cur.fetchall()
-    count = 0
+    chats = cur.fetchall(); count = 0
     for chat in chats:
         try:
             await context.bot.send_message(chat[0], msg, parse_mode='HTML')
@@ -147,20 +158,21 @@ async def start(update, context):
         [InlineKeyboardButton("📱 Baixar App (Android)", url="https://t.me/APKBUGADO")]
     ])
     await update.message.reply_text(
-        f"🎬 <b>CineSky v4.6 - Cine Mega</b>\n\nAssista diretamente no site ou via APK!",
+        f"🎬 <b>CineSky v4.7 - Cine Mega</b>\n\nEncontre e assista seus filmes favoritos sem anúncios irritantes!",
         parse_mode='HTML', reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
     )
-    await update.message.reply_text("Links oficiais:", reply_markup=promo_kb)
+    await update.message.reply_text("Escolha uma opção abaixo ou acesse nossos canais:", reply_markup=promo_kb)
 
+# ================= EXECUÇÃO =================
 def main():
     setup_database()
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler('start', start))
-    application.add_handler(CommandHandler('avisogeral', avisogeral)) # Comando registrado corretamente
+    application.add_handler(CommandHandler('avisogeral', avisogeral))
     application.add_handler(CommandHandler('filme', lambda u, c: send_item_info(c, u.effective_chat.id, make_tmdb_request("search/movie", {"query": " ".join(c.args)}).get('results', [None])[0]) if c.args else None))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(CallbackQueryHandler(callback_handler))
-    logging.info("CineSky v4.6 Online!")
+    logging.info("CineSky v4.7 Online!")
     application.run_polling()
 
 if __name__ == "__main__": main()

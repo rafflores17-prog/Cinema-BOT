@@ -15,6 +15,7 @@ DATABASE_URL = "postgresql://neondb_owner:npg_uc8fRtixQZ6U@ep-orange-band-anlv6z
 
 TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w500"
 SITE_URL = "https://www.cinemega.online" 
+APP_DOWNLOAD_URL = "http://bgdv.online/27l1qh" # Seu encurtador oficial
 
 GENEROS_MENU = {"🔥 Ação": 28, "🤡 Comédia": 35, "👻 Terror": 27, "🛸 Ficção": 878, "🕵️ Suspense": 53, "🧸 Animação": 16}
 EPOCAS_MENU = {"🎸 Anos 80": (1980, 1989), "💾 Anos 90": (1990, 1999), "💿 Anos 2000": (2000, 2010), "🆕 Recentes": (2020, 2026)}
@@ -60,14 +61,30 @@ async def send_item_info(context, chat_id, item, is_tv=False):
                f"{stars} ({rating:.1f}/10)\n"
                f"📖 {item.get('overview', 'Sinopse não disponível.')[:280]}...")
     
-    # Link direto para o seu site Cine Mega
     link_assistir = f"{SITE_URL}/filme/{iid}"
     
-    # BOTÕES: Removido o botão Torrent para focar no seu site
+    # BUSCA DE TRAILER ROBUSTA
+    v = make_tmdb_request(f"{'tv' if is_tv else 'movie'}/{iid}/videos")
+    trailer_url = None
+    if v and v.get('results'):
+        video_list = v.get('results')
+        # Tenta achar exatamente o 'Trailer', se não houver, pega o primeiro vídeo disponível do YouTube
+        trailer_obj = next((vid for vid in video_list if vid['type'] == 'Trailer' and vid['site'] == 'YouTube'), None)
+        if not trailer_obj and video_list:
+            trailer_obj = video_list[0]
+        
+        if trailer_obj:
+            trailer_url = f"https://youtube.com/watch?v={trailer_obj['key']}"
+
+    # MONTAGEM DOS BOTÕES
     keyboard = [
         [InlineKeyboardButton("🚀 ASSISTIR ONLINE (Cine Mega)", url=link_assistir)],
-        [InlineKeyboardButton("🎬 Ver Trailer (YouTube)", callback_data=f"tr_{'tv' if is_tv else 'mv'}_{iid}")]
+        [InlineKeyboardButton("📲 BAIXAR APP OFICIAL (Android)", url=APP_DOWNLOAD_URL)]
     ]
+    
+    # Só adiciona o botão de trailer se ele realmente existir
+    if trailer_url:
+        keyboard.insert(1, [InlineKeyboardButton("🎬 Ver Trailer Oficial", url=trailer_url)])
     
     post = item.get("poster_path")
     markup = InlineKeyboardMarkup(keyboard)
@@ -107,18 +124,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == '🔍 Buscar':
         await update.message.reply_text("⌨️ Digite: <code>/filme Nome do Filme</code>", parse_mode='HTML')
 
-# ================= CALLBACKS (GÊNERO E ÉPOCA) =================
+# ================= CALLBACKS =================
 async def callback_handler(update, context):
     query = update.callback_query; await query.answer()
     data = query.data; chat_id = query.message.chat_id
     
-    if data.startswith("tr_"):
-        p = data.split("_")
-        v = make_tmdb_request(f"{'tv' if p[1]=='tv' else 'movie'}/{p[2]}/videos")
-        link = next((f"https://youtube.com/watch?v={i['key']}" for i in v.get('results', []) if i['type'] == 'Trailer'), None)
-        await query.message.reply_text(f"🎥 Trailer: {link}" if link else "❌ Trailer não disponível.")
-        
-    elif data.startswith("gen_"):
+    if data.startswith("gen_"):
         gid = data.split("_")[1]
         d = make_tmdb_request("discover/movie", {"with_genres": gid, "page": random.randint(1, 5)})
         if d and d.get('results'):
@@ -129,7 +140,6 @@ async def callback_handler(update, context):
         era_nome = data.split("_")[1]
         inicio, fim = EPOCAS_MENU[era_nome]
         ano_sorteado = random.randint(inicio, fim)
-        # Busca os 10 filmes mais populares do ano sorteado para garantir qualidade
         d = make_tmdb_request("discover/movie", {"primary_release_year": ano_sorteado, "sort_by": "popularity.desc", "page": 1})
         if d and d.get('results'):
             await context.bot.send_message(chat_id, f"🎞️ <b>Buscando os melhores de {ano_sorteado}...</b>", parse_mode='HTML')
@@ -155,13 +165,13 @@ async def start(update, context):
     kb = [['🎥 Em Cartaz', '🚀 Em Breve'], ['🌟 Populares', '📺 Séries'], ['🎭 Por Gênero', '🎞️ Por Época'], ['🎲 Sugestão', '🔍 Buscar']]
     promo_kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🌐 Acessar Site Oficial", url=SITE_URL)],
-        [InlineKeyboardButton("📱 Baixar App (Android)", url="https://t.me/APKBUGADO")]
+        [InlineKeyboardButton("📲 BAIXAR APP OFICIAL (Android)", url=APP_DOWNLOAD_URL)]
     ])
     await update.message.reply_text(
-        f"🎬 <b>CineSky v4.7 - Cine Mega</b>\n\nEncontre e assista seus filmes favoritos sem anúncios irritantes!",
+        f"🎬 <b>CineSky v4.7 - Cine Mega</b>\n\nBem-vindo Mestre! Encontre e assista seus filmes favoritos diretamente no nosso site ou pelo nosso aplicativo oficial!",
         parse_mode='HTML', reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
     )
-    await update.message.reply_text("Escolha uma opção abaixo ou acesse nossos canais:", reply_markup=promo_kb)
+    await update.message.reply_text("Escolha uma opção no menu ou baixe nosso APK para uma experiência nativa:", reply_markup=promo_kb)
 
 # ================= EXECUÇÃO =================
 def main():

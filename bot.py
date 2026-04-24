@@ -15,7 +15,7 @@ DATABASE_URL = "postgresql://neondb_owner:npg_uc8fRtixQZ6U@ep-orange-band-anlv6z
 
 TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w500"
 SITE_URL = "https://www.cinemega.online" 
-APP_DOWNLOAD_URL = "http://bgdv.online/27l1qh" # Seu link oficial
+APP_DOWNLOAD_URL = "http://bgdv.online/a4qjfr" # Seu link oficial
 
 GENEROS_MENU = {"🔥 Ação": 28, "🤡 Comédia": 35, "👻 Terror": 27, "🛸 Ficção": 878, "🕵️ Suspense": 53, "🧸 Animação": 16}
 EPOCAS_MENU = {"🎸 Anos 80": (1980, 1989), "💾 Anos 90": (1990, 1999), "💿 Anos 2000": (2000, 2010), "🆕 Recentes": (2020, 2026)}

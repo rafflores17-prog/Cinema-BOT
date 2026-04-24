@@ -4,7 +4,7 @@ import requests
 import random
 import logging
 import psycopg2
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
@@ -15,7 +15,7 @@ DATABASE_URL = "postgresql://neondb_owner:npg_uc8fRtixQZ6U@ep-orange-band-anlv6z
 
 TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w500"
 SITE_URL = "https://www.cinemega.online" 
-APP_DOWNLOAD_URL = "http://bgdv.online/27l1qh" # Seu encurtador oficial
+APP_DOWNLOAD_URL = "http://bgdv.online/27l1qh" # Seu link oficial
 
 GENEROS_MENU = {"🔥 Ação": 28, "🤡 Comédia": 35, "👻 Terror": 27, "🛸 Ficção": 878, "🕵️ Suspense": 53, "🧸 Animação": 16}
 EPOCAS_MENU = {"🎸 Anos 80": (1980, 1989), "💾 Anos 90": (1990, 1999), "💿 Anos 2000": (2000, 2010), "🆕 Recentes": (2020, 2026)}
@@ -63,37 +63,37 @@ async def send_item_info(context, chat_id, item, is_tv=False):
     
     link_assistir = f"{SITE_URL}/filme/{iid}"
     
-    # BUSCA DE TRAILER ROBUSTA
+    # BUSCA DE TRAILER PARA MINI PLAY
     v = make_tmdb_request(f"{'tv' if is_tv else 'movie'}/{iid}/videos")
     trailer_url = None
     if v and v.get('results'):
         video_list = v.get('results')
-        # Tenta achar exatamente o 'Trailer', se não houver, pega o primeiro vídeo disponível do YouTube
         trailer_obj = next((vid for vid in video_list if vid['type'] == 'Trailer' and vid['site'] == 'YouTube'), None)
-        if not trailer_obj and video_list:
-            trailer_obj = video_list[0]
-        
-        if trailer_obj:
-            trailer_url = f"https://youtube.com/watch?v={trailer_obj['key']}"
+        if not trailer_obj and video_list: trailer_obj = video_list[0]
+        if trailer_obj: trailer_url = f"https://youtube.com/watch?v={trailer_obj['key']}"
 
-    # MONTAGEM DOS BOTÕES
+    # BOTÕES PRINCIPAIS
     keyboard = [
         [InlineKeyboardButton("🚀 ASSISTIR ONLINE (Cine Mega)", url=link_assistir)],
         [InlineKeyboardButton("📲 BAIXAR APP OFICIAL (Android)", url=APP_DOWNLOAD_URL)]
     ]
     
-    # Só adiciona o botão de trailer se ele realmente existir
-    if trailer_url:
-        keyboard.insert(1, [InlineKeyboardButton("🎬 Ver Trailer Oficial", url=trailer_url)])
-    
     post = item.get("poster_path")
     markup = InlineKeyboardMarkup(keyboard)
+    
     try:
+        # 1. Envia a Foto com Sinopse e Botões
         if post:
             await context.bot.send_photo(chat_id, f"{TMDB_IMAGE_BASE_URL}{post}", caption=caption, parse_mode='HTML', reply_markup=markup)
         else:
             await context.bot.send_message(chat_id, caption, parse_mode='HTML', reply_markup=markup)
-    except: pass
+        
+        # 2. Envia o Trailer logo abaixo para gerar o Mini Play interno (Instant View)
+        if trailer_url:
+            await context.bot.send_message(chat_id, f"🎥 <b>Trailer Oficial:</b>\n{trailer_url}", parse_mode='HTML')
+            
+    except Exception as e:
+        logging.error(f"Erro ao enviar: {e}")
 
 # ================= HANDLERS DE TEXTO =================
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):

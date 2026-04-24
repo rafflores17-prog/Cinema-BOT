@@ -1,4 +1,4 @@
-# ================= BOT DE CINEMA v4.1 (ÉPOCAS & BUSCA INTELIGENTE) =================
+# ================= BOT DE CINEMA v4.5 (INTEGRAÇÃO CINE MEGA) =================
 import html
 import requests
 import random
@@ -14,6 +14,7 @@ TMDB_API_KEY = "c90fb79a2f7d756a49bee848bce5f413"
 DATABASE_URL = "postgresql://neondb_owner:npg_uc8fRtixQZ6U@ep-orange-band-anlv6zu6-pooler.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
 TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w500"
+SITE_URL = "https://www.cinemega.online" # Seu domínio oficial
 
 # Dicionários de Configuração Visual
 GENEROS_MENU = {"🔥 Ação": 28, "🤡 Comédia": 35, "👻 Terror": 27, "🛸 Ficção": 878, "🕵️ Suspense": 53, "🧸 Animação": 16}
@@ -60,13 +61,14 @@ async def send_item_info(context, chat_id, item, is_tv=False):
                f"{stars} ({rating:.1f}/10)\n"
                f"📖 {item.get('overview', 'Sinopse não disponível.')[:280]}...")
     
-    q_online = quote(f"assistir {title} dublado online")
+    # Lógica Cine Mega: Redireciona para a página do filme no seu site
+    link_assistir = f"{SITE_URL}/filme/{iid}"
     q_torrent = quote(f"{title} download torrent dublado 1080p")
     
     keyboard = [
-        [InlineKeyboardButton("🎬 Ver Trailer (YouTube)", callback_data=f"tr_{'tv' if is_tv else 'mv'}_{iid}")],
-        [InlineKeyboardButton("📺 Assistir Online", url=f"https://duckduckgo.com/?q={q_online}"),
-         InlineKeyboardButton("📥 Buscar Torrent", url=f"https://duckduckgo.com/?q={q_torrent}")]
+        [InlineKeyboardButton("🚀 ASSISTIR ONLINE (VIP)", url=link_assistir)],
+        [InlineKeyboardButton("🎬 Trailer", callback_data=f"tr_{'tv' if is_tv else 'mv'}_{iid}"),
+         InlineKeyboardButton("📥 Torrent", url=f"https://duckduckgo.com/?q={q_torrent}")]
     ]
     
     post = item.get("poster_path")
@@ -114,7 +116,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == '🔍 Buscar':
         await update.message.reply_text("⌨️ Digite: <code>/filme Nome do Filme</code>", parse_mode='HTML')
 
-# ================= CALLBACKS (BOTÕES INLINE) =================
+# ================= CALLBACKS =================
 async def callback_handler(update, context):
     query = update.callback_query; await query.answer()
     data = query.data; chat_id = query.message.chat_id
@@ -130,8 +132,7 @@ async def callback_handler(update, context):
         gid = data.split("_")[1]
         d = make_tmdb_request("discover/movie", {"with_genres": gid, "page": random.randint(1, 5)})
         if d.get('results'):
-            filmes = d.get('results')
-            random.shuffle(filmes)
+            filmes = d.get('results'); random.shuffle(filmes)
             for m in filmes[:3]: await send_item_info(context, chat_id, m)
 
     elif data.startswith("era_"):
@@ -140,24 +141,44 @@ async def callback_handler(update, context):
         ano_sorteado = random.randint(inicio, fim)
         d = make_tmdb_request("discover/movie", {"primary_release_year": ano_sorteado, "sort_by": "popularity.desc", "page": random.randint(1, 3)})
         if d.get('results'):
-            filmes = d.get('results')
-            random.shuffle(filmes)
-            await context.bot.send_message(chat_id, f"🎬 <b>Garimpando clássicos de {ano_sorteado}...</b>", parse_mode='HTML')
+            filmes = d.get('results'); random.shuffle(filmes)
+            await context.bot.send_message(chat_id, f"🎬 <b>Clássicos de {ano_sorteado}:</b>", parse_mode='HTML')
             for m in filmes[:3]: await send_item_info(context, chat_id, m)
+
+# ================= COMANDO BROADCAST (AVISO GERAL) =================
+@app.route # Apenas lembrete: este comando é para o dono do bot
+async def avisogeral(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != 123456789: # TROQUE PELO SEU ID DO TELEGRAM
+        return
+    msg = " ".join(context.args)
+    if not msg: return
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT chat_id FROM subscribed_chats")
+    chats = cur.fetchall()
+    count = 0
+    for chat in chats:
+        try:
+            await context.bot.send_message(chat[0], msg, parse_mode='HTML')
+            count += 1
+        except: continue
+    await update.message.reply_text(f"📢 Aviso enviado para {count} usuários!")
 
 # ================= START & MAIN =================
 async def start(update, context):
     add_chat_to_db(update.effective_chat.id)
-    kb = [
-        ['🎥 Em Cartaz', '🚀 Em Breve'],
-        ['🌟 Populares', '📺 Séries'],
-        ['🎭 Por Gênero', '🎞️ Por Época'],
-        ['🎲 Sugestão', '🔍 Buscar']
-    ]
+    kb = [['🎥 Em Cartaz', '🚀 Em Breve'], ['🌟 Populares', '📺 Séries'], ['🎭 Por Gênero', '🎞️ Por Época'], ['🎲 Sugestão', '🔍 Buscar']]
+    
+    # Propaganda do Site e App
+    promo_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌐 Acessar Site Oficial", url=SITE_URL)],
+        [InlineKeyboardButton("📱 Baixar App (Android)", url="https://t.me/APKBUGADO")] # Canal onde está o APK
+    ])
+    
     await update.message.reply_text(
-        "🎬 <b>Bem-vindo ao CineSky V4.1</b>\n\nO bot mais completo para os amantes de cinema!",
+        f"🎬 <b>CineSky v4.5 - Integrado ao Cine Mega</b>\n\nAgora você pode assistir seus filmes favoritos diretamente no nosso site oficial ou via APK!",
         parse_mode='HTML', reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
     )
+    await update.message.reply_text("Escolha uma opção ou use nossos links oficiais:", reply_markup=promo_kb)
 
 def main():
     setup_database()
@@ -166,7 +187,7 @@ def main():
     app.add_handler(CommandHandler('filme', lambda u, c: send_item_info(c, u.effective_chat.id, make_tmdb_request("search/movie", {"query": " ".join(c.args)}).get('results', [None])[0]) if c.args else None))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(callback_handler))
-    logging.info("CineSky v4.1 Online!")
+    logging.info("CineSky v4.5 Online!")
     app.run_polling()
 
 if __name__ == "__main__": main()

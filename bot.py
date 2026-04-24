@@ -4,7 +4,7 @@ import requests
 import random
 import logging
 import psycopg2
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
@@ -41,7 +41,7 @@ def add_chat_to_db(chat_id):
         conn.commit(); cur.close(); conn.close()
     except: pass
 
-# ================= TMDB & BUSCA =================
+# ================= TMDB & BUSCA INTELIGENTE DE TRAILER =================
 def make_tmdb_request(endpoint, params={}):
     base = "https://api.themoviedb.org/3"
     p = {"api_key": TMDB_API_KEY, "language": "pt-BR", **params}
@@ -49,6 +49,24 @@ def make_tmdb_request(endpoint, params={}):
         r = requests.get(f"{base}/{endpoint}", params=p, timeout=10)
         return r.json()
     except: return None
+
+def buscar_trailer_boost(item_id, titulo, is_tv=False):
+    """Tenta o TMDB, se falhar, gera link de busca no YouTube para o Mini Play"""
+    v = make_tmdb_request(f"{'tv' if is_tv else 'movie'}/{item_id}/videos")
+    if v and v.get('results'):
+        video_list = v.get('results')
+        # Tenta achar o Trailer Oficial
+        trailer_obj = next((vid for vid in video_list if vid['type'] == 'Trailer' and vid['site'] == 'YouTube'), None)
+        if trailer_obj:
+            return f"https://youtube.com/watch?v={trailer_obj['key']}"
+        # Se não tiver tipo 'Trailer', pega qualquer vídeo do YT
+        elif video_list:
+            yt_vid = next((vid for vid in video_list if vid['site'] == 'YouTube'), None)
+            if yt_vid: return f"https://youtube.com/watch?v={yt_vid['key']}"
+
+    # BOOST: Se nada acima funcionar, cria link de busca (O Telegram tenta puxar o 1º resultado)
+    busca_query = quote(f"{titulo} Trailer Oficial Português")
+    return f"https://www.youtube.com/results?search_query={busca_query}"
 
 async def send_item_info(context, chat_id, item, is_tv=False):
     if not item: return
@@ -63,14 +81,8 @@ async def send_item_info(context, chat_id, item, is_tv=False):
     
     link_assistir = f"{SITE_URL}/filme/{iid}"
     
-    # BUSCA DE TRAILER PARA MINI PLAY
-    v = make_tmdb_request(f"{'tv' if is_tv else 'movie'}/{iid}/videos")
-    trailer_url = None
-    if v and v.get('results'):
-        video_list = v.get('results')
-        trailer_obj = next((vid for vid in video_list if vid['type'] == 'Trailer' and vid['site'] == 'YouTube'), None)
-        if not trailer_obj and video_list: trailer_obj = video_list[0]
-        if trailer_obj: trailer_url = f"https://youtube.com/watch?v={trailer_obj['key']}"
+    # Busca turbinada de trailer para garantir o Mini Play
+    trailer_url = buscar_trailer_boost(iid, title, is_tv)
 
     # BOTÕES PRINCIPAIS
     keyboard = [
@@ -82,15 +94,15 @@ async def send_item_info(context, chat_id, item, is_tv=False):
     markup = InlineKeyboardMarkup(keyboard)
     
     try:
-        # 1. Envia a Foto com Sinopse e Botões
+        # 1. Envia a Foto/Sinopse com botões
         if post:
             await context.bot.send_photo(chat_id, f"{TMDB_IMAGE_BASE_URL}{post}", caption=caption, parse_mode='HTML', reply_markup=markup)
         else:
             await context.bot.send_message(chat_id, caption, parse_mode='HTML', reply_markup=markup)
         
-        # 2. Envia o Trailer logo abaixo para gerar o Mini Play interno (Instant View)
+        # 2. Envia o link do Trailer logo abaixo (Gera o player automático no Telegram)
         if trailer_url:
-            await context.bot.send_message(chat_id, f"🎥 <b>Trailer Oficial:</b>\n{trailer_url}", parse_mode='HTML')
+            await context.bot.send_message(chat_id, f"🎥 <b>Confira o Trailer:</b>\n{trailer_url}", parse_mode='HTML')
             
     except Exception as e:
         logging.error(f"Erro ao enviar: {e}")
@@ -146,19 +158,17 @@ async def callback_handler(update, context):
             filmes = d.get('results')[:10]; random.shuffle(filmes)
             for m in filmes[:3]: await send_item_info(context, chat_id, m)
 
-# ================= COMANDOS EXTRAS =================
+# ================= COMANDOS E START =================
 async def avisogeral(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = " ".join(context.args)
     if not msg: return
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT chat_id FROM subscribed_chats")
-    chats = cur.fetchall(); count = 0
+    chats = cur.fetchall()
     for chat in chats:
-        try:
-            await context.bot.send_message(chat[0], msg, parse_mode='HTML')
-            count += 1
+        try: await context.bot.send_message(chat[0], msg, parse_mode='HTML')
         except: continue
-    await update.message.reply_text(f"📢 Aviso enviado para {count} usuários!")
+    await update.message.reply_text("📢 Aviso enviado!")
 
 async def start(update, context):
     add_chat_to_db(update.effective_chat.id)
@@ -168,12 +178,11 @@ async def start(update, context):
         [InlineKeyboardButton("📲 BAIXAR APP OFICIAL (Android)", url=APP_DOWNLOAD_URL)]
     ])
     await update.message.reply_text(
-        f"🎬 <b>CineSky v4.7 - Cine Mega</b>\n\nBem-vindo Mestre! Encontre e assista seus filmes favoritos diretamente no nosso site ou pelo nosso aplicativo oficial!",
+        f"🎬 <b>CineSky v4.7 - Cine Mega</b>\n\nOlá Mestre! Tudo pronto para sua sessão de cinema hoje?",
         parse_mode='HTML', reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
     )
-    await update.message.reply_text("Escolha uma opção no menu ou baixe nosso APK para uma experiência nativa:", reply_markup=promo_kb)
+    await update.message.reply_text("Use o menu abaixo ou baixe nosso App para assistir agora:", reply_markup=promo_kb)
 
-# ================= EXECUÇÃO =================
 def main():
     setup_database()
     application = Application.builder().token(TOKEN).build()
@@ -182,7 +191,7 @@ def main():
     application.add_handler(CommandHandler('filme', lambda u, c: send_item_info(c, u.effective_chat.id, make_tmdb_request("search/movie", {"query": " ".join(c.args)}).get('results', [None])[0]) if c.args else None))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(CallbackQueryHandler(callback_handler))
-    logging.info("CineSky v4.7 Online!")
+    logging.info("CineSky v4.7 Online com Boost de Trailer!")
     application.run_polling()
 
 if __name__ == "__main__": main()

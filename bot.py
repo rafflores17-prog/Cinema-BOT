@@ -14,7 +14,7 @@ TMDB_API_KEY = "c90fb79a2f7d756a49bee848bce5f413"
 DATABASE_URL = "postgresql://neondb_owner:npg_uc8fRtixQZ6U@ep-orange-band-anlv6zu6-pooler.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
 TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w500"
-SITE_URL = "www.cinemega.online" 
+SITE_URL = "cinemega.online" 
 APP_DOWNLOAD_URL = "http://bgdv.online/a4qjfr" # Seu link oficial
 
 GENEROS_MENU = {"🔥 Ação": 28, "🤡 Comédia": 35, "👻 Terror": 27, "🛸 Ficção": 878, "🕵️ Suspense": 53, "🧸 Animação": 16}

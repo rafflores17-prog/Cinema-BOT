@@ -14,7 +14,8 @@ TMDB_API_KEY = "c90fb79a2f7d756a49bee848bce5f413"
 DATABASE_URL = "postgresql://neondb_owner:npg_uc8fRtixQZ6U@ep-orange-band-anlv6zu6-pooler.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
 TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w500"
-SITE_URL = "cinemega.online" 
+# AJUSTE: Incluindo o protocolo correto para o Render
+SITE_URL = "https://cinemega.online" 
 APP_DOWNLOAD_URL = "http://bgdv.online/a4qjfr" # Seu link oficial
 
 GENEROS_MENU = {"🔥 Ação": 28, "🤡 Comédia": 35, "👻 Terror": 27, "🛸 Ficção": 878, "🕵️ Suspense": 53, "🧸 Animação": 16}
@@ -51,20 +52,16 @@ def make_tmdb_request(endpoint, params={}):
     except: return None
 
 def buscar_trailer_boost(item_id, titulo, is_tv=False):
-    """Tenta o TMDB, se falhar, gera link de busca no YouTube para o Mini Play"""
     v = make_tmdb_request(f"{'tv' if is_tv else 'movie'}/{item_id}/videos")
     if v and v.get('results'):
         video_list = v.get('results')
-        # Tenta achar o Trailer Oficial
         trailer_obj = next((vid for vid in video_list if vid['type'] == 'Trailer' and vid['site'] == 'YouTube'), None)
         if trailer_obj:
             return f"https://youtube.com/watch?v={trailer_obj['key']}"
-        # Se não tiver tipo 'Trailer', pega qualquer vídeo do YT
         elif video_list:
             yt_vid = next((vid for vid in video_list if vid['site'] == 'YouTube'), None)
             if yt_vid: return f"https://youtube.com/watch?v={yt_vid['key']}"
 
-    # BOOST: Se nada acima funcionar, cria link de busca (O Telegram tenta puxar o 1º resultado)
     busca_query = quote(f"{titulo} Trailer Oficial Português")
     return f"https://www.youtube.com/results?search_query={busca_query}"
 
@@ -79,12 +76,12 @@ async def send_item_info(context, chat_id, item, is_tv=False):
                f"{stars} ({rating:.1f}/10)\n"
                f"📖 {item.get('overview', 'Sinopse não disponível.')[:280]}...")
     
+    # AJUSTE: Link garantido para o seu novo site no Render
     link_assistir = f"{SITE_URL}/filme/{iid}"
     
-    # Busca turbinada de trailer para garantir o Mini Play
     trailer_url = buscar_trailer_boost(iid, title, is_tv)
 
-    # BOTÕES PRINCIPAIS
+    # BOTÕES PRINCIPAIS CORRIGIDOS
     keyboard = [
         [InlineKeyboardButton("🚀 ASSISTIR ONLINE (Cine Mega)", url=link_assistir)],
         [InlineKeyboardButton("📲 BAIXAR APP OFICIAL (Android)", url=APP_DOWNLOAD_URL)]
@@ -94,13 +91,11 @@ async def send_item_info(context, chat_id, item, is_tv=False):
     markup = InlineKeyboardMarkup(keyboard)
     
     try:
-        # 1. Envia a Foto/Sinopse com botões
         if post:
             await context.bot.send_photo(chat_id, f"{TMDB_IMAGE_BASE_URL}{post}", caption=caption, parse_mode='HTML', reply_markup=markup)
         else:
             await context.bot.send_message(chat_id, caption, parse_mode='HTML', reply_markup=markup)
         
-        # 2. Envia o link do Trailer logo abaixo (Gera o player automático no Telegram)
         if trailer_url:
             await context.bot.send_message(chat_id, f"🎥 <b>Confira o Trailer:</b>\n{trailer_url}", parse_mode='HTML')
             
@@ -191,7 +186,7 @@ def main():
     application.add_handler(CommandHandler('filme', lambda u, c: send_item_info(c, u.effective_chat.id, make_tmdb_request("search/movie", {"query": " ".join(c.args)}).get('results', [None])[0]) if c.args else None))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(CallbackQueryHandler(callback_handler))
-    logging.info("CineSky v4.7 Online com Boost de Trailer!")
+    logging.info("CineSky v4.7 Online Corrigido!")
     application.run_polling()
 
 if __name__ == "__main__": main()

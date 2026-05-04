@@ -14,9 +14,7 @@ TMDB_API_KEY = "c90fb79a2f7d756a49bee848bce5f413"
 DATABASE_URL = "postgresql://neondb_owner:npg_uc8fRtixQZ6U@ep-orange-band-anlv6zu6-pooler.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
 TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w500"
-# AJUSTE: Incluindo o protocolo correto para o Render
 SITE_URL = "https://cinemega.online" 
-APP_DOWNLOAD_URL = "http://bgdv.online/a4qjfr" # Seu link oficial
 
 GENEROS_MENU = {"🔥 Ação": 28, "🤡 Comédia": 35, "👻 Terror": 27, "🛸 Ficção": 878, "🕵️ Suspense": 53, "🧸 Animação": 16}
 EPOCAS_MENU = {"🎸 Anos 80": (1980, 1989), "💾 Anos 90": (1990, 1999), "💿 Anos 2000": (2000, 2010), "🆕 Recentes": (2020, 2026)}
@@ -76,15 +74,11 @@ async def send_item_info(context, chat_id, item, is_tv=False):
                f"{stars} ({rating:.1f}/10)\n"
                f"📖 {item.get('overview', 'Sinopse não disponível.')[:280]}...")
     
-    # AJUSTE: Link garantido para o seu novo site no Render
-    link_assistir = f"{SITE_URL}/filme/{iid}"
-    
     trailer_url = buscar_trailer_boost(iid, title, is_tv)
 
-    # BOTÕES PRINCIPAIS CORRIGIDOS
+    # BOTÃO ÚNICO DIRECIONANDO PARA O SITE OFICIAL
     keyboard = [
-        [InlineKeyboardButton("🚀 ASSISTIR ONLINE (Cine Mega)", url=link_assistir)],
-        [InlineKeyboardButton("📲 BAIXAR APP OFICIAL (Android)", url=APP_DOWNLOAD_URL)]
+        [InlineKeyboardButton("▶ ACESSAR CINE MEGA", url=SITE_URL)]
     ]
     
     post = item.get("poster_path")
@@ -168,15 +162,17 @@ async def avisogeral(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update, context):
     add_chat_to_db(update.effective_chat.id)
     kb = [['🎥 Em Cartaz', '🚀 Em Breve'], ['🌟 Populares', '📺 Séries'], ['🎭 Por Gênero', '🎞️ Por Época'], ['🎲 Sugestão', '🔍 Buscar']]
+    
+    # BOTÃO ÚNICO NO START
     promo_kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌐 Acessar Site Oficial", url=SITE_URL)],
-        [InlineKeyboardButton("📲 BAIXAR APP OFICIAL (Android)", url=APP_DOWNLOAD_URL)]
+        [InlineKeyboardButton("🌐 ACESSAR CINE MEGA", url=SITE_URL)]
     ])
+    
     await update.message.reply_text(
-        f"🎬 <b>CineSky v4.7 - Cine Mega</b>\n\nOlá Mestre! Tudo pronto para sua sessão de cinema hoje?",
+        f"🎬 <b>CineSky v4.7 - Cine Mega</b>\n\nOlá! Tudo pronto para sua sessão de cinema hoje?",
         parse_mode='HTML', reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
     )
-    await update.message.reply_text("Use o menu abaixo ou baixe nosso App para assistir agora:", reply_markup=promo_kb)
+    await update.message.reply_text("Acesse nosso site oficial para assistir e explorar o catálogo completo:", reply_markup=promo_kb)
 
 def main():
     setup_database()
@@ -186,7 +182,7 @@ def main():
     application.add_handler(CommandHandler('filme', lambda u, c: send_item_info(c, u.effective_chat.id, make_tmdb_request("search/movie", {"query": " ".join(c.args)}).get('results', [None])[0]) if c.args else None))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(CallbackQueryHandler(callback_handler))
-    logging.info("CineSky v4.7 Online Corrigido!")
+    logging.info("CineSky v4.7 Online com Botão Único!")
     application.run_polling()
 
 if __name__ == "__main__": main()

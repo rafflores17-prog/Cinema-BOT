@@ -14,7 +14,7 @@ TMDB_API_KEY = "c90fb79a2f7d756a49bee848bce5f413"
 DATABASE_URL = "postgresql://neondb_owner:npg_uc8fRtixQZ6U@ep-orange-band-anlv6zu6-pooler.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
 TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w500"
-# URL do seu site oficial
+# Link da sua página principal para evitar erro 404
 SITE_URL = "https://cinemega.online" 
 
 GENEROS_MENU = {"🔥 Ação": 28, "🤡 Comédia": 35, "👻 Terror": 27, "🛸 Ficção": 878, "🕵️ Suspense": 53, "🧸 Animação": 16}
@@ -75,14 +75,11 @@ async def send_item_info(context, chat_id, item, is_tv=False):
                f"{stars} ({rating:.1f}/10)\n"
                f"📖 {item.get('overview', 'Sinopse não disponível.')[:280]}...")
     
-    # AJUSTE DE MESTRE: Link direto para o player do filme no site
-    link_direto_filme = f"{SITE_URL}/filme/{iid}"
-    
     trailer_url = buscar_trailer_boost(iid, title, is_tv)
 
-    # BOTÃO ÚNICO CORRIGIDO PARA DIRECIONAR AO FILME ESPECÍFICO
+    # BOTÃO ÚNICO PARA A HOME (Evita o erro 404)
     keyboard = [
-        [InlineKeyboardButton("▶ ASSISTIR NO CINE MEGA", url=link_direto_filme)]
+        [InlineKeyboardButton("▶ ASSISTIR NO CINE MEGA", url=SITE_URL)]
     ]
     
     post = item.get("poster_path")
@@ -167,7 +164,6 @@ async def start(update, context):
     add_chat_to_db(update.effective_chat.id)
     kb = [['🎥 Em Cartaz', '🚀 Em Breve'], ['🌟 Populares', '📺 Séries'], ['🎭 Por Gênero', '🎞️ Por Época'], ['🎲 Sugestão', '🔍 Buscar']]
     
-    # BOTÃO DE ACESSO AO SITE NO START
     promo_kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🌐 ACESSAR SITE OFICIAL", url=SITE_URL)]
     ])
@@ -176,7 +172,7 @@ async def start(update, context):
         f"🎬 <b>CineSky v4.7 - Cine Mega</b>\n\nOlá Mestre! Tudo pronto para sua sessão de cinema hoje?",
         parse_mode='HTML', reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
     )
-    await update.message.reply_text("Explore nosso catálogo VIP e assista agora pelo site:", reply_markup=promo_kb)
+    await update.message.reply_text("Acesse nosso site oficial para assistir agora:", reply_markup=promo_kb)
 
 def main():
     setup_database()
@@ -186,7 +182,7 @@ def main():
     application.add_handler(CommandHandler('filme', lambda u, c: send_item_info(c, u.effective_chat.id, make_tmdb_request("search/movie", {"query": " ".join(c.args)}).get('results', [None])[0]) if c.args else None))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(CallbackQueryHandler(callback_handler))
-    logging.info("CineSky v4.7 Online Corrigido!")
+    logging.info("Bot Online - Direcionando para a Home!")
     application.run_polling()
 
 if __name__ == "__main__": main()

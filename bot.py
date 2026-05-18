@@ -14,7 +14,8 @@ TMDB_API_KEY = "c90fb79a2f7d756a49bee848bce5f413"
 DATABASE_URL = "postgresql://neondb_owner:npg_uc8fRtixQZ6U@ep-orange-band-anlv6zu6-pooler.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
 TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w500"
-SITE_URL = "https://cinemega.online"
+# NOVO SITE
+SITE_URL = "https://streamflix-app-iota.vercel.app"
 
 # ID do grupo @streamflixofc
 GRUPO_ID = -1003177664821
@@ -73,7 +74,6 @@ async def enviar_no_topico(context, text=None, photo=None, caption=None, reply_m
     """Envia mensagem SEMPRE no tópico 4342 do grupo"""
     kwargs = {"parse_mode": parse_mode}
     
-    # SEMPRE força o envio no tópico 4342
     if TOPIC_ID:
         kwargs["message_thread_id"] = TOPIC_ID
     
@@ -101,9 +101,20 @@ async def send_item_info(context, item, is_tv=False):
     
     trailer_url = buscar_trailer_boost(iid, title, is_tv)
 
-    # BOTÕES: Site + Link do tópico
+    # ============================================
+    # LINK DIRETO PARA O FILME NO SEU SITE
+    # ============================================
+    # Cria link de busca no seu site com o título do filme
+    titulo_url = quote(title)
+    link_filme = f"{SITE_URL}/search?q={titulo_url}"
+    # Se seu site usar outro formato de URL, ajuste aqui:
+    # Exemplos:
+    # link_filme = f"{SITE_URL}/movie/{iid}"  # se usar TMDB ID
+    # link_filme = f"{SITE_URL}/search/{titulo_url}"  # se usar /search/
+    # link_filme = f"{SITE_URL}/?s={titulo_url}"  # se usar parâmetro ?s=
+    
     keyboard = [
-        [InlineKeyboardButton("▶ ASSISTIR NO CINE MEGA", url=SITE_URL)],
+        [InlineKeyboardButton("▶ ASSISTIR AGORA", url=link_filme)],
         [InlineKeyboardButton("💬 Ver no Tópico StreamFlix", url="https://t.me/streamflixofc/4342")]
     ]
     
@@ -126,7 +137,6 @@ async def send_item_info(context, item, is_tv=False):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     
-    # Só responde se for no grupo correto
     if update.effective_chat.id != GRUPO_ID:
         return
     
@@ -201,7 +211,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("💬 Ir para o Tópico StreamFlix", url="https://t.me/streamflixofc/4342")]
     ])
     
-    # Envia no tópico 4342
     await enviar_no_topico(
         context,
         text=f"🎬 <b>CineSky v4.7 - Cine Mega</b>\n\nOlá {html.escape(user.first_name)}! Tudo pronto para sua sessão de cinema hoje?",
@@ -217,7 +226,7 @@ def main():
     application.add_handler(CommandHandler('filme', lambda u, c: send_item_info(c, make_tmdb_request("search/movie", {"query": " ".join(c.args)}).get('results', [None])[0]) if c.args else None))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(CallbackQueryHandler(callback_handler))
-    logging.info(f"✅ Bot Online - Respondendo no tópico {TOPIC_ID}!")
+    logging.info(f"✅ Bot Online - Site: {SITE_URL} | Tópico: {TOPIC_ID}")
     application.run_polling()
 
 if __name__ == "__main__": main()

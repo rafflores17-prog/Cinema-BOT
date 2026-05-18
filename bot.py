@@ -14,15 +14,14 @@ TMDB_API_KEY = "c90fb79a2f7d756a49bee848bce5f413"
 DATABASE_URL = "postgresql://neondb_owner:npg_uc8fRtixQZ6U@ep-orange-band-anlv6zu6-pooler.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
 TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w500"
-# Link da sua página principal para evitar erro 404
 SITE_URL = "https://cinemega.online"
 
-# ================= CONFIGURAÇÃO DO TÓPICO =================
-# ID do tópico onde o bot vai responder (do link https://t.me/streamflixofc/4342)
-TOPIC_ID = 4342
-# ID do chat/grupo (substitua pelo ID numérico do @streamflixofc)
-# Para descobrir: adicione o bot @userinfobot no grupo ou use a API
-TARGET_CHAT_ID = -1001234567890  # <-- SUBSTITUA PELO ID NUMÉRICO REAL DO GRUPO @streamflixofc
+# ID do grupo @streamflixofc (COM -100 NA FRENTE)
+GRUPO_ID = -1003177664821
+
+# ⬇️⬇️⬇️ IMPORTANTE: SUBSTITUA ISSO PELO ID REAL DO TÓPICO ⬇️⬇️⬇️
+# Use o comando /topic no tópico desejado para descobrir
+TOPIC_ID = 2  # TROQUE AQUI DEPOIS DE USAR /topic
 
 GENEROS_MENU = {"🔥 Ação": 28, "🤡 Comédia": 35, "👻 Terror": 27, "🛸 Ficção": 878, "🕵️ Suspense": 53, "🧸 Animação": 16}
 EPOCAS_MENU = {"🎸 Anos 80": (1980, 1989), "💾 Anos 90": (1990, 1999), "💿 Anos 2000": (2000, 2010), "🆕 Recentes": (2020, 2026)}
@@ -71,7 +70,35 @@ def buscar_trailer_boost(item_id, titulo, is_tv=False):
     busca_query = quote(f"{titulo} Trailer Oficial Português")
     return f"https://www.youtube.com/results?search_query={busca_query}"
 
-async def send_item_info(context, chat_id, item, is_tv=False, message_thread_id=None):
+# ================= FUNÇÃO DE ENVIO NO TÓPICO =================
+async def send_to_topic(context, text=None, photo=None, caption=None, reply_markup=None, parse_mode='HTML'):
+    """Envia mensagem no tópico específico do grupo"""
+    try:
+        kwargs = {"parse_mode": parse_mode}
+        if reply_markup:
+            kwargs["reply_markup"] = reply_markup
+        
+        # SEMPRE envia no tópico configurado
+        if TOPIC_ID and TOPIC_ID > 1:
+            kwargs["message_thread_id"] = TOPIC_ID
+        
+        if photo:
+            return await context.bot.send_photo(GRUPO_ID, photo, caption=caption, **kwargs)
+        elif text:
+            return await context.bot.send_message(GRUPO_ID, text, **kwargs)
+            
+    except Exception as e:
+        logging.error(f"Erro ao enviar no tópico {TOPIC_ID}: {e}")
+        # Fallback: envia sem tópico (cai no geral)
+        try:
+            if photo:
+                return await context.bot.send_photo(GRUPO_ID, photo, caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
+            elif text:
+                return await context.bot.send_message(GRUPO_ID, text, parse_mode=parse_mode, reply_markup=reply_markup)
+        except Exception as e2:
+            logging.error(f"Erro fallback: {e2}")
+
+async def send_item_info(context, item, is_tv=False):
     if not item: return
     iid = item.get("id")
     title = item.get("name") if is_tv else item.get("title")
@@ -84,79 +111,71 @@ async def send_item_info(context, chat_id, item, is_tv=False, message_thread_id=
     
     trailer_url = buscar_trailer_boost(iid, title, is_tv)
 
-    # BOTÃO COM LINK DO TÓPICO E DO SITE
+    # BOTÕES: Site + Link direto do tópico
     keyboard = [
         [InlineKeyboardButton("▶ ASSISTIR NO CINE MEGA", url=SITE_URL)],
-        [InlineKeyboardButton("💬 Ir para o Tópico", url="https://t.me/streamflixofc/4342")]
+        [InlineKeyboardButton("💬 Ver no Tópico StreamFlix", url="https://t.me/streamflixofc/4342")]
     ]
     
     post = item.get("poster_path")
     markup = InlineKeyboardMarkup(keyboard)
     
-    # Parâmetros comuns para envio no tópico
-    kwargs = {"parse_mode": 'HTML', "reply_markup": markup}
-    if message_thread_id:
-        kwargs["message_thread_id"] = message_thread_id
-    
     try:
         if post:
-            await context.bot.send_photo(chat_id, f"{TMDB_IMAGE_BASE_URL}{post}", caption=caption, **kwargs)
+            await send_to_topic(context, photo=f"{TMDB_IMAGE_BASE_URL}{post}", caption=caption, reply_markup=markup)
         else:
-            await context.bot.send_message(chat_id, caption, **kwargs)
+            await send_to_topic(context, text=caption, reply_markup=markup)
         
         if trailer_url:
-            trailer_kwargs = {"parse_mode": 'HTML'}
-            if message_thread_id:
-                trailer_kwargs["message_thread_id"] = message_thread_id
-            await context.bot.send_message(chat_id, f"🎥 <b>Confira o Trailer:</b>\n{trailer_url}", **trailer_kwargs)
+            await send_to_topic(context, text=f"🎥 <b>Confira o Trailer:</b>\n{trailer_url}")
             
     except Exception as e:
-        logging.error(f"Erro ao enviar: {e}")
+        logging.error(f"Erro ao enviar filme: {e}")
 
 # ================= HANDLERS DE TEXTO =================
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    chat_id = update.effective_chat.id
-    # Usa o message_thread_id da mensagem atual, ou o TOPIC_ID definido
-    thread_id = update.message.message_thread_id if update.message and update.message.message_thread_id else TOPIC_ID
+    
+    # IGNORA mensagens que não são do grupo configurado
+    if update.effective_chat.id != GRUPO_ID:
+        return
     
     if text == '🎥 Em Cartaz':
         d = make_tmdb_request("movie/now_playing", {"region": "BR"})
-        for m in d.get('results', [])[:3]: await send_item_info(context, chat_id, m, message_thread_id=thread_id)
+        for m in d.get('results', [])[:3]: await send_item_info(context, m)
     elif text == '🚀 Em Breve':
         d = make_tmdb_request("movie/upcoming", {"region": "BR"})
-        for m in d.get('results', [])[:3]: await send_item_info(context, chat_id, m, message_thread_id=thread_id)
+        for m in d.get('results', [])[:3]: await send_item_info(context, m)
     elif text == '🌟 Populares':
         d = make_tmdb_request("movie/popular", {"region": "BR"})
-        for m in d.get('results', [])[:3]: await send_item_info(context, chat_id, m, message_thread_id=thread_id)
+        for m in d.get('results', [])[:3]: await send_item_info(context, m)
     elif text == '📺 Séries':
         d = make_tmdb_request("tv/popular")
-        for s in d.get('results', [])[:3]: await send_item_info(context, chat_id, s, is_tv=True, message_thread_id=thread_id)
+        for s in d.get('results', [])[:3]: await send_item_info(context, s, is_tv=True)
     elif text == '🎭 Por Gênero':
         btns = [[InlineKeyboardButton(n, callback_data=f"gen_{i}")] for n, i in GENEROS_MENU.items()]
-        await update.message.reply_text("✨ <b>Escolha um Gênero:</b>", parse_mode='HTML', reply_markup=InlineKeyboardMarkup(btns))
+        await send_to_topic(context, text="✨ <b>Escolha um Gênero:</b>", reply_markup=InlineKeyboardMarkup(btns))
     elif text == '🎞️ Por Época':
         btns = [[InlineKeyboardButton(n, callback_data=f"era_{n}")] for n in EPOCAS_MENU.keys()]
-        await update.message.reply_text("⏳ <b>Escolha uma Época:</b>", parse_mode='HTML', reply_markup=InlineKeyboardMarkup(btns))
+        await send_to_topic(context, text="⏳ <b>Escolha uma Época:</b>", reply_markup=InlineKeyboardMarkup(btns))
     elif text == '🎲 Sugestão':
         d = make_tmdb_request("movie/top_rated", {"page": random.randint(1, 20)})
-        if d.get('results'): await send_item_info(context, chat_id, random.choice(d['results']), message_thread_id=thread_id)
+        if d.get('results'): await send_item_info(context, random.choice(d['results']))
     elif text == '🔍 Buscar':
-        await update.message.reply_text("⌨️ Digite: <code>/filme Nome do Filme</code>", parse_mode='HTML')
+        await send_to_topic(context, text="⌨️ Digite: <code>/filme Nome do Filme</code>")
 
 # ================= CALLBACKS =================
 async def callback_handler(update, context):
     query = update.callback_query; await query.answer()
-    data = query.data; chat_id = query.message.chat_id
-    # Tenta pegar o thread_id da mensagem do callback
-    thread_id = query.message.message_thread_id if query.message and query.message.message_thread_id else TOPIC_ID
+    data = query.data
     
+    # Sempre responde no tópico configurado
     if data.startswith("gen_"):
         gid = data.split("_")[1]
         d = make_tmdb_request("discover/movie", {"with_genres": gid, "page": random.randint(1, 5)})
         if d and d.get('results'):
             filmes = d.get('results'); random.shuffle(filmes)
-            for m in filmes[:3]: await send_item_info(context, chat_id, m, message_thread_id=thread_id)
+            for m in filmes[:3]: await send_item_info(context, m)
 
     elif data.startswith("era_"):
         era_nome = data.split("_")[1]
@@ -164,14 +183,11 @@ async def callback_handler(update, context):
         ano_sorteado = random.randint(inicio, fim)
         d = make_tmdb_request("discover/movie", {"primary_release_year": ano_sorteado, "sort_by": "popularity.desc", "page": 1})
         if d and d.get('results'):
-            msg_kwargs = {"parse_mode": 'HTML'}
-            if thread_id:
-                msg_kwargs["message_thread_id"] = thread_id
-            await context.bot.send_message(chat_id, f"🎞️ <b>Buscando os melhores de {ano_sorteado}...</b>", **msg_kwargs)
+            await send_to_topic(context, text=f"🎞️ <b>Buscando os melhores de {ano_sorteado}...</b>")
             filmes = d.get('results')[:10]; random.shuffle(filmes)
-            for m in filmes[:3]: await send_item_info(context, chat_id, m, message_thread_id=thread_id)
+            for m in filmes[:3]: await send_item_info(context, m)
 
-# ================= COMANDOS E START =================
+# ================= COMANDOS =================
 async def avisogeral(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = " ".join(context.args)
     if not msg: return
@@ -180,15 +196,14 @@ async def avisogeral(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chats = cur.fetchall()
     for chat in chats:
         try: 
-            await context.bot.send_message(chat[0], msg, parse_mode='HTML', message_thread_id=TOPIC_ID)
+            await send_to_topic(context, text=msg)
         except: 
             continue
-    await update.message.reply_text("📢 Aviso enviado!")
+    await update.message.reply_text("📢 Aviso enviado no tópico!")
 
-async def start(update, context):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_chat_to_db(update.effective_chat.id)
-    chat_id = update.effective_chat.id
-    thread_id = update.message.message_thread_id if update.message and update.message.message_thread_id else TOPIC_ID
+    user = update.effective_user
     
     kb = [['🎥 Em Cartaz', '🚀 Em Breve'], ['🌟 Populares', '📺 Séries'], ['🎭 Por Gênero', '🎞️ Por Época'], ['🎲 Sugestão', '🔍 Buscar']]
     
@@ -197,30 +212,48 @@ async def start(update, context):
         [InlineKeyboardButton("💬 Ir para o Tópico StreamFlix", url="https://t.me/streamflixofc/4342")]
     ])
     
-    start_kwargs = {"parse_mode": 'HTML', "reply_markup": ReplyKeyboardMarkup(kb, resize_keyboard=True)}
-    if thread_id:
-        start_kwargs["message_thread_id"] = thread_id
-    
-    await update.message.reply_text(
-        f"🎬 <b>CineSky v4.7 - Cine Mega</b>\n\nOlá Mestre! Tudo pronto para sua sessão de cinema hoje?",
-        **start_kwargs
+    # Envia no tópico configurado
+    await send_to_topic(
+        context,
+        text=f"🎬 <b>CineSky v4.7 - Cine Mega</b>\n\nOlá {html.escape(user.first_name)}! Tudo pronto para sua sessão de cinema hoje?",
+        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
     )
+    await send_to_topic(context, text="Acesse nosso site oficial para assistir agora:", reply_markup=promo_kb)
+
+# ⬇️⬇️⬇️ COMANDO PARA DESCOBRIR O ID DO TÓPICO ⬇️⬇️⬇️
+async def descobrir_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Envie /topic DENTRO do tópico que você quer que o bot responda"""
+    chat_id = update.effective_chat.id
+    thread_id = update.message.message_thread_id if update.message else None
     
-    promo_kwargs = {"reply_markup": promo_kb}
     if thread_id:
-        promo_kwargs["message_thread_id"] = thread_id
-    
-    await context.bot.send_message(chat_id, "Acesse nosso site oficial para assistir agora:", **promo_kwargs)
+        await update.message.reply_text(
+            f"✅ <b>ID do tópico detectado!</b>\n\n"
+            f"• Chat ID: <code>{chat_id}</code>\n"
+            f"• Thread ID: <code>{thread_id}</code>\n\n"
+            f"Substitua no código:\n"
+            f"<code>TOPIC_ID = {thread_id}</code>",
+            parse_mode='HTML'
+        )
+    else:
+        await update.message.reply_text(
+            "❌ <b>Esta mensagem não está em um tópico!</b>\n\n"
+            "1. Vá no tópico que você quer (ex: o tópico 4342)\n"
+            "2. Envie <code>/topic</code> DENTRO daquele tópico\n"
+            "3. O bot vai te dar o ID correto",
+            parse_mode='HTML'
+        )
 
 def main():
     setup_database()
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('avisogeral', avisogeral))
-    application.add_handler(CommandHandler('filme', lambda u, c: send_item_info(c, u.effective_chat.id, make_tmdb_request("search/movie", {"query": " ".join(c.args)}).get('results', [None])[0], message_thread_id=TOPIC_ID) if c.args else None))
+    application.add_handler(CommandHandler('topic', descobrir_topic))  # NOVO COMANDO
+    application.add_handler(CommandHandler('filme', lambda u, c: send_item_info(c, make_tmdb_request("search/movie", {"query": " ".join(c.args)}).get('results', [None])[0]) if c.args else None))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(CallbackQueryHandler(callback_handler))
-    logging.info("Bot Online - Direcionando para o Tópico!")
+    logging.info(f"Bot Online - Tópico configurado: {TOPIC_ID}")
     application.run_polling()
 
 if __name__ == "__main__": main()

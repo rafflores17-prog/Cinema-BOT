@@ -115,7 +115,7 @@ async def send_item_info(context, item, is_tv=False):
     
     keyboard = [
         [InlineKeyboardButton("▶ ASSISTIR AGORA", url=link_filme)],
-        [InlineKeyboardButton("💬 Ver no Tópico StreamFlix", url="https://t.me/streamflixofc/4342")]
+        [InlineKeyboardButton("💬 BAIXAR APP AQUI", url="http://bgdv.online/ed7g1w")]
     ]
     
     post = item.get("poster_path")

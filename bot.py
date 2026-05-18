@@ -208,7 +208,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     promo_kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🌐 ACESSAR SITE OFICIAL", url=SITE_URL)],
-        [InlineKeyboardButton("💬 Ir para o Tópico StreamFlix", url="https://t.me/streamflixofc/4342")]
+        [InlineKeyboardButton("💬 BAIXAR APP AQUI", url="http://bgdv.online/ed7g1w")]
     ])
     
     await enviar_no_topico(

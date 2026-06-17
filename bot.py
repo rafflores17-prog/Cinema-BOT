@@ -19,7 +19,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 # Recomendo fortemente revogar/regenerar ambos e colocar os novos valores
 # como variáveis de ambiente no painel do Zeabur (aba "Variable"),
 # em vez de deixá-los escritos no código.
-TOKEN = os.environ.get("BOT_TOKEN", "8158367501:AAFDh-On-TklycKt2aj9WxUvQjWvxrH_U-Y")
+TOKEN = os.environ.get("BOT_TOKEN", "8158367501:AAEpU5YkliLbY9xddHohmbW6wTffM1ye49U")
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "c90fb79a2f7d756a49bee848bce5f413")
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",

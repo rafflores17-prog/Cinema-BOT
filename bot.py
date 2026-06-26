@@ -1,6 +1,6 @@
 # ================= BOT DE CINEMA v7.0 — StreamFlix Edition =================
 # Melhorias v7:
-#   ✅ Deep link corrigido: SITE_URL/#/title/{id}/{type}  (abre direto no filme)
+#   ✅ Deep link via query string: SITE_URL/?id={id}&type={type}  (abre direto no filme)
 #   ✅ Mais info no card: elenco, diretor, gêneros, duração, nota detalhada
 #   ✅ Botão trailer com link do YouTube embutido (t.me/iv para preview inline)
 #   ✅ Posts de séries com info de temporadas/episódios
@@ -135,12 +135,12 @@ def get_trailer_url(item_id, titulo, is_tv=False):
 
 def link_streamflix(item_id, is_tv=False):
     """
-    ✅ Deep link correto para o app StreamFlix.
-    Formato: SITE_URL/#/title/{id}/{type}
-    O router do app detecta via hashchange e chama openDetailPage(id, type).
+    Deep link para o app StreamFlix via query string (?id=X&type=Y).
+    O app lê os params no init() e converte para hash #/title/{id}/{type}.
+    Isso resolve o problema do Telegram/Chrome que ignora o # em links externos.
     """
     tipo = "tv" if is_tv else "movie"
-    return f"{SITE_URL}/#/title/{item_id}/{tipo}"
+    return f"{SITE_URL}/?id={item_id}&type={tipo}"
 
 def formatar_estrelas(rating):
     """Converte nota 0-10 em estrelas."""

@@ -19,8 +19,10 @@ from telegram.ext import (Application, CommandHandler, MessageHandler,
                           filters, ContextTypes, CallbackQueryHandler, JobQueue)
 
 # ── Variáveis de ambiente ──────────────────────────────────────────────────
-TOKEN        = os.environ.get("BOT_TOKEN",    "SEU_TOKEN_AQUI")
-TMDB_KEY     = os.environ.get("TMDB_API_KEY", "SUA_CHAVE_TMDB_AQUI")
+# ── Nomes das variáveis conforme configurado no Koyeb ─────────────────────
+# Koyeb: TOKEN, TMDB_API_KEY, DATABASE_URL, SITE_URL, APP_URL, GRUPO_ID, TOPIC_ID
+TOKEN        = os.environ.get("TOKEN",        os.environ.get("BOT_TOKEN", ""))
+TMDB_KEY     = os.environ.get("TMDB_API_KEY", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 SITE_URL     = os.environ.get("SITE_URL",     "https://streamflix-red.zeabur.app")
 APP_URL      = os.environ.get("APP_URL",      "https://streamflix-red.zeabur.app")

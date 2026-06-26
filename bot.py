@@ -24,8 +24,8 @@ from telegram.ext import (Application, CommandHandler, MessageHandler,
 TOKEN        = os.environ.get("TOKEN",        os.environ.get("BOT_TOKEN", ""))
 TMDB_KEY     = os.environ.get("TMDB_API_KEY", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-SITE_URL     = os.environ.get("SITE_URL",     "https://streamflix-red.zeabur.app")
-APP_URL      = os.environ.get("APP_URL",      "https://streamflix-red.zeabur.app")
+SITE_URL     = os.environ.get("SITE_URL",     "https://streamflixvip.online")
+APP_URL      = os.environ.get("APP_URL",      "https://streamflixvip.online")
 GRUPO_ID     = int(os.environ.get("GRUPO_ID", "0"))
 TOPIC_ID     = int(os.environ.get("TOPIC_ID", "0"))
 DIAS_SEM_REPETIR = 21

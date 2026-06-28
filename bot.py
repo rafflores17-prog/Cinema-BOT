@@ -1,34 +1,35 @@
-# ================= BOT DE CINEMA v7.0 — StreamFlix Edition =================
-# Melhorias v7:
-#   ✅ Deep link via query string: SITE_URL/?id={id}&type={type}  (abre direto no filme)
-#   ✅ Mais info no card: elenco, diretor, gêneros, duração, nota detalhada
-#   ✅ Botão trailer com link do YouTube embutido (t.me/iv para preview inline)
-#   ✅ Posts de séries com info de temporadas/episódios
-#   ✅ /top10 — ranking semanal automático
-#   ✅ /ator busca filmes por nome de ator
-#   ✅ Postagem automática agendada diária (8h e 20h)
-# ============================================================================
+# ================= BOT DE CINEMA v8.0 — StreamFlix SaaS Edition =================
+# Novidades v8:
+#   ✅ Sistema multi-tenant (vários clientes, um bot)
+#   ✅ Aluguel de 30 dias com renovação automática
+#   ✅ Painel admin completo via Telegram
+#   ✅ Aviso automático 3 dias antes de vencer
+#   ✅ Bloqueio automático ao vencer + mensagem de renovação
+#   ✅ Tokens de ativação seguros
+#   ✅ Postagem automática para TODOS os clientes ativos
+# =================================================================================
 
-import os, html, time, random, logging, threading
+import os, html, time, random, logging, threading, secrets, string
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, quote
 import requests, psycopg2
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import (Application, CommandHandler, MessageHandler,
-                          filters, ContextTypes, CallbackQueryHandler, JobQueue)
+                          filters, ContextTypes, CallbackQueryHandler)
 
 # ── Variáveis de ambiente ──────────────────────────────────────────────────
-# ── Nomes das variáveis conforme configurado no Koyeb ─────────────────────
-# Koyeb: TOKEN, TMDB_API_KEY, DATABASE_URL, SITE_URL, APP_URL, GRUPO_ID, TOPIC_ID
-TOKEN        = os.environ.get("TOKEN",        os.environ.get("BOT_TOKEN", ""))
-TMDB_KEY     = os.environ.get("TMDB_API_KEY", "")
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
-SITE_URL     = os.environ.get("SITE_URL",     "https://streamflixvip.online")
-APP_URL      = os.environ.get("APP_URL",      "https://mnil.ink/pq")
-GRUPO_ID     = int(os.environ.get("GRUPO_ID", "0"))
-TOPIC_ID     = int(os.environ.get("TOPIC_ID", "0"))
+TOKEN         = os.environ.get("TOKEN",        os.environ.get("BOT_TOKEN", ""))
+TMDB_KEY      = os.environ.get("TMDB_API_KEY", "")
+DATABASE_URL  = os.environ.get("DATABASE_URL", "")
+SITE_URL      = os.environ.get("SITE_URL",     "https://streamflixvip.online")
+APP_URL       = os.environ.get("APP_URL",      "https://streamflixvip.online")
+ADMIN_ID      = int(os.environ.get("ADMIN_ID", "0"))   # Seu user_id do Telegram (não chat_id do canal)
+GRUPO_ID      = int(os.environ.get("GRUPO_ID", "0"))   # Seu canal principal
+TOPIC_ID      = int(os.environ.get("TOPIC_ID", "0"))
+CANAL_SUPORTE = "https://t.me/streamflixofc"
 DIAS_SEM_REPETIR = 21
+DIAS_PLANO       = 30
 
 IMG_BASE  = "https://image.tmdb.org/t/p/w500"
 TMDB_BASE = "https://api.themoviedb.org/3"
@@ -48,9 +49,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 # ── Healthcheck ────────────────────────────────────────────────────────────
 class Health(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type","text/plain")
-        self.end_headers()
+        self.send_response(200); self.send_header("Content-Type","text/plain"); self.end_headers()
         self.wfile.write(b"OK")
     def log_message(self, *a, **k): pass
 
@@ -68,40 +67,156 @@ def db():
 def setup_db():
     try:
         c = db(); cur = c.cursor()
-        cur.execute("CREATE TABLE IF NOT EXISTS subscribed_chats (chat_id BIGINT PRIMARY KEY);")
+        # Clientes (multi-tenant)
+        cur.execute("""CREATE TABLE IF NOT EXISTS clientes (
+            chat_id    BIGINT PRIMARY KEY,
+            topic_id   BIGINT DEFAULT 0,
+            token      TEXT,
+            ativo      BOOLEAN DEFAULT TRUE,
+            validade   TIMESTAMP,
+            aviso_3d   BOOLEAN DEFAULT FALSE,
+            aviso_venc BOOLEAN DEFAULT FALSE,
+            criado_em  TIMESTAMP DEFAULT NOW()
+        );""")
+        # Tokens gerados pelo admin
+        cur.execute("""CREATE TABLE IF NOT EXISTS tokens (
+            token     TEXT PRIMARY KEY,
+            usado     BOOLEAN DEFAULT FALSE,
+            criado_em TIMESTAMP DEFAULT NOW()
+        );""")
+        # Itens enviados por cliente (para não repetir)
         cur.execute("""CREATE TABLE IF NOT EXISTS sent_items (
-            item_id BIGINT NOT NULL, item_type TEXT NOT NULL, sent_at TIMESTAMP NOT NULL,
-            PRIMARY KEY (item_id, item_type));""")
+            chat_id   BIGINT NOT NULL,
+            item_id   BIGINT NOT NULL,
+            item_type TEXT NOT NULL,
+            sent_at   TIMESTAMP NOT NULL,
+            PRIMARY KEY (chat_id, item_id, item_type)
+        );""")
         c.commit(); cur.close(); c.close()
-        logging.info("✅ Banco pronto")
+        logging.info("✅ Banco pronto (v8 SaaS)")
     except Exception as e:
         logging.error(f"Banco: {e}")
 
-def ja_enviados(tipo):
+# ── Funções de cliente ─────────────────────────────────────────────────────
+def gerar_token():
+    chars = string.ascii_uppercase + string.digits
+    token = "SF-" + "".join(secrets.choice(chars) for _ in range(10))
     try:
         c = db(); cur = c.cursor()
-        cur.execute("SELECT item_id FROM sent_items WHERE item_type=%s AND sent_at>%s",
-                    (tipo, datetime.utcnow()-timedelta(days=DIAS_SEM_REPETIR)))
-        ids = {r[0] for r in cur.fetchall()}
-        cur.close(); c.close()
-        return ids
-    except:
-        return set()
-
-def marcar(item_id, tipo):
-    try:
-        c = db(); cur = c.cursor()
-        cur.execute("""INSERT INTO sent_items VALUES(%s,%s,%s)
-            ON CONFLICT(item_id,item_type) DO UPDATE SET sent_at=EXCLUDED.sent_at""",
-            (item_id, tipo, datetime.utcnow()))
+        cur.execute("INSERT INTO tokens (token) VALUES (%s)", (token,))
         c.commit(); cur.close(); c.close()
     except Exception as e:
         logging.error(e)
+    return token
 
-def filtrar(itens, tipo):
-    env = ja_enviados(tipo)
-    novos = [i for i in itens if i.get("id") not in env]
-    return novos if novos else itens
+def token_valido(token):
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("SELECT token FROM tokens WHERE token=%s AND usado=FALSE", (token,))
+        r = cur.fetchone(); cur.close(); c.close()
+        return r is not None
+    except: return False
+
+def usar_token(token, chat_id, topic_id=0):
+    try:
+        c = db(); cur = c.cursor()
+        validade = datetime.utcnow() + timedelta(days=DIAS_PLANO)
+        cur.execute("""INSERT INTO clientes (chat_id, topic_id, token, ativo, validade)
+            VALUES (%s,%s,%s,TRUE,%s)
+            ON CONFLICT (chat_id) DO UPDATE
+            SET token=%s, ativo=TRUE, validade=%s, aviso_3d=FALSE, aviso_venc=FALSE""",
+            (chat_id, topic_id, token, validade, token, validade))
+        cur.execute("UPDATE tokens SET usado=TRUE WHERE token=%s", (token,))
+        c.commit(); cur.close(); c.close()
+        return validade
+    except Exception as e:
+        logging.error(e); return None
+
+def cliente_ativo(chat_id):
+    if chat_id == GRUPO_ID: return True  # canal do dono sempre liberado
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("SELECT ativo, validade FROM clientes WHERE chat_id=%s", (chat_id,))
+        r = cur.fetchone(); cur.close(); c.close()
+        if not r: return False
+        ativo, validade = r
+        if not ativo: return False
+        if validade and datetime.utcnow() > validade: return False
+        return True
+    except: return False
+
+def get_topic_id(chat_id):
+    if chat_id == GRUPO_ID: return TOPIC_ID
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("SELECT topic_id FROM clientes WHERE chat_id=%s", (chat_id,))
+        r = cur.fetchone(); cur.close(); c.close()
+        return r[0] if r else 0
+    except: return 0
+
+def listar_clientes():
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("SELECT chat_id, ativo, validade, criado_em FROM clientes ORDER BY criado_em DESC")
+        rows = cur.fetchall(); cur.close(); c.close()
+        return rows
+    except: return []
+
+def renovar_cliente(chat_id):
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("SELECT validade FROM clientes WHERE chat_id=%s", (chat_id,))
+        r = cur.fetchone()
+        if not r: return None
+        base = max(r[0], datetime.utcnow()) if r[0] else datetime.utcnow()
+        nova = base + timedelta(days=DIAS_PLANO)
+        cur.execute("""UPDATE clientes SET ativo=TRUE, validade=%s,
+            aviso_3d=FALSE, aviso_venc=FALSE WHERE chat_id=%s""", (nova, chat_id))
+        c.commit(); cur.close(); c.close()
+        return nova
+    except Exception as e:
+        logging.error(e); return None
+
+def revogar_cliente(chat_id):
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("UPDATE clientes SET ativo=FALSE WHERE chat_id=%s", (chat_id,))
+        c.commit(); cur.close(); c.close()
+        return True
+    except: return False
+
+def clientes_para_avisar():
+    try:
+        c = db(); cur = c.cursor()
+        limite = datetime.utcnow() + timedelta(days=3)
+        cur.execute("""SELECT chat_id FROM clientes
+            WHERE ativo=TRUE AND validade <= %s AND aviso_3d=FALSE""", (limite,))
+        rows = [r[0] for r in cur.fetchall()]; cur.close(); c.close()
+        return rows
+    except: return []
+
+def clientes_vencidos():
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("""SELECT chat_id FROM clientes
+            WHERE ativo=TRUE AND validade < NOW() AND aviso_venc=FALSE""")
+        rows = [r[0] for r in cur.fetchall()]; cur.close(); c.close()
+        return rows
+    except: return []
+
+def marcar_aviso_3d(chat_id):
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("UPDATE clientes SET aviso_3d=TRUE WHERE chat_id=%s", (chat_id,))
+        c.commit(); cur.close(); c.close()
+    except: pass
+
+def marcar_vencido(chat_id):
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("UPDATE clientes SET ativo=FALSE, aviso_venc=TRUE WHERE chat_id=%s", (chat_id,))
+        c.commit(); cur.close(); c.close()
+    except: pass
 
 # ── TMDB ───────────────────────────────────────────────────────────────────
 def tmdb(endpoint, params=None):
@@ -109,21 +224,16 @@ def tmdb(endpoint, params=None):
     for _ in range(2):
         try:
             r = requests.get(f"{TMDB_BASE}/{endpoint}", params=p, timeout=15)
-            r.raise_for_status()
-            return r.json()
+            r.raise_for_status(); return r.json()
         except Exception as e:
             logging.warning(e); time.sleep(1)
     return None
 
 def tmdb_details(item_id, is_tv=False):
-    """Busca detalhes completos: elenco, diretor, gêneros, runtime, etc."""
     tipo = "tv" if is_tv else "movie"
-    extra = "credits,videos,external_ids"
-    d = tmdb(f"{tipo}/{item_id}", {"append_to_response": extra})
-    return d
+    return tmdb(f"{tipo}/{item_id}", {"append_to_response": "credits,videos"})
 
 def get_trailer_url(item_id, titulo, is_tv=False):
-    """Retorna URL do YouTube do trailer."""
     v = tmdb(f"{'tv' if is_tv else 'movie'}/{item_id}/videos")
     if v and v.get("results"):
         res = v["results"]
@@ -134,22 +244,14 @@ def get_trailer_url(item_id, titulo, is_tv=False):
     return f"https://www.youtube.com/results?search_query={quote(titulo+' Trailer Oficial')}"
 
 def link_streamflix(item_id, is_tv=False):
-    """
-    Deep link para o app StreamFlix via query string (?id=X&type=Y).
-    O app lê os params no init() e converte para hash #/title/{id}/{type}.
-    Isso resolve o problema do Telegram/Chrome que ignora o # em links externos.
-    """
-    tipo = "tv" if is_tv else "movie"
-    return f"{SITE_URL}/?id={item_id}&type={tipo}"
+    return f"{SITE_URL}/#/title/{item_id}/{'tv' if is_tv else 'movie'}"
 
 def formatar_estrelas(rating):
-    """Converte nota 0-10 em estrelas."""
     if not rating: return "—"
     cheias = round(rating / 2)
     return "⭐" * cheias + "☆" * (5 - cheias)
 
 def formatar_runtime(minutos):
-    """Formata duração em horas e minutos."""
     if not minutos: return ""
     h, m = divmod(minutos, 60)
     if h and m: return f"{h}h{m:02d}min"
@@ -157,198 +259,421 @@ def formatar_runtime(minutos):
     return f"{m}min"
 
 def build_caption(details, is_tv=False):
-    """
-    Monta caption completo com: título, ano, nota, gêneros, duração/temporadas,
-    sinopse, elenco principal e diretor/criadores.
-    """
-    if not details:
-        return "ℹ️ Informações indisponíveis."
-
-    titulo   = details.get("name") if is_tv else details.get("title","?")
+    if not details: return "ℹ️ Informações indisponíveis."
+    titulo     = details.get("name") if is_tv else details.get("title","?")
     orig_title = details.get("original_name" if is_tv else "original_title","")
-    ano      = (details.get("first_air_date","") if is_tv else details.get("release_date",""))[:4] or "?"
-    rating   = details.get("vote_average", 0)
-    count    = details.get("vote_count", 0)
-    sinopse  = details.get("overview") or "Sinopse não disponível."
+    ano        = (details.get("first_air_date","") if is_tv else details.get("release_date",""))[:4] or "?"
+    rating     = details.get("vote_average", 0)
+    count      = details.get("vote_count", 0)
+    sinopse    = details.get("overview") or "Sinopse não disponível."
     if len(sinopse) > 300: sinopse = sinopse[:300].rsplit(" ",1)[0] + "…"
-
-    # Gêneros
-    gen_list = [g["name"] for g in details.get("genres", [])]
-    generos  = " • ".join(gen_list[:3]) if gen_list else ""
-
-    # Duração / temporadas
+    gen_list   = [g["name"] for g in details.get("genres", [])]
+    generos    = " • ".join(gen_list[:3]) if gen_list else ""
     if is_tv:
         seasons  = details.get("number_of_seasons", 0)
         episodes = details.get("number_of_episodes", 0)
         duracao  = f"📺 {seasons} temp. • {episodes} eps." if seasons else ""
-        status_raw = details.get("status","")
         status_map = {
-            "Returning Series":"🟢 Em exibição",
-            "Ended":"🔴 Encerrada",
-            "Canceled":"⛔ Cancelada",
-            "In Production":"🎬 Em produção",
+            "Returning Series":"🟢 Em exibição","Ended":"🔴 Encerrada",
+            "Canceled":"⛔ Cancelada","In Production":"🎬 Em produção"
         }
-        status = status_map.get(status_raw, "")
+        status = status_map.get(details.get("status",""), "")
     else:
-        runtime  = details.get("runtime") or 0
-        duracao  = f"⏱ {formatar_runtime(runtime)}" if runtime else ""
-        status   = ""
-
-    # Elenco (top 5)
-    cast_list = []
+        runtime = details.get("runtime") or 0
+        duracao = f"⏱ {formatar_runtime(runtime)}" if runtime else ""
+        status  = ""
     credits   = details.get("credits", {})
-    cast      = credits.get("cast", [])
-    for p in cast[:5]:
-        cast_list.append(p.get("name",""))
-    elenco = ", ".join(cast_list) if cast_list else ""
-
-    # Diretor (filmes) ou criadores (séries)
+    cast_list = [p.get("name","") for p in credits.get("cast", [])[:5]]
+    elenco    = ", ".join(cast_list) if cast_list else ""
     if is_tv:
         criadores = [c.get("name","") for c in details.get("created_by", [])]
-        direcao_label = "✍️ Criado por"
-        direcao_val   = ", ".join(criadores[:2]) if criadores else ""
+        dir_label = "✍️ Criado por"; dir_val = ", ".join(criadores[:2]) if criadores else ""
     else:
-        crew = credits.get("crew", [])
-        diretores = [p["name"] for p in crew if p.get("job")=="Director"]
-        direcao_label = "🎬 Direção"
-        direcao_val   = ", ".join(diretores[:2]) if diretores else ""
-
-    # Monta caption
-    icone = "📺" if is_tv else "🎬"
+        diretores = [p["name"] for p in credits.get("crew",[]) if p.get("job")=="Director"]
+        dir_label = "🎬 Direção"; dir_val = ", ".join(diretores[:2]) if diretores else ""
+    icone  = "📺" if is_tv else "🎬"
     linhas = [f"{icone} <b>{html.escape(titulo)}</b> ({ano})"]
-
-    if orig_title and orig_title != titulo:
-        linhas.append(f"<i>{html.escape(orig_title)}</i>")
-
-    linhas.append("")
-    linhas.append(f"{formatar_estrelas(rating)} <b>{rating:.1f}/10</b> ({count:,} votos)")
-
-    if generos:
-        linhas.append(f"🎭 {html.escape(generos)}")
-    if duracao:
-        linhas.append(duracao)
-    if status:
-        linhas.append(status)
-
-    linhas.append("")
-    linhas.append(f"📖 {html.escape(sinopse)}")
-
-    if elenco:
-        linhas.append("")
-        linhas.append(f"🌟 <b>Elenco:</b> {html.escape(elenco)}")
-    if direcao_val:
-        linhas.append(f"{direcao_label}: {html.escape(direcao_val)}")
-
+    if orig_title and orig_title != titulo: linhas.append(f"<i>{html.escape(orig_title)}</i>")
+    linhas += ["", f"{formatar_estrelas(rating)} <b>{rating:.1f}/10</b> ({count:,} votos)"]
+    if generos: linhas.append(f"🎭 {html.escape(generos)}")
+    if duracao: linhas.append(duracao)
+    if status:  linhas.append(status)
+    linhas += ["", f"📖 {html.escape(sinopse)}"]
+    if elenco:   linhas += ["", f"🌟 <b>Elenco:</b> {html.escape(elenco)}"]
+    if dir_val:  linhas.append(f"{dir_label}: {html.escape(dir_val)}")
     return "\n".join(linhas)
 
-# ── Envio ──────────────────────────────────────────────────────────────────
-async def enviar(context, text=None, photo=None, caption=None, markup=None, parse_mode="HTML"):
-    kw = {"parse_mode": parse_mode}
-    if TOPIC_ID: kw["message_thread_id"] = TOPIC_ID
-    if markup:   kw["reply_markup"] = markup
+# ── Itens enviados por cliente ─────────────────────────────────────────────
+def ja_enviados(chat_id, tipo):
     try:
-        if photo:  return await context.bot.send_photo(GRUPO_ID, photo, caption=caption, **kw)
-        elif text: return await context.bot.send_message(GRUPO_ID, text, **kw)
+        c = db(); cur = c.cursor()
+        cur.execute("SELECT item_id FROM sent_items WHERE chat_id=%s AND item_type=%s AND sent_at>%s",
+                    (chat_id, tipo, datetime.utcnow()-timedelta(days=DIAS_SEM_REPETIR)))
+        ids = {r[0] for r in cur.fetchall()}; cur.close(); c.close()
+        return ids
+    except: return set()
+
+def marcar_enviado(chat_id, item_id, tipo):
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("""INSERT INTO sent_items VALUES(%s,%s,%s,%s)
+            ON CONFLICT(chat_id,item_id,item_type) DO UPDATE SET sent_at=EXCLUDED.sent_at""",
+            (chat_id, item_id, tipo, datetime.utcnow()))
+        c.commit(); cur.close(); c.close()
+    except Exception as e: logging.error(e)
+
+def filtrar(chat_id, itens, tipo):
+    env   = ja_enviados(chat_id, tipo)
+    novos = [i for i in itens if i.get("id") not in env]
+    return novos if novos else itens
+
+# ── Envio ──────────────────────────────────────────────────────────────────
+async def enviar(context, chat_id, text=None, photo=None, caption=None, markup=None, parse_mode="HTML"):
+    topic = get_topic_id(chat_id)
+    kw = {"parse_mode": parse_mode}
+    if topic:  kw["message_thread_id"] = topic
+    if markup: kw["reply_markup"] = markup
+    try:
+        if photo:  return await context.bot.send_photo(chat_id, photo, caption=caption, **kw)
+        elif text: return await context.bot.send_message(chat_id, text, **kw)
     except Exception as e:
         logging.error(f"Envio: {e}")
         kw.pop("message_thread_id", None)
         try:
-            if photo:  return await context.bot.send_photo(GRUPO_ID, photo, caption=caption, **kw)
-            elif text: return await context.bot.send_message(GRUPO_ID, text, **kw)
-        except Exception as e2:
-            logging.error(f"Fallback: {e2}")
+            if photo:  return await context.bot.send_photo(chat_id, photo, caption=caption, **kw)
+            elif text: return await context.bot.send_message(chat_id, text, **kw)
+        except Exception as e2: logging.error(f"Fallback: {e2}")
 
-async def send_item(context, item, is_tv=False, tipo="movie"):
-    """
-    Envia card completo:
-      1) Foto + caption com detalhes + botão ASSISTIR e BAIXAR APP
-      2) Mensagem separada com link YouTube puro → Telegram gera mini player inline
-    """
+async def send_item(context, chat_id, item, is_tv=False, tipo="movie"):
     if not item: return
-    iid = item.get("id")
-
-    # Busca detalhes completos (inclui credits, videos, etc.)
-    details = tmdb_details(iid, is_tv=is_tv)
-    if not details: details = item  # fallback para dados básicos
-
+    iid     = item.get("id")
+    details = tmdb_details(iid, is_tv=is_tv) or item
     title   = details.get("name") if is_tv else details.get("title","?")
     caption = build_caption(details, is_tv=is_tv)
-
-    # ✅ Deep link correto — abre direto no filme/série no app
-    url_direto  = link_streamflix(iid, is_tv=is_tv)
-    url_trailer = get_trailer_url(iid, title, is_tv=is_tv)
-
-    # Botões: só ASSISTIR e BAIXAR APP (trailer vai como mensagem separada)
     keyboard = [
-        [InlineKeyboardButton("▶️ ASSISTIR AGORA", url=url_direto)],
+        [InlineKeyboardButton("▶️ ASSISTIR AGORA",  url=link_streamflix(iid, is_tv=is_tv))],
         [InlineKeyboardButton("💬 BAIXAR APP AQUI", url=APP_URL)]
     ]
-
     post = details.get("poster_path") or item.get("poster_path")
     try:
-        # 1) Card principal com poster + info + botões
-        if post:
-            await enviar(context, photo=f"{IMG_BASE}{post}", caption=caption,
-                         markup=InlineKeyboardMarkup(keyboard))
-        else:
-            await enviar(context, text=caption, markup=InlineKeyboardMarkup(keyboard))
+        if post: await enviar(context, chat_id, photo=f"{IMG_BASE}{post}", caption=caption, markup=InlineKeyboardMarkup(keyboard))
+        else:    await enviar(context, chat_id, text=caption, markup=InlineKeyboardMarkup(keyboard))
+        await enviar(context, chat_id, text=f"🎬 <b>Confira o Trailer:</b>\n{get_trailer_url(iid, title, is_tv=is_tv)}")
+        marcar_enviado(chat_id, iid, tipo)
+    except Exception as e: logging.error(e)
 
-        # 2) Link YouTube como texto puro → Telegram renderiza mini player inline automaticamente
-        trailer_msg = "\U0001f3ac <b>Confira o Trailer:</b>\n" + url_trailer
-        await enviar(context, text=trailer_msg)
-
-        marcar(iid, tipo)
-    except Exception as e:
-        logging.error(e)
-
-async def enviar_lista(context, itens, is_tv=False, tipo="movie", limite=3):
-    itens = filtrar(itens, tipo)
+async def enviar_lista(context, chat_id, itens, is_tv=False, tipo="movie", limite=3):
+    itens = filtrar(chat_id, itens, tipo)
     random.shuffle(itens)
     for item in itens[:limite]:
-        await send_item(context, item, is_tv=is_tv, tipo=tipo)
+        await send_item(context, chat_id, item, is_tv=is_tv, tipo=tipo)
+
+# ── Verificação de acesso ──────────────────────────────────────────────────
+async def verificar_acesso(update: Update, context) -> bool:
+    cid = update.effective_chat.id
+    if cliente_ativo(cid): return True
+    await update.message.reply_text(
+        "🔒 <b>Acesso bloqueado!</b>\n\n"
+        "Seu plano não está ativo ou expirou.\n\n"
+        f"Para ativar ou renovar:\n{CANAL_SUPORTE}",
+        parse_mode="HTML"
+    )
+    return False
+
+# ── Comandos de cliente ────────────────────────────────────────────────────
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cid  = update.effective_chat.id
+    user = update.effective_user
+    if not cliente_ativo(cid):
+        bot_info = await context.bot.get_me()
+        bot_username = bot_info.username
+        await update.message.reply_text(
+            f"👋 Olá <b>{html.escape(user.first_name)}</b>! Bem-vindo ao StreamFlix Bot! 🎬\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📋 <b>COMO CONFIGURAR O BOT NO SEU CANAL</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<b>1️⃣ Adquira seu plano:</b>\n"
+            f"👉 {CANAL_SUPORTE}\n\n"
+            f"<b>2️⃣ Adicione o bot ao seu canal:</b>\n"
+            f"• Abra seu canal no Telegram\n"
+            f"• Toque nos 3 pontos (⋮) no canto superior\n"
+            f"• Vá em <b>Administradores</b>\n"
+            f"• Toque em <b>Adicionar Administrador</b>\n"
+            f"• Pesquise: <code>@{bot_username}</code>\n"
+            f"• Ative a permissão <b>Enviar Mensagens</b> ✅\n"
+            f"• Confirme\n\n"
+            f"<b>3️⃣ Ative seu plano no canal:</b>\n"
+            f"Digite no seu canal:\n"
+            f"<code>/ativar SEU_TOKEN</code>\n\n"
+            f"<b>4️⃣ Tudo pronto! 🚀</b>\n"
+            f"O bot já começa a postar automaticamente!\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"❓ Dúvidas? {CANAL_SUPORTE}",
+            parse_mode="HTML"
+        )
+        return
+    kb = [
+        ["🎥 Em Cartaz","🚀 Em Breve"],
+        ["🌟 Populares","📺 Séries"],
+        ["🔥 Em Alta","🎲 Sugestão"],
+        ["🎭 Por Gênero","🎞️ Por Época"],
+        ["🔍 Buscar","❓ Ajuda"]
+    ]
+    promo = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌐 ACESSAR STREAMFLIX", url=SITE_URL)],
+        [InlineKeyboardButton("📱 BAIXAR APP",         url=APP_URL)]
+    ])
+    await enviar(context, cid,
+        text=f"🎬 <b>StreamFlix Bot</b>\n\nOlá {html.escape(user.first_name)}! Pronto para assistir? 🍿",
+        markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    await enviar(context, cid, text="Acesse o StreamFlix:", markup=promo)
+
+async def cmd_ativar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    if not context.args:
+        await update.message.reply_text("⚠️ Use: <code>/ativar SEU_TOKEN</code>", parse_mode="HTML")
+        return
+    token = context.args[0].strip().upper()
+    if not token_valido(token):
+        await update.message.reply_text(
+            "❌ Token inválido ou já utilizado.\n\nAdquira um novo em: " + CANAL_SUPORTE)
+        return
+    topic    = int(context.args[1]) if len(context.args) > 1 else 0
+    validade = usar_token(token, cid, topic)
+    if validade:
+        await update.message.reply_text(
+            f"✅ <b>Bot ativado com sucesso!</b>\n\n"
+            f"📅 Válido até: <b>{validade.strftime('%d/%m/%Y')}</b>\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🚀 <b>PRÓXIMOS PASSOS:</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"O bot já está ativo neste canal! Agora:\n\n"
+            f"▶️ Use /start para abrir o menu\n"
+            f"🎥 Use os botões para buscar filmes e séries\n"
+            f"⏰ Posts automáticos chegam todo dia às 8h e 20h\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📋 <b>COMANDOS DISPONÍVEIS:</b>\n"
+            f"/filme Nome — busca um filme\n"
+            f"/serie Nome — busca uma série\n"
+            f"/ator Nome — filmes de um ator\n"
+            f"/top10 — top 10 da semana\n"
+            f"/meuplano — ver validade do plano\n\n"
+            f"❓ Suporte: {CANAL_SUPORTE}",
+            parse_mode="HTML"
+        )
+        # Avisa o admin
+        try:
+            await context.bot.send_message(ADMIN_ID,
+                f"🟢 Novo cliente ativado!\nChat ID: <code>{cid}</code>\nToken: <code>{token}</code>\nVálido até: {validade.strftime('%d/%m/%Y')}",
+                parse_mode="HTML")
+        except: pass
+    else:
+        await update.message.reply_text("❌ Erro ao ativar. Contate: " + CANAL_SUPORTE)
+
+async def cmd_meuplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("SELECT ativo, validade FROM clientes WHERE chat_id=%s", (cid,))
+        r = cur.fetchone(); cur.close(); c.close()
+    except: r = None
+    if not r:
+        await update.message.reply_text(f"❌ Sem plano ativo.\nAdquira em: {CANAL_SUPORTE}")
+        return
+    ativo, validade = r
+    dias_rest = (validade - datetime.utcnow()).days if validade else 0
+    status    = "✅ Ativo" if (ativo and dias_rest > 0) else "❌ Expirado"
+    await update.message.reply_text(
+        f"📋 <b>Seu Plano:</b>\n\n"
+        f"Status: {status}\n"
+        f"📅 Vence em: <b>{validade.strftime('%d/%m/%Y') if validade else '—'}</b>\n"
+        f"⏳ Dias restantes: <b>{max(dias_rest, 0)}</b>\n\n"
+        f"Para renovar: {CANAL_SUPORTE}",
+        parse_mode="HTML"
+    )
+
+# ── Painel Admin ───────────────────────────────────────────────────────────
+def is_admin(update: Update) -> bool:
+    return update.effective_user.id == ADMIN_ID
+
+async def cmd_gerar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("⛔ Acesso negado."); return
+    qtd    = min(int(context.args[0]) if context.args else 1, 10)
+    tokens = [gerar_token() for _ in range(qtd)]
+    msg    = f"🎟️ <b>{qtd} Token(s) gerado(s) — 30 dias:</b>\n\n"
+    for t in tokens: msg += f"<code>{t}</code>\n"
+    msg += f"\n📲 Cliente usa: <code>/ativar TOKEN</code>"
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+async def cmd_clientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("⛔ Acesso negado."); return
+    rows = listar_clientes()
+    if not rows:
+        await update.message.reply_text("📭 Nenhum cliente cadastrado."); return
+    msg = f"👥 <b>Clientes ({len(rows)}):</b>\n\n"
+    for chat_id, ativo, validade, criado in rows:
+        dias = (validade - datetime.utcnow()).days if validade else 0
+        icone = "🟢" if (ativo and dias > 3) else ("🟡" if (ativo and 0 < dias <= 3) else "🔴")
+        venc  = validade.strftime('%d/%m/%Y') if validade else "—"
+        msg  += f"{icone} <code>{chat_id}</code> — vence {venc} ({max(dias,0)}d)\n"
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+async def cmd_renovar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("⛔ Acesso negado."); return
+    if not context.args:
+        await update.message.reply_text("⚠️ Use: /renovar CHAT_ID"); return
+    cid  = int(context.args[0])
+    nova = renovar_cliente(cid)
+    if nova:
+        await update.message.reply_text(
+            f"✅ Cliente <code>{cid}</code> renovado!\nNova validade: <b>{nova.strftime('%d/%m/%Y')}</b>",
+            parse_mode="HTML")
+        try:
+            await context.bot.send_message(cid,
+                f"✅ <b>Plano renovado!</b>\n\nSeu acesso foi renovado até <b>{nova.strftime('%d/%m/%Y')}</b>.\n\nObrigado! 🎬",
+                parse_mode="HTML")
+        except: pass
+    else:
+        await update.message.reply_text(f"❌ Cliente {cid} não encontrado.")
+
+async def cmd_revogar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("⛔ Acesso negado."); return
+    if not context.args:
+        await update.message.reply_text("⚠️ Use: /revogar CHAT_ID"); return
+    cid = int(context.args[0])
+    if revogar_cliente(cid):
+        await update.message.reply_text(f"✅ Acesso de <code>{cid}</code> revogado.", parse_mode="HTML")
+        try:
+            await context.bot.send_message(cid,
+                f"⚠️ Seu acesso foi cancelado.\n\nPara reativar: {CANAL_SUPORTE}")
+        except: pass
+    else:
+        await update.message.reply_text("❌ Erro ao revogar.")
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("⛔ Acesso negado."); return
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("SELECT COUNT(*) FROM clientes WHERE ativo=TRUE AND validade > NOW()")
+        ativos = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM clientes WHERE ativo=FALSE OR validade <= NOW()")
+        inativos = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM tokens WHERE usado=FALSE")
+        tokens_livres = cur.fetchone()[0]
+        cur.close(); c.close()
+    except: ativos = inativos = tokens_livres = 0
+    await update.message.reply_text(
+        f"📊 <b>Painel StreamFlix:</b>\n\n"
+        f"🟢 Clientes ativos: <b>{ativos}</b>\n"
+        f"🔴 Inativos/expirados: <b>{inativos}</b>\n"
+        f"🎟️ Tokens disponíveis: <b>{tokens_livres}</b>\n\n"
+        f"💰 Receita estimada: <b>R$ {ativos * 30:.2f}/mês</b>",
+        parse_mode="HTML"
+    )
+
+# ── Jobs automáticos ───────────────────────────────────────────────────────
+async def job_verificar_vencimentos(context: ContextTypes.DEFAULT_TYPE):
+    """Roda a cada hora: avisa quem vence em 3 dias e bloqueia quem venceu."""
+    for cid in clientes_para_avisar():
+        try:
+            await context.bot.send_message(cid,
+                f"⚠️ <b>Seu plano vence em 3 dias!</b>\n\n"
+                f"Renove agora para continuar assistindo:\n{CANAL_SUPORTE}",
+                parse_mode="HTML")
+            marcar_aviso_3d(cid)
+            await context.bot.send_message(ADMIN_ID,
+                f"🟡 Aviso enviado → <code>{cid}</code> (vence em 3 dias)", parse_mode="HTML")
+        except Exception as e: logging.error(f"Aviso 3d {cid}: {e}")
+
+    for cid in clientes_vencidos():
+        try:
+            marcar_vencido(cid)
+            await context.bot.send_message(cid,
+                f"🔴 <b>Seu plano expirou!</b>\n\n"
+                f"O bot foi suspenso automaticamente.\n\n"
+                f"Para renovar e reativar:\n{CANAL_SUPORTE}",
+                parse_mode="HTML")
+            await context.bot.send_message(ADMIN_ID,
+                f"🔴 Cliente <code>{cid}</code> bloqueado automaticamente (plano vencido).", parse_mode="HTML")
+        except Exception as e: logging.error(f"Bloqueio {cid}: {e}")
+
+async def job_diario_todos(context: ContextTypes.DEFAULT_TYPE, turno="manha"):
+    """Posta conteúdo para TODOS os clientes ativos."""
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("SELECT chat_id FROM clientes WHERE ativo=TRUE AND validade > NOW()")
+        chats = [r[0] for r in cur.fetchall()]; cur.close(); c.close()
+    except: chats = []
+    if GRUPO_ID and GRUPO_ID not in chats: chats.append(GRUPO_ID)
+
+    for cid in chats:
+        try:
+            if turno == "manha":
+                d = tmdb("movie/now_playing", {"region":"BR"})
+                if d:
+                    await enviar(context, cid, text="🌅 <b>Bom dia! Confira o que está em cartaz hoje:</b>")
+                    await enviar_lista(context, cid, d.get("results",[]), tipo="now_playing", limite=2)
+            else:
+                d = tmdb("trending/all/week")
+                if d:
+                    await enviar(context, cid, text="🌆 <b>Boa noite! Top da semana para você:</b>")
+                    itens = d.get("results",[])[:6]; random.shuffle(itens)
+                    for item in itens[:2]:
+                        is_tv = item.get("media_type") == "tv"
+                        await send_item(context, cid, item, is_tv=is_tv, tipo="tv" if is_tv else "movie")
+        except Exception as e: logging.error(f"Job {turno} → {cid}: {e}")
+
+async def job_diario_manha(context): await job_diario_todos(context, "manha")
+async def job_diario_noite(context): await job_diario_todos(context, "noite")
 
 # ── Handlers de texto ──────────────────────────────────────────────────────
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await verificar_acesso(update, context): return
+    cid  = update.effective_chat.id
     text = update.message.text
-    if update.effective_chat.id != GRUPO_ID: return
 
     if text == "🎥 Em Cartaz":
         d = tmdb("movie/now_playing", {"region":"BR"})
-        if d: await enviar_lista(context, d.get("results",[]), tipo="now_playing")
+        if d: await enviar_lista(context, cid, d.get("results",[]), tipo="now_playing")
 
     elif text == "🚀 Em Breve":
         d = tmdb("movie/upcoming", {"region":"BR"})
-        if d: await enviar_lista(context, d.get("results",[]), tipo="upcoming")
+        if d: await enviar_lista(context, cid, d.get("results",[]), tipo="upcoming")
 
     elif text == "🌟 Populares":
         d = tmdb("movie/popular", {"region":"BR","page":random.randint(1,5)})
-        if d: await enviar_lista(context, d.get("results",[]))
+        if d: await enviar_lista(context, cid, d.get("results",[]))
 
     elif text == "📺 Séries":
         d = tmdb("tv/popular", {"page":random.randint(1,5)})
-        if d: await enviar_lista(context, d.get("results",[]), is_tv=True, tipo="tv")
+        if d: await enviar_lista(context, cid, d.get("results",[]), is_tv=True, tipo="tv")
 
     elif text == "🔥 Em Alta":
         d = tmdb("trending/all/week")
         if d:
             for item in d.get("results",[])[:4]:
                 is_tv = item.get("media_type") == "tv"
-                await send_item(context, item, is_tv=is_tv, tipo="tv" if is_tv else "movie")
+                await send_item(context, cid, item, is_tv=is_tv, tipo="tv" if is_tv else "movie")
 
     elif text == "🎭 Por Gênero":
         btns = [[InlineKeyboardButton(n, callback_data=f"gen_{i}")] for n,i in GENEROS.items()]
-        await enviar(context, text="✨ <b>Escolha um Gênero:</b>", markup=InlineKeyboardMarkup(btns))
+        await enviar(context, cid, text="✨ <b>Escolha um Gênero:</b>", markup=InlineKeyboardMarkup(btns))
 
     elif text == "🎞️ Por Época":
         btns = [[InlineKeyboardButton(n, callback_data=f"era_{n}")] for n in EPOCAS]
-        await enviar(context, text="⏳ <b>Escolha uma Época:</b>", markup=InlineKeyboardMarkup(btns))
+        await enviar(context, cid, text="⏳ <b>Escolha uma Época:</b>", markup=InlineKeyboardMarkup(btns))
 
     elif text == "🎲 Sugestão":
         d = tmdb("movie/top_rated", {"page":random.randint(1,20)})
-        if d and d.get("results"): await enviar_lista(context, d["results"], limite=1)
+        if d and d.get("results"): await enviar_lista(context, cid, d["results"], limite=1)
 
     elif text == "🔍 Buscar":
-        await enviar(context, text=(
+        await enviar(context, cid, text=(
             "⌨️ Use os comandos:\n\n"
             "<code>/filme Nome do Filme</code>\n"
             "<code>/serie Nome da Série</code>\n"
@@ -357,88 +682,79 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ))
 
     elif text == "❓ Ajuda":
-        await cmd_ajuda_fn(context)
+        await cmd_ajuda_fn(context, cid)
 
-# ── Callback (Gênero / Época) ──────────────────────────────────────────────
 async def callback_handler(update, context):
-    q = update.callback_query
-    await q.answer()
+    q   = update.callback_query; await q.answer()
+    cid = update.effective_chat.id
+    if not cliente_ativo(cid):
+        await q.message.reply_text(f"🔒 Acesso bloqueado. Renove em: {CANAL_SUPORTE}"); return
     data = q.data
 
     if data.startswith("gen_"):
         gid = data.split("_")[1]
-        d = tmdb("discover/movie", {
-            "with_genres": gid, "sort_by":"popularity.desc",
-            "page": random.randint(1,5)
-        })
-        if d and d.get("results"):
-            await enviar_lista(context, d["results"])
+        d = tmdb("discover/movie", {"with_genres":gid,"sort_by":"popularity.desc","page":random.randint(1,5)})
+        if d and d.get("results"): await enviar_lista(context, cid, d["results"])
 
     elif data.startswith("era_"):
         era = data.split("_",1)[1]
         inicio, fim = EPOCAS[era]
         ano = random.randint(inicio, fim)
-        d = tmdb("discover/movie", {
-            "primary_release_year": ano, "sort_by":"popularity.desc", "page":1
-        })
+        d = tmdb("discover/movie", {"primary_release_year":ano,"sort_by":"popularity.desc","page":1})
         if d and d.get("results"):
-            await enviar(context, text=f"🎞️ <b>Melhores de {ano}...</b>")
-            await enviar_lista(context, d["results"][:10])
+            await enviar(context, cid, text=f"🎞️ <b>Melhores de {ano}...</b>")
+            await enviar_lista(context, cid, d["results"][:10])
 
-# ── Comandos ───────────────────────────────────────────────────────────────
+# ── Comandos com verificação de acesso ────────────────────────────────────
 async def cmd_filme(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await verificar_acesso(update, context): return
     if not context.args:
         await update.message.reply_text("⚠️ Use: /filme Nome do Filme"); return
-    q = " ".join(context.args)
-    d = tmdb("search/movie", {"query": q})
+    cid = update.effective_chat.id
+    q   = " ".join(context.args)
+    d   = tmdb("search/movie", {"query": q})
     res = d.get("results",[]) if d else []
     if not res:
-        await enviar(context, text=f"😕 Filme não encontrado: <b>{html.escape(q)}</b>"); return
-    await send_item(context, res[0], tipo="movie")
+        await enviar(context, cid, text=f"😕 Filme não encontrado: <b>{html.escape(q)}</b>"); return
+    await send_item(context, cid, res[0], tipo="movie")
 
 async def cmd_serie(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await verificar_acesso(update, context): return
     if not context.args:
         await update.message.reply_text("⚠️ Use: /serie Nome da Série"); return
-    q = " ".join(context.args)
-    d = tmdb("search/tv", {"query": q})
+    cid = update.effective_chat.id
+    q   = " ".join(context.args)
+    d   = tmdb("search/tv", {"query": q})
     res = d.get("results",[]) if d else []
     if not res:
-        await enviar(context, text=f"😕 Série não encontrada: <b>{html.escape(q)}</b>"); return
-    await send_item(context, res[0], is_tv=True, tipo="tv")
+        await enviar(context, cid, text=f"😕 Série não encontrada: <b>{html.escape(q)}</b>"); return
+    await send_item(context, cid, res[0], is_tv=True, tipo="tv")
 
 async def cmd_ator(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Busca filmes por nome de ator/atriz."""
+    if not await verificar_acesso(update, context): return
     if not context.args:
         await update.message.reply_text("⚠️ Use: /ator Nome do Ator"); return
-    q = " ".join(context.args)
-    # Busca pessoa
-    d = tmdb("search/person", {"query": q})
+    cid = update.effective_chat.id
+    q   = " ".join(context.args)
+    d   = tmdb("search/person", {"query": q})
     pessoas = d.get("results",[]) if d else []
     if not pessoas:
-        await enviar(context, text=f"😕 Ator não encontrado: <b>{html.escape(q)}</b>"); return
-
-    pessoa = pessoas[0]
-    nome   = pessoa.get("name","")
-    pid    = pessoa.get("id")
-
-    # Filmes desse ator ordenados por popularidade
+        await enviar(context, cid, text=f"😕 Ator não encontrado: <b>{html.escape(q)}</b>"); return
+    pessoa   = pessoas[0]; nome = pessoa.get("name",""); pid = pessoa.get("id")
     filmes_d = tmdb(f"person/{pid}/movie_credits")
-    filmes   = filmes_d.get("cast",[]) if filmes_d else []
-    filmes   = sorted(filmes, key=lambda x: x.get("popularity",0), reverse=True)
-
+    filmes   = sorted(filmes_d.get("cast",[]) if filmes_d else [], key=lambda x: x.get("popularity",0), reverse=True)
     if not filmes:
-        await enviar(context, text=f"😕 Nenhum filme encontrado para <b>{html.escape(nome)}</b>"); return
-
-    await enviar(context, text=f"🌟 <b>Filmes de {html.escape(nome)}:</b>")
-    await enviar_lista(context, filmes[:10], tipo="movie", limite=3)
+        await enviar(context, cid, text=f"😕 Nenhum filme encontrado para <b>{html.escape(nome)}</b>"); return
+    await enviar(context, cid, text=f"🌟 <b>Filmes de {html.escape(nome)}:</b>")
+    await enviar_lista(context, cid, filmes[:10], tipo="movie", limite=3)
 
 async def cmd_top10(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Envia o Top 10 da semana (trending)."""
-    d = tmdb("trending/all/week")
+    if not await verificar_acesso(update, context): return
+    cid = update.effective_chat.id
+    d   = tmdb("trending/all/week")
     if not d or not d.get("results"):
-        await enviar(context, text="😕 Não foi possível buscar o Top 10."); return
-
-    itens = d["results"][:10]
+        await enviar(context, cid, text="😕 Não foi possível buscar o Top 10."); return
+    itens  = d["results"][:10]
     linhas = ["🏆 <b>TOP 10 DA SEMANA:</b>\n"]
     for i, item in enumerate(itens, 1):
         is_tv = item.get("media_type") == "tv"
@@ -446,21 +762,12 @@ async def cmd_top10(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ano   = (item.get("first_air_date","") if is_tv else item.get("release_date",""))[:4]
         nota  = item.get("vote_average",0)
         tipo  = "📺" if is_tv else "🎬"
-        iid   = item.get("id")
-        url   = link_streamflix(iid, is_tv=is_tv)
+        url   = link_streamflix(item.get("id"), is_tv=is_tv)
         linhas.append(f"{i}. {tipo} <a href=\"{url}\">{html.escape(name)}</a> ({ano}) — ⭐{nota:.1f}")
+    await enviar(context, cid, text="\n".join(linhas))
 
-    await enviar(context, text="\n".join(linhas))
-
-async def cmd_avisogeral(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = " ".join(context.args)
-    if not msg:
-        await update.message.reply_text("⚠️ /avisogeral mensagem"); return
-    await enviar(context, text=msg)
-    await update.message.reply_text("📢 Aviso enviado!")
-
-async def cmd_ajuda_fn(context):
-    texto = (
+async def cmd_ajuda_fn(context, cid):
+    await enviar(context, cid, text=(
         "❓ <b>Comandos:</b>\n\n"
         "🎥 <b>Em Cartaz</b> — cinemas agora\n"
         "🚀 <b>Em Breve</b> — próximos lançamentos\n"
@@ -474,86 +781,49 @@ async def cmd_ajuda_fn(context):
         "<code>/serie Nome</code> — busca série\n"
         "<code>/ator Nome</code> — filmes de um ator\n"
         "<code>/top10</code> — ranking semanal\n"
-    )
-    await enviar(context, text=texto)
+        "<code>/meuplano</code> — ver seu plano\n"
+    ))
 
 async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await cmd_ajuda_fn(context)
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        c = db(); cur = c.cursor()
-        cur.execute("INSERT INTO subscribed_chats VALUES(%s) ON CONFLICT DO NOTHING",
-                    (update.effective_chat.id,))
-        c.commit(); cur.close(); c.close()
-    except: pass
-
-    user = update.effective_user
-    kb = [
-        ["🎥 Em Cartaz","🚀 Em Breve"],
-        ["🌟 Populares","📺 Séries"],
-        ["🔥 Em Alta","🎲 Sugestão"],
-        ["🎭 Por Gênero","🎞️ Por Época"],
-        ["🔍 Buscar","❓ Ajuda"]
-    ]
-    promo = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌐 ACESSAR STREAMFLIX", url=SITE_URL)],
-        [InlineKeyboardButton("📱 BAIXAR APP",         url=APP_URL)]
-    ])
-    await enviar(context,
-        text=f"🎬 <b>StreamFlix Bot</b>\n\nOlá {html.escape(user.first_name)}! Pronto para assistir? 🍿",
-        markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
-    await enviar(context, text="Acesse o StreamFlix:", markup=promo)
-
-# ── Jobs automáticos ───────────────────────────────────────────────────────
-async def job_diario_manha(context: ContextTypes.DEFAULT_TYPE):
-    """Postagem automática às 8h — filmes em cartaz."""
-    logging.info("⏰ Job manhã: Em Cartaz")
-    d = tmdb("movie/now_playing", {"region":"BR"})
-    if d:
-        await enviar(context, text="🌅 <b>Bom dia! Confira o que está em cartaz hoje:</b>")
-        await enviar_lista(context, d.get("results",[]), tipo="now_playing", limite=2)
-
-async def job_diario_noite(context: ContextTypes.DEFAULT_TYPE):
-    """Postagem automática às 20h — trending da semana."""
-    logging.info("⏰ Job noite: Trending")
-    d = tmdb("trending/all/week")
-    if d:
-        await enviar(context, text="🌆 <b>Boa noite! Top da semana para você:</b>")
-        itens = d.get("results",[])[:6]
-        random.shuffle(itens)
-        for item in itens[:2]:
-            is_tv = item.get("media_type") == "tv"
-            await send_item(context, item, is_tv=is_tv, tipo="tv" if is_tv else "movie")
+    if not await verificar_acesso(update, context): return
+    await cmd_ajuda_fn(context, update.effective_chat.id)
 
 # ── Main ───────────────────────────────────────────────────────────────────
 def main():
     setup_db()
     threading.Thread(target=start_health, daemon=True).start()
-
     app = Application.builder().token(TOKEN).build()
 
-    # Comandos
-    app.add_handler(CommandHandler("start",      cmd_start))
-    app.add_handler(CommandHandler("ajuda",      cmd_ajuda))
-    app.add_handler(CommandHandler("help",       cmd_ajuda))
-    app.add_handler(CommandHandler("avisogeral", cmd_avisogeral))
-    app.add_handler(CommandHandler("filme",      cmd_filme))
-    app.add_handler(CommandHandler("serie",      cmd_serie))
-    app.add_handler(CommandHandler("ator",       cmd_ator))
-    app.add_handler(CommandHandler("top10",      cmd_top10))
+    # Comandos de cliente
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("ativar",   cmd_ativar))
+    app.add_handler(CommandHandler("meuplano", cmd_meuplan))
+    app.add_handler(CommandHandler("ajuda",    cmd_ajuda))
+    app.add_handler(CommandHandler("help",     cmd_ajuda))
+    app.add_handler(CommandHandler("filme",    cmd_filme))
+    app.add_handler(CommandHandler("serie",    cmd_serie))
+    app.add_handler(CommandHandler("ator",     cmd_ator))
+    app.add_handler(CommandHandler("top10",    cmd_top10))
+
+    # Painel admin (só você usa — protegido por ADMIN_ID)
+    app.add_handler(CommandHandler("gerar",    cmd_gerar))
+    app.add_handler(CommandHandler("clientes", cmd_clientes))
+    app.add_handler(CommandHandler("renovar",  cmd_renovar))
+    app.add_handler(CommandHandler("revogar",  cmd_revogar))
+    app.add_handler(CommandHandler("stats",    cmd_stats))
 
     # Texto e callbacks
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
-    # Jobs automáticos (UTC — ajuste conforme fuso de Brasília = UTC-3)
+    # Jobs automáticos
     jq = app.job_queue
     if jq:
-        jq.run_daily(job_diario_manha, time=datetime.strptime("11:00","%H:%M").time())   # 8h BRT
-        jq.run_daily(job_diario_noite, time=datetime.strptime("23:00","%H:%M").time())   # 20h BRT
+        jq.run_daily(job_diario_manha,           time=datetime.strptime("11:00","%H:%M").time())  # 8h BRT
+        jq.run_daily(job_diario_noite,           time=datetime.strptime("23:00","%H:%M").time())  # 20h BRT
+        jq.run_repeating(job_verificar_vencimentos, interval=3600, first=60)                       # a cada 1h
 
-    logging.info(f"✅ Bot v7.0 Online — {SITE_URL}")
+    logging.info(f"✅ Bot v8.0 SaaS Online — {SITE_URL}")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":

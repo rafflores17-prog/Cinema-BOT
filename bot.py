@@ -98,7 +98,7 @@ class AdminHandler(BaseHTTPRequestHandler):
                 cur.close(); c.close()
                 self._json({"ativos": ativos, "inativos": inativos,
                             "tokens_livres": tokens_livres,
-                            "receita": f"{ativos*30:.2f}"}); return
+                            "receita": f"{ativos*14.90:.2f}"}); return
 
             if cmd == "clientes":
                 c = db(); cur = c.cursor()
@@ -344,6 +344,7 @@ def set_site_url(chat_id, url):
         logging.error(e); return False
 
 
+def clientes_para_avisar():
     try:
         c = db(); cur = c.cursor()
         limite = datetime.utcnow() + timedelta(days=3)
@@ -474,7 +475,7 @@ def ja_enviados(chat_id, tipo):
 def marcar_enviado(chat_id, item_id, tipo):
     try:
         c = db(); cur = c.cursor()
-        cur.execute("""INSERT INTO sent_items VALUES(%s,%s,%s,%s)
+        cur.execute("""INSERT INTO sent_items(chat_id,item_id,item_type,sent_at) VALUES(%s,%s,%s,%s)
             ON CONFLICT(chat_id,item_id,item_type) DO UPDATE SET sent_at=EXCLUDED.sent_at""",
             (chat_id, item_id, tipo, datetime.utcnow()))
         c.commit(); cur.close(); c.close()

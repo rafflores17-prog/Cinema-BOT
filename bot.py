@@ -46,15 +46,126 @@ EPOCAS = {
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# ── Healthcheck ────────────────────────────────────────────────────────────
-class Health(BaseHTTPRequestHandler):
+# ── Servidor HTTP (healthcheck + API do painel) ────────────────────────────
+PANEL_PASS = os.environ.get("PANEL_PASS", "")  # Senha do painel web
+
+class AdminHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200); self.send_header("Content-Type","text/plain"); self.end_headers()
-        self.wfile.write(b"OK")
+        parsed = urlparse(self.path)
+        if parsed.path == "/":
+            self.send_response(200); self.send_header("Content-Type","text/plain"); self.end_headers()
+            self.wfile.write(b"StreamFlix BOT OK"); return
+
+        if parsed.path == "/admin":
+            self._handle_admin(parsed); return
+
+        self.send_response(404); self.end_headers()
+
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin",  "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self._cors(); self.end_headers()
+
+    def _json(self, data, status=200):
+        body = __import__('json').dumps(data, default=str).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self._cors(); self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_admin(self, parsed):
+        from urllib.parse import parse_qs
+        params = parse_qs(parsed.query)
+        pw  = params.get("pass",  [""])[0]
+        cmd = params.get("cmd",   [""])[0]
+
+        if not PANEL_PASS or pw != PANEL_PASS:
+            self._json({"error": "Senha incorreta."}, 403); return
+
+        try:
+            if cmd == "stats":
+                c = db(); cur = c.cursor()
+                cur.execute("SELECT COUNT(*) FROM clientes WHERE ativo=TRUE AND validade > NOW()")
+                ativos = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM clientes WHERE ativo=FALSE OR validade <= NOW()")
+                inativos = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM tokens WHERE usado=FALSE")
+                tokens_livres = cur.fetchone()[0]
+                cur.close(); c.close()
+                self._json({"ativos": ativos, "inativos": inativos,
+                            "tokens_livres": tokens_livres,
+                            "receita": f"{ativos*30:.2f}"}); return
+
+            if cmd == "clientes":
+                c = db(); cur = c.cursor()
+                cur.execute("""SELECT chat_id, ativo, validade, criado_em, modo, site_url
+                    FROM clientes ORDER BY criado_em DESC""")
+                rows = cur.fetchall(); cur.close(); c.close()
+                result = []
+                for chat_id, ativo, validade, criado, modo, site_url in rows:
+                    dias = (validade - datetime.utcnow()).days if validade else -1
+                    result.append({
+                        "chat_id": chat_id,
+                        "ativo": bool(ativo and dias >= 0),
+                        "validade": validade.strftime("%d/%m/%Y") if validade else None,
+                        "dias_rest": dias,
+                        "modo": modo or "completo",
+                        "site_url": site_url or ""
+                    })
+                self._json({"clientes": result}); return
+
+            if cmd.startswith("gerar:"):
+                qtd = min(int(cmd.split(":")[1]), 10)
+                tokens = [gerar_token() for _ in range(qtd)]
+                self._json({"tokens": tokens, "ok": True}); return
+
+            if cmd.startswith("renovar:"):
+                cid = int(cmd.split(":")[1])
+                nova = renovar_cliente(cid)
+                self._json({"ok": nova is not None,
+                            "validade": nova.strftime("%d/%m/%Y") if nova else None}); return
+
+            if cmd.startswith("revogar:"):
+                cid = int(cmd.split(":")[1])
+                ok = revogar_cliente(cid)
+                self._json({"ok": ok}); return
+
+            if cmd.startswith("config_modo:"):
+                _, cid, modo = cmd.split(":", 2)
+                ok = set_modo(int(cid), modo)
+                self._json({"ok": ok}); return
+
+            if cmd.startswith("config_site:"):
+                from urllib.parse import unquote
+                _, cid, url = cmd.split(":", 2)
+                url = unquote(url)
+                ok = set_site_url(int(cid), None if url == "remover" else url)
+                self._json({"ok": ok}); return
+
+            if cmd.startswith("ativar:"):
+                parts = cmd.split(":")
+                cid   = int(parts[1])
+                token = parts[2].strip().upper()
+                if not token_valido(token):
+                    self._json({"ok": False, "error": "Token inválido ou já usado."}); return
+                validade = usar_token(token, cid)
+                self._json({"ok": validade is not None,
+                            "validade": validade.strftime("%d/%m/%Y") if validade else None}); return
+
+            self._json({"error": "Comando desconhecido."}, 400)
+        except Exception as e:
+            logging.error(f"AdminAPI: {e}")
+            self._json({"error": str(e)}, 500)
+
     def log_message(self, *a, **k): pass
 
 def start_health():
-    HTTPServer(("0.0.0.0", int(os.environ.get("PORT","8000"))), Health).serve_forever()
+    HTTPServer(("0.0.0.0", int(os.environ.get("PORT","8000"))), AdminHandler).serve_forever()
+
 
 # ── Banco ──────────────────────────────────────────────────────────────────
 def db():
@@ -76,8 +187,16 @@ def setup_db():
             validade   TIMESTAMP,
             aviso_3d   BOOLEAN DEFAULT FALSE,
             aviso_venc BOOLEAN DEFAULT FALSE,
-            criado_em  TIMESTAMP DEFAULT NOW()
+            criado_em  TIMESTAMP DEFAULT NOW(),
+            modo       TEXT DEFAULT 'completo',
+            site_url   TEXT DEFAULT NULL
         );""")
+        # Migrações de colunas novas
+        try:
+            cur.execute("ALTER TABLE clientes ADD COLUMN IF NOT EXISTS modo TEXT DEFAULT 'completo'")
+            cur.execute("ALTER TABLE clientes ADD COLUMN IF NOT EXISTS site_url TEXT DEFAULT NULL")
+            c.commit()
+        except: pass
         # Tokens gerados pelo admin
         cur.execute("""CREATE TABLE IF NOT EXISTS tokens (
             token     TEXT PRIMARY KEY,
@@ -185,7 +304,46 @@ def revogar_cliente(chat_id):
         return True
     except: return False
 
-def clientes_para_avisar():
+def get_modo(chat_id):
+    """Retorna o modo do cliente: 'completo' (padrão) ou 'simples'."""
+    if chat_id == GRUPO_ID: return "completo"
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("SELECT modo FROM clientes WHERE chat_id=%s", (chat_id,))
+        r = cur.fetchone(); cur.close(); c.close()
+        return (r[0] if r and r[0] else "completo")
+    except: return "completo"
+
+def set_modo(chat_id, modo):
+    """Define modo 'completo' ou 'simples' para um cliente."""
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("UPDATE clientes SET modo=%s WHERE chat_id=%s", (modo, chat_id))
+        c.commit(); cur.close(); c.close()
+        return True
+    except Exception as e:
+        logging.error(e); return False
+
+def get_site_url(chat_id):
+    """Retorna o site_url personalizado do cliente, ou o SITE_URL padrão."""
+    if chat_id == GRUPO_ID: return SITE_URL
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("SELECT site_url FROM clientes WHERE chat_id=%s", (chat_id,))
+        r = cur.fetchone(); cur.close(); c.close()
+        return (r[0] if r and r[0] else SITE_URL)
+    except: return SITE_URL
+
+def set_site_url(chat_id, url):
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("UPDATE clientes SET site_url=%s WHERE chat_id=%s", (url or None, chat_id))
+        c.commit(); cur.close(); c.close()
+        return True
+    except Exception as e:
+        logging.error(e); return False
+
+
     try:
         c = db(); cur = c.cursor()
         limite = datetime.utcnow() + timedelta(days=3)
@@ -350,10 +508,18 @@ async def send_item(context, chat_id, item, is_tv=False, tipo="movie"):
     details = tmdb_details(iid, is_tv=is_tv) or item
     title   = details.get("name") if is_tv else details.get("title","?")
     caption = build_caption(details, is_tv=is_tv)
-    keyboard = [
-        [InlineKeyboardButton("▶️ ASSISTIR AGORA",  url=link_streamflix(iid, is_tv=is_tv))],
-        [InlineKeyboardButton("💬 BAIXAR APP AQUI", url=APP_URL)]
-    ]
+    modo     = get_modo(chat_id)
+    site     = get_site_url(chat_id)
+    # modo 'completo': botão site personalizado; modo 'simples': só assistir
+    if modo == "simples":
+        keyboard = [
+            [InlineKeyboardButton("▶️ ASSISTIR AGORA", url=link_streamflix(iid, is_tv=is_tv))]
+        ]
+    else:
+        keyboard = [
+            [InlineKeyboardButton("▶️ ASSISTIR AGORA",    url=link_streamflix(iid, is_tv=is_tv))],
+            [InlineKeyboardButton("🌐 Visite nosso Site", url=site)]
+        ]
     post = details.get("poster_path") or item.get("poster_path")
     try:
         if post: await enviar(context, chat_id, photo=f"{IMG_BASE}{post}", caption=caption, markup=InlineKeyboardMarkup(keyboard))
@@ -420,13 +586,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ["🔍 Buscar","❓ Ajuda"]
     ]
     promo = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌐 ACESSAR STREAMFLIX", url=SITE_URL)],
-        [InlineKeyboardButton("📱 BAIXAR APP",         url=APP_URL)]
+        [InlineKeyboardButton("🌐 Visite nosso Site", url=SITE_URL)]
     ])
     await enviar(context, cid,
         text=f"🎬 <b>StreamFlix Bot</b>\n\nOlá {html.escape(user.first_name)}! Pronto para assistir? 🍿",
         markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
-    await enviar(context, cid, text="Acesse o StreamFlix:", markup=promo)
+    await enviar(context, cid, text="✨ Acesse agora:", markup=promo)
 
 async def cmd_ativar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
@@ -512,12 +677,21 @@ async def cmd_clientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = listar_clientes()
     if not rows:
         await update.message.reply_text("📭 Nenhum cliente cadastrado."); return
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("SELECT chat_id, modo, site_url FROM clientes")
+        extras = {r[0]: (r[1] or "completo", r[2]) for r in cur.fetchall()}
+        cur.close(); c.close()
+    except: extras = {}
     msg = f"👥 <b>Clientes ({len(rows)}):</b>\n\n"
     for chat_id, ativo, validade, criado in rows:
         dias = (validade - datetime.utcnow()).days if validade else 0
         icone = "🟢" if (ativo and dias > 3) else ("🟡" if (ativo and 0 < dias <= 3) else "🔴")
         venc  = validade.strftime('%d/%m/%Y') if validade else "—"
-        msg  += f"{icone} <code>{chat_id}</code> — vence {venc} ({max(dias,0)}d)\n"
+        modo, site = extras.get(chat_id, ("completo", None))
+        modo_icone = "📋" if modo == "simples" else "🌐"
+        site_txt = f"\n    🔗 {site}" if site else ""
+        msg  += f"{icone} <code>{chat_id}</code> — vence {venc} ({max(dias,0)}d) {modo_icone}{modo}{site_txt}\n"
     await update.message.reply_text(msg, parse_mode="HTML")
 
 async def cmd_renovar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -576,7 +750,58 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
-# ── Jobs automáticos ───────────────────────────────────────────────────────
+async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("⛔ Acesso negado."); return
+    # /config CHAT_ID modo simples|completo
+    # /config CHAT_ID site https://...
+    # /config CHAT_ID site remover
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "⚠️ <b>Uso do /config:</b>\n\n"
+            "<b>Modo de postagem:</b>\n"
+            "<code>/config CHAT_ID modo completo</code> — com botão de site\n"
+            "<code>/config CHAT_ID modo simples</code>  — só botão assistir\n\n"
+            "<b>Site personalizado do cliente:</b>\n"
+            "<code>/config CHAT_ID site https://sitedomeucliente.com</code>\n"
+            "<code>/config CHAT_ID site remover</code> — volta ao padrão",
+            parse_mode="HTML"); return
+    try: cid = int(context.args[0])
+    except:
+        await update.message.reply_text("❌ CHAT_ID inválido."); return
+    acao = context.args[1].lower()
+    valor = context.args[2]
+
+    if acao == "modo":
+        if valor not in ("simples", "completo"):
+            await update.message.reply_text("❌ Modo inválido. Use <code>simples</code> ou <code>completo</code>.", parse_mode="HTML"); return
+        if set_modo(cid, valor):
+            icone = "📋" if valor == "simples" else "🌐"
+            await update.message.reply_text(
+                f"✅ <b>Modo atualizado!</b>\n{icone} Chat <code>{cid}</code> → modo <b>{valor}</b>",
+                parse_mode="HTML")
+        else:
+            await update.message.reply_text(f"❌ Chat ID <code>{cid}</code> não encontrado.", parse_mode="HTML")
+
+    elif acao == "site":
+        if valor.lower() == "remover":
+            set_site_url(cid, None)
+            await update.message.reply_text(
+                f"✅ Site removido! Chat <code>{cid}</code> voltou ao padrão (<code>{SITE_URL}</code>)",
+                parse_mode="HTML")
+        elif valor.startswith("http"):
+            if set_site_url(cid, valor):
+                await update.message.reply_text(
+                    f"✅ <b>Site atualizado!</b>\n🔗 Chat <code>{cid}</code> → <code>{valor}</code>",
+                    parse_mode="HTML")
+            else:
+                await update.message.reply_text(f"❌ Chat ID <code>{cid}</code> não encontrado.", parse_mode="HTML")
+        else:
+            await update.message.reply_text("❌ URL inválida. Deve começar com <code>http</code>.", parse_mode="HTML")
+    else:
+        await update.message.reply_text("❌ Ação inválida. Use <code>modo</code> ou <code>site</code>.", parse_mode="HTML")
+
+
 async def job_verificar_vencimentos(context: ContextTypes.DEFAULT_TYPE):
     """Roda a cada hora: avisa quem vence em 3 dias e bloqueia quem venceu."""
     for cid in clientes_para_avisar():
@@ -811,6 +1036,7 @@ def main():
     app.add_handler(CommandHandler("renovar",  cmd_renovar))
     app.add_handler(CommandHandler("revogar",  cmd_revogar))
     app.add_handler(CommandHandler("stats",    cmd_stats))
+    app.add_handler(CommandHandler("config",   cmd_config))
 
     # Texto e callbacks
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

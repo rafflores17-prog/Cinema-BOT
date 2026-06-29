@@ -96,7 +96,7 @@ class AdminHandler(BaseHTTPRequestHandler):
                 cur.execute("SELECT COUNT(*) FROM tokens WHERE usado=FALSE")
                 tokens_livres = cur.fetchone()[0]
                 cur.close(); c.close()
-                self._json({"ativos": ativos, "inativos": inativos,
+                self._json({"ativos": ativos, "expirados": inativos,
                             "tokens_livres": tokens_livres,
                             "receita": f"{ativos*14.90:.2f}"}); return
 
@@ -155,6 +155,45 @@ class AdminHandler(BaseHTTPRequestHandler):
                 validade = usar_token(token, cid)
                 self._json({"ok": validade is not None,
                             "validade": validade.strftime("%d/%m/%Y") if validade else None}); return
+
+
+            if cmd == "tokens_lista":
+                c = db(); cur = c.cursor()
+                cur.execute("SELECT token, usado, criado_em FROM tokens ORDER BY criado_em DESC LIMIT 100")
+                rows = cur.fetchall(); cur.close(); c.close()
+                result = [{"token": r[0], "usado": bool(r[1]),
+                           "criado_em": r[2].strftime("%d/%m/%Y %H:%M") if r[2] else ""} for r in rows]
+                self._json({"tokens": result}); return
+
+            if cmd.startswith("broadcast:"):
+                from urllib.parse import unquote
+                msg = unquote(cmd[len("broadcast:"):])
+                c = db(); cur = c.cursor()
+                cur.execute("SELECT chat_id FROM clientes WHERE ativo=TRUE AND validade > NOW()")
+                chats = [r[0] for r in cur.fetchall()]; cur.close(); c.close()
+                enviados = 0
+                import asyncio
+                async def _send_all():
+                    nonlocal enviados
+                    from telegram import Bot
+                    bot = Bot(token=TOKEN)
+                    for cid in chats:
+                        try:
+                            await bot.send_message(chat_id=cid, text=msg)
+                            enviados += 1
+                        except: pass
+                asyncio.run(_send_all())
+                self._json({"ok": True, "enviados": enviados}); return
+
+            if cmd == "historico":
+                c = db(); cur = c.cursor()
+                cur.execute("""SELECT chat_id, token, criado_em, validade
+                    FROM clientes ORDER BY criado_em DESC LIMIT 50""")
+                rows = cur.fetchall(); cur.close(); c.close()
+                result = [{"chat_id": r[0], "token": r[1],
+                           "criado_em": r[2].strftime("%d/%m/%Y %H:%M") if r[2] else "",
+                           "validade": r[3].strftime("%d/%m/%Y") if r[3] else ""} for r in rows]
+                self._json({"historico": result}); return
 
             self._json({"error": "Comando desconhecido."}, 400)
         except Exception as e:
@@ -344,7 +383,6 @@ def set_site_url(chat_id, url):
         logging.error(e); return False
 
 
-def clientes_para_avisar():
     try:
         c = db(); cur = c.cursor()
         limite = datetime.utcnow() + timedelta(days=3)
@@ -475,7 +513,7 @@ def ja_enviados(chat_id, tipo):
 def marcar_enviado(chat_id, item_id, tipo):
     try:
         c = db(); cur = c.cursor()
-        cur.execute("""INSERT INTO sent_items(chat_id,item_id,item_type,sent_at) VALUES(%s,%s,%s,%s)
+        cur.execute("""INSERT INTO sent_items VALUES(%s,%s,%s,%s)
             ON CONFLICT(chat_id,item_id,item_type) DO UPDATE SET sent_at=EXCLUDED.sent_at""",
             (chat_id, item_id, tipo, datetime.utcnow()))
         c.commit(); cur.close(); c.close()

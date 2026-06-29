@@ -193,12 +193,15 @@ class AdminHandler(BaseHTTPRequestHandler):
                     bot = Bot(token=TOKEN)
                     for cid in canais:
                         try:
+                            kw2 = {}
+                            if cid == GRUPO_ID and TOPIC_ID:
+                                kw2["message_thread_id"] = TOPIC_ID
                             await bot.send_message(
                                 chat_id=cid, text=txt, parse_mode="HTML",
                                 reply_markup=InlineKeyboardMarkup([[
                                     InlineKeyboardButton("💬 Falar com Admin",
                                         url=f"https://t.me/{ADMIN_CONTATO.lstrip('@')}")
-                                ]]))
+                                ]]), **kw2)
                             enviados += 1
                         except: pass
                 asyncio.run(_send())
@@ -970,11 +973,14 @@ async def job_propaganda(context: ContextTypes.DEFAULT_TYPE):
 
     for cid in canais:
         try:
+            kw = {}
+            if cid == GRUPO_ID and TOPIC_ID:
+                kw["message_thread_id"] = TOPIC_ID
             await context.bot.send_message(
                 chat_id=cid, text=texto, parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("💬 Falar com Admin", url=f"https://t.me/{ADMIN_CONTATO.lstrip('@')}")
-                ]])
+                ]]), **kw
             )
         except Exception as e: logging.error(f"Propaganda {cid}: {e}")
 

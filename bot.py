@@ -25,7 +25,9 @@ DATABASE_URL  = os.environ.get("DATABASE_URL", "")
 SITE_URL      = os.environ.get("SITE_URL",     "https://streamflixvip.online")
 APP_URL       = os.environ.get("APP_URL",      "https://streamflixvip.online")
 ADMIN_ID      = int(os.environ.get("ADMIN_ID", "0"))   # Seu user_id do Telegram (não chat_id do canal)
-GRUPO_ID      = int(os.environ.get("GRUPO_ID", "0"))   # Seu canal principal
+GRUPO_ID      = int(os.environ.get("GRUPO_ID", "0"))   # Seu canal principal (streamflixofc)
+CANAL_VIP     = int(os.environ.get("CANAL_VIP", "0"))    # Canal VIP (streamflixvip)
+ADMIN_CONTATO = os.environ.get("ADMIN_CONTATO", "@RaffDimitri")  # Contato para propagandas
 TOPIC_ID      = int(os.environ.get("TOPIC_ID", "0"))
 CANAL_SUPORTE = "https://t.me/streamflixofc"
 DIAS_SEM_REPETIR = 21
@@ -157,6 +159,51 @@ class AdminHandler(BaseHTTPRequestHandler):
                             "validade": validade.strftime("%d/%m/%Y") if validade else None}); return
 
 
+
+            if cmd == "propagandas_lista":
+                rows = listar_propagandas()
+                result = [{"id": r[0], "texto": r[1], "ativo": bool(r[2]),
+                           "criado_em": r[3].strftime("%d/%m/%Y") if r[3] else ""} for r in rows]
+                self._json({"propagandas": result, "fixas": PROPAGANDAS_FIXAS}); return
+
+            if cmd.startswith("propaganda_add:"):
+                from urllib.parse import unquote
+                texto = unquote(cmd[len("propaganda_add:"):])
+                ok = add_propaganda(texto)
+                self._json({"ok": ok}); return
+
+            if cmd.startswith("propaganda_del:"):
+                pid = int(cmd.split(":")[1])
+                ok = deletar_propaganda(pid)
+                self._json({"ok": ok}); return
+
+            if cmd.startswith("propaganda_disparo:"):
+                from urllib.parse import unquote
+                import asyncio
+                texto_raw = cmd[len("propaganda_disparo:"):]
+                texto = unquote(texto_raw) if texto_raw else None
+                canais = []
+                if GRUPO_ID: canais.append(GRUPO_ID)
+                if CANAL_VIP: canais.append(CANAL_VIP)
+                txt = (texto or PROPAGANDAS_FIXAS[0]).format(contato=ADMIN_CONTATO)
+                from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton
+                enviados = 0
+                async def _send():
+                    nonlocal enviados
+                    bot = Bot(token=TOKEN)
+                    for cid in canais:
+                        try:
+                            await bot.send_message(
+                                chat_id=cid, text=txt, parse_mode="HTML",
+                                reply_markup=InlineKeyboardMarkup([[
+                                    InlineKeyboardButton("💬 Falar com Admin",
+                                        url=f"https://t.me/{ADMIN_CONTATO.lstrip('@')}")
+                                ]]))
+                            enviados += 1
+                        except: pass
+                asyncio.run(_send())
+                self._json({"ok": True, "enviados": enviados}); return
+
             if cmd == "tokens_lista":
                 c = db(); cur = c.cursor()
                 cur.execute("SELECT token, usado, criado_em FROM tokens ORDER BY criado_em DESC LIMIT 100")
@@ -236,6 +283,19 @@ def setup_db():
             cur.execute("ALTER TABLE clientes ADD COLUMN IF NOT EXISTS site_url TEXT DEFAULT NULL")
             c.commit()
         except: pass
+        # Propagandas agendadas
+        cur.execute("""CREATE TABLE IF NOT EXISTS propagandas (
+            id        SERIAL PRIMARY KEY,
+            texto     TEXT NOT NULL,
+            ativo     BOOLEAN DEFAULT TRUE,
+            criado_em TIMESTAMP DEFAULT NOW()
+        );""")
+        # Controle de rotação de propagandas
+        cur.execute("""CREATE TABLE IF NOT EXISTS propa_state (
+            id        INTEGER PRIMARY KEY DEFAULT 1,
+            ultimo_idx INTEGER DEFAULT 0
+        );""")
+        cur.execute("INSERT INTO propa_state(id,ultimo_idx) VALUES(1,0) ON CONFLICT DO NOTHING")
         # Tokens gerados pelo admin
         cur.execute("""CREATE TABLE IF NOT EXISTS tokens (
             token     TEXT PRIMARY KEY,
@@ -254,6 +314,59 @@ def setup_db():
         logging.info("✅ Banco pronto (v8 SaaS)")
     except Exception as e:
         logging.error(f"Banco: {e}")
+
+
+# ── Propagandas ────────────────────────────────────────────────────────────
+PROPAGANDAS_FIXAS = [
+    "🎬 <b>Transforme seu canal do Telegram em um cinema!</b>\n\nCom o <b>StreamFlix Bot</b> seu canal recebe automaticamente:\n🎥 Filmes em cartaz todo dia\n🔥 Séries populares\n🚀 Lançamentos antes de todo mundo\n\n💬 Fale comigo: {contato}",
+    "🍿 <b>Seu canal merece mais do que posts manuais!</b>\n\nO <b>StreamFlix Bot</b> posta filmes, séries e trailers no automático — sem você fazer nada.\n\n✅ Configuração rápida\n✅ Conteúdo todo dia\n✅ Preço acessível\n\n👉 {contato}",
+    "📺 <b>Dono de canal no Telegram?</b>\n\nVeja o que o <b>StreamFlix Bot</b> pode fazer pelo seu canal:\n\n🎬 Filmes em cartaz diariamente\n📅 Lançamentos futuros\n⭐ Rankings populares\n\nSeu canal nunca mais fica parado. 👉 {contato}",
+    "🚀 <b>Automatize seu canal de séries e filmes!</b>\n\nNão perca mais tempo postando manualmente. O <b>StreamFlix Bot</b> faz tudo no piloto automático.\n\n💰 Plano mensal acessível\n🎯 Conteúdo certeiro para seu público\n\n📩 {contato}",
+    "🎥 <b>Quer engajar mais no seu canal?</b>\n\nConteúdo de filmes e séries todo dia = audiência ativa todo dia.\n\nO <b>StreamFlix Bot</b> já está no ar em canais como este. Quer também?\n\n👇 {contato}",
+]
+
+def get_propagandas():
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("SELECT texto FROM propagandas WHERE ativo=TRUE ORDER BY id")
+        rows = [r[0] for r in cur.fetchall()]; cur.close(); c.close()
+        return rows
+    except: return []
+
+def get_proximo_idx():
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("SELECT ultimo_idx FROM propa_state WHERE id=1")
+        r = cur.fetchone()
+        idx = (r[0] + 1) if r else 0
+        cur.execute("UPDATE propa_state SET ultimo_idx=%s WHERE id=1", (idx,))
+        c.commit(); cur.close(); c.close()
+        return idx
+    except: return 0
+
+def add_propaganda(texto):
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("INSERT INTO propagandas(texto) VALUES(%s)", (texto,))
+        c.commit(); cur.close(); c.close()
+        return True
+    except: return False
+
+def listar_propagandas():
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("SELECT id, texto, ativo, criado_em FROM propagandas ORDER BY id DESC")
+        rows = cur.fetchall(); cur.close(); c.close()
+        return rows
+    except: return []
+
+def deletar_propaganda(pid):
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("DELETE FROM propagandas WHERE id=%s", (pid,))
+        c.commit(); cur.close(); c.close()
+        return True
+    except: return False
 
 # ── Funções de cliente ─────────────────────────────────────────────────────
 def gerar_token():
@@ -841,6 +954,50 @@ async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Ação inválida. Use <code>modo</code> ou <code>site</code>.", parse_mode="HTML")
 
 
+
+async def job_propaganda(context: ContextTypes.DEFAULT_TYPE):
+    """Roda 3x ao dia: posta propaganda rotativa nos canais principais."""
+    canais = []
+    if GRUPO_ID: canais.append(GRUPO_ID)
+    if CANAL_VIP: canais.append(CANAL_VIP)
+    if not canais: return
+
+    # Pega propagandas do banco; usa as fixas como fallback
+    custom = get_propagandas()
+    todas = custom if custom else PROPAGANDAS_FIXAS
+    idx = get_proximo_idx() % len(todas)
+    texto = todas[idx].format(contato=ADMIN_CONTATO)
+
+    for cid in canais:
+        try:
+            await context.bot.send_message(
+                chat_id=cid, text=texto, parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("💬 Falar com Admin", url=f"https://t.me/{ADMIN_CONTATO.lstrip('@')}")
+                ]])
+            )
+        except Exception as e: logging.error(f"Propaganda {cid}: {e}")
+
+async def enviar_propaganda_agora(context, texto_custom=None):
+    """Disparo manual de propaganda pelo painel."""
+    canais = []
+    if GRUPO_ID: canais.append(GRUPO_ID)
+    if CANAL_VIP: canais.append(CANAL_VIP)
+    if not canais: return 0
+    texto = (texto_custom or PROPAGANDAS_FIXAS[0]).format(contato=ADMIN_CONTATO)
+    enviados = 0
+    for cid in canais:
+        try:
+            await context.bot.send_message(
+                chat_id=cid, text=texto, parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("💬 Falar com Admin", url=f"https://t.me/{ADMIN_CONTATO.lstrip('@')}")
+                ]])
+            )
+            enviados += 1
+        except Exception as e: logging.error(f"Propaganda manual {cid}: {e}")
+    return enviados
+
 async def job_verificar_vencimentos(context: ContextTypes.DEFAULT_TYPE):
     """Roda a cada hora: avisa quem vence em 3 dias e bloqueia quem venceu."""
     for cid in clientes_para_avisar():
@@ -874,6 +1031,7 @@ async def job_diario_todos(context: ContextTypes.DEFAULT_TYPE, turno="manha"):
         chats = [r[0] for r in cur.fetchall()]; cur.close(); c.close()
     except: chats = []
     if GRUPO_ID and GRUPO_ID not in chats: chats.append(GRUPO_ID)
+    if CANAL_VIP and CANAL_VIP not in chats: chats.append(CANAL_VIP)
 
     for cid in chats:
         try:
@@ -1087,6 +1245,9 @@ def main():
         jq.run_daily(job_diario_manha,           time=datetime.strptime("11:00","%H:%M").time())  # 8h BRT
         jq.run_daily(job_diario_noite,           time=datetime.strptime("23:00","%H:%M").time())  # 20h BRT
         jq.run_repeating(job_verificar_vencimentos, interval=3600, first=60)                       # a cada 1h
+        jq.run_daily(job_propaganda, time=datetime.strptime("13:00","%H:%M").time())  # 10h BRT
+        jq.run_daily(job_propaganda, time=datetime.strptime("18:00","%H:%M").time())  # 15h BRT
+        jq.run_daily(job_propaganda, time=datetime.strptime("22:00","%H:%M").time())  # 19h BRT
 
     logging.info(f"✅ Bot v8.0 SaaS Online — {SITE_URL}")
     app.run_polling(drop_pending_updates=True)

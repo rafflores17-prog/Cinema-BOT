@@ -104,11 +104,11 @@ class AdminHandler(BaseHTTPRequestHandler):
 
             if cmd == "clientes":
                 c = db(); cur = c.cursor()
-                cur.execute("""SELECT chat_id, ativo, validade, criado_em, modo, site_url
+                cur.execute("""SELECT chat_id, ativo, validade, criado_em, modo, site_url, nome_canal
                     FROM clientes ORDER BY criado_em DESC""")
                 rows = cur.fetchall(); cur.close(); c.close()
                 result = []
-                for chat_id, ativo, validade, criado, modo, site_url in rows:
+                for chat_id, ativo, validade, criado, modo, site_url, nome_canal in rows:
                     dias = (validade - datetime.utcnow()).days if validade else -1
                     result.append({
                         "chat_id": chat_id,
@@ -116,7 +116,8 @@ class AdminHandler(BaseHTTPRequestHandler):
                         "validade": validade.strftime("%d/%m/%Y") if validade else None,
                         "dias_rest": dias,
                         "modo": modo or "completo",
-                        "site_url": site_url or ""
+                        "site_url": site_url or "",
+                        "nome_canal": nome_canal or ""
                     })
                 self._json({"clientes": result}); return
 
@@ -159,6 +160,46 @@ class AdminHandler(BaseHTTPRequestHandler):
                             "validade": validade.strftime("%d/%m/%Y") if validade else None}); return
 
 
+
+
+            if cmd.startswith("config_nome:"):
+                from urllib.parse import unquote
+                _, cid, nome = cmd.split(":", 2)
+                nome = unquote(nome)
+                c = db(); cur = c.cursor()
+                cur.execute("UPDATE clientes SET nome_canal=%s WHERE chat_id=%s",
+                    (None if nome=="remover" else nome, int(cid)))
+                c.commit(); cur.close(); c.close()
+                self._json({"ok": True}); return
+
+            if cmd.startswith("token_add:"):
+                from urllib.parse import unquote
+                token_raw = unquote(cmd[len("token_add:"):]).strip().upper()
+                if not token_raw:
+                    self._json({"ok": False, "error": "Token vazio"}); return
+                c = db(); cur = c.cursor()
+                try:
+                    cur.execute("INSERT INTO tokens(token,usado) VALUES(%s,FALSE)", (token_raw,))
+                    c.commit(); cur.close(); c.close()
+                    self._json({"ok": True, "token": token_raw}); return
+                except Exception as e:
+                    cur.close(); c.close()
+                    self._json({"ok": False, "error": "Token já existe"}); return
+
+            if cmd.startswith("token_del:"):
+                token_raw = cmd[len("token_del:"):].strip().upper()
+                c = db(); cur = c.cursor()
+                cur.execute("DELETE FROM tokens WHERE token=%s AND usado=FALSE", (token_raw,))
+                deleted = cur.rowcount
+                c.commit(); cur.close(); c.close()
+                self._json({"ok": deleted > 0, "error": "Token já usado ou não encontrado" if not deleted else ""}); return
+
+            if cmd.startswith("cliente_del:"):
+                cid = int(cmd.split(":")[1])
+                c = db(); cur = c.cursor()
+                cur.execute("DELETE FROM clientes WHERE chat_id=%s", (cid,))
+                c.commit(); cur.close(); c.close()
+                self._json({"ok": True}); return
 
             if cmd == "propagandas_lista":
                 rows = listar_propagandas()
@@ -284,6 +325,8 @@ def setup_db():
         try:
             cur.execute("ALTER TABLE clientes ADD COLUMN IF NOT EXISTS modo TEXT DEFAULT 'completo'")
             cur.execute("ALTER TABLE clientes ADD COLUMN IF NOT EXISTS site_url TEXT DEFAULT NULL")
+            cur.execute("ALTER TABLE clientes ADD COLUMN IF NOT EXISTS nome_canal TEXT DEFAULT NULL")
+            cur.execute("ALTER TABLE tokens ADD COLUMN IF NOT EXISTS criado_em TIMESTAMP DEFAULT NOW()")
             c.commit()
         except: pass
         # Propagandas agendadas
@@ -372,6 +415,14 @@ def deletar_propaganda(pid):
     except: return False
 
 # ── Funções de cliente ─────────────────────────────────────────────────────
+def set_nome_canal(chat_id, nome):
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("UPDATE clientes SET nome_canal=%s WHERE chat_id=%s", (nome, chat_id))
+        c.commit(); cur.close(); c.close()
+        return True
+    except: return False
+
 def gerar_token():
     chars = string.ascii_uppercase + string.digits
     token = "SF-" + "".join(secrets.choice(chars) for _ in range(10))

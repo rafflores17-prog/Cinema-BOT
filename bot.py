@@ -572,6 +572,10 @@ async def cmd_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
     premios = get_premios_disponiveis()
 
     # Tipos disponíveis
+    NOMES_TIPO = {
+        "xtream": "Conta Xtream IPTV",
+        "vip": "Código VIP StreamFlix",
+    }
     tipos = {}
     for p in premios:
         if p["tipo"] not in tipos:
@@ -587,7 +591,8 @@ async def cmd_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
         texto += "🎁 <b>Prêmios disponíveis:</b>\n"
         for tipo, info in tipos.items():
             emoji = "📺" if tipo == "xtream" else "🎟️" if tipo == "vip" else "🎁"
-            texto += f"{emoji} {info['qtd']}x {tipo.upper()} — R$ {info['valor']:.2f} cada\n"
+            nome_tipo = NOMES_TIPO.get(tipo, tipo.upper())
+            texto += f"{emoji} {info['qtd']}x {nome_tipo} — R$ {info['valor']:.2f} cada\n"
         texto += "\nEscolha uma opção abaixo:"
     else:
         texto += "⚠️ Nenhum prêmio disponível no momento."
@@ -606,7 +611,7 @@ async def cmd_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for tipo, info in tipos.items():
         emoji = "📺" if tipo == "xtream" else "🎟️" if tipo == "vip" else "🎁"
         botoes.append([InlineKeyboardButton(
-            f"{emoji} Resgatar {tipo.upper()} — R$ {info['valor']:.2f}",
+            f"{emoji} {NOMES_TIPO.get(tipo, tipo.upper())} — R$ {info['valor']:.2f}",  # botão resgate
             callback_data=f"resgatar:{tipo}"
         )])
 
@@ -667,9 +672,16 @@ async def callback_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
         valor = premios[0]["valor"]
         saldo = get_saldo(user_id)
         if saldo < valor:
-            await q.answer(
-                f"💰 Saldo insuficiente! Você tem R$ {saldo:.2f} e precisa de R$ {valor:.2f}",
-                show_alert=True
+            await q.answer("💰 Saldo insuficiente!", show_alert=True)
+            await q.edit_message_text(
+                f"❌ <b>Saldo insuficiente!</b>\n\n"
+                f"💰 Seu saldo: <b>R$ {saldo:.2f}</b>\n"
+                f"💳 Necessário: <b>R$ {valor:.2f}</b>\n\n"
+                f"Adicione créditos para continuar.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("💳 Adicionar créditos", callback_data=f"voltar_credito")
+                ]])
             )
             return
         # Confirmar resgate
@@ -679,7 +691,7 @@ async def callback_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         await q.edit_message_text(
             f"🎁 <b>Confirmar resgate?</b>\n\n"
-            f"Tipo: <b>{tipo.upper()}</b>\n"
+            f"Tipo: <b>{NOMES_TIPO.get(tipo, tipo.upper())}</b>\n"
             f"Valor: <b>R$ {valor:.2f}</b>\n"
             f"Saldo atual: <b>R$ {saldo:.2f}</b>\n"
             f"Saldo após: <b>R$ {saldo-valor:.2f}</b>",
@@ -743,6 +755,35 @@ async def callback_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "cancelar":
         await q.edit_message_text("❌ Resgate cancelado.")
+
+    elif data == "voltar_credito":
+        # Redireciona para o menu de créditos
+        user_id2 = q.from_user.id
+        saldo2 = get_saldo(user_id2)
+        premios2 = get_premios_disponiveis()
+        tipos2 = {}
+        for p in premios2:
+            if p["tipo"] not in tipos2:
+                tipos2[p["tipo"]] = {"qtd": 0, "valor": p["valor"]}
+            tipos2[p["tipo"]]["qtd"] += 1
+        NOMES_TIPO2 = {"xtream": "Conta Xtream IPTV", "vip": "Código VIP StreamFlix"}
+        texto2 = f"💰 <b>Seus Créditos StreamFlix</b>\n\n🏦 Saldo atual: <b>R$ {saldo2:.2f}</b>\n\n"
+        botoes2 = []
+        botoes2.append([
+            InlineKeyboardButton("💳 Adicionar R$2,00", callback_data="pix:2.00"),
+            InlineKeyboardButton("💳 Adicionar R$5,99", callback_data="pix:5.99"),
+        ])
+        botoes2.append([
+            InlineKeyboardButton("💳 Adicionar R$10,00", callback_data="pix:10.00"),
+            InlineKeyboardButton("💳 Adicionar R$20,00", callback_data="pix:20.00"),
+        ])
+        for tipo2, info2 in tipos2.items():
+            emoji2 = "📺" if tipo2 == "xtream" else "🎟️" if tipo2 == "vip" else "🎁"
+            botoes2.append([InlineKeyboardButton(
+                f"{emoji2} {NOMES_TIPO2.get(tipo2, tipo2.upper())} — R$ {info2['valor']:.2f}",
+                callback_data=f"resgatar:{tipo2}"
+            )])
+        await q.edit_message_text(texto2, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(botoes2))
 
 # ── Funções de cliente ─────────────────────────────────────────────────────
 
@@ -1733,7 +1774,7 @@ def main():
 
     # Créditos
     app.add_handler(CommandHandler("credito", cmd_credito))
-    app.add_handler(CallbackQueryHandler(callback_credito, pattern="^(pix:|check:|resgatar:|confirmar:|cancelar)"))
+    app.add_handler(CallbackQueryHandler(callback_credito, pattern="^(pix:|check:|resgatar:|confirmar:|cancelar|voltar_credito)"))
     # Texto e callbacks
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(callback_handler))

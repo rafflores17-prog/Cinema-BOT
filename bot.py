@@ -30,6 +30,8 @@ CANAL_VIP     = int(os.environ.get("CANAL_VIP", "0"))    # Canal VIP (streamflix
 ADMIN_CONTATO = os.environ.get("ADMIN_CONTATO", "@RaffDimitri")  # Contato para propagandas
 TOPIC_ID      = int(os.environ.get("TOPIC_ID", "0"))
 CANAL_SUPORTE = "https://t.me/streamflixofc"
+MP_TOKEN      = os.environ.get("MP_ACCESS_TOKEN", "")  # Mercado Pago Access Token
+BOT_PUBLIC_URL = os.environ.get("BOT_PUBLIC_URL", "")  # URL pública do bot no Koyeb
 DIAS_SEM_REPETIR = 21
 DIAS_PLANO       = 30
 
@@ -286,10 +288,124 @@ class AdminHandler(BaseHTTPRequestHandler):
                            "validade": r[3].strftime("%d/%m/%Y") if r[3] else ""} for r in rows]
                 self._json({"historico": result}); return
 
+
+            if cmd == "premios_lista":
+                c = db(); cur = c.cursor()
+                cur.execute("""SELECT id, tipo, nome, conteudo, valor, usado, data_exp, criado_em
+                    FROM premios ORDER BY tipo, usado, id DESC""")
+                rows = cur.fetchall(); cur.close(); c.close()
+                result = [{"id":r[0],"tipo":r[1],"nome":r[2],"conteudo":r[3],
+                           "valor":float(r[4]),"usado":bool(r[5]),"data_exp":r[6],
+                           "criado_em":r[7].strftime("%d/%m/%Y") if r[7] else ""} for r in rows]
+                # Contagem por tipo
+                from collections import Counter
+                disp = Counter(r["tipo"] for r in result if not r["usado"])
+                self._json({"premios": result, "disponiveis": dict(disp)}); return
+
+            if cmd.startswith("premio_add:"):
+                from urllib.parse import unquote
+                import json
+                raw = unquote(cmd[len("premio_add:"):])
+                data = json.loads(raw)
+                c = db(); cur = c.cursor()
+                cur.execute("INSERT INTO premios(tipo,nome,conteudo,valor,data_exp) VALUES(%s,%s,%s,%s,%s)",
+                    (data["tipo"], data["nome"], data["conteudo"], float(data["valor"]), data.get("data_exp")))
+                c.commit(); cur.close(); c.close()
+                self._json({"ok": True}); return
+
+            if cmd.startswith("premio_del:"):
+                pid = int(cmd.split(":")[1])
+                c = db(); cur = c.cursor()
+                cur.execute("DELETE FROM premios WHERE id=%s AND usado=FALSE", (pid,))
+                ok = cur.rowcount > 0
+                c.commit(); cur.close(); c.close()
+                self._json({"ok": ok}); return
+
+            if cmd == "resgates_lista":
+                c = db(); cur = c.cursor()
+                cur.execute("""SELECT r.user_id, p.tipo, p.nome, r.valor, r.criado_em
+                    FROM resgates r JOIN premios p ON r.premio_id=p.id
+                    ORDER BY r.criado_em DESC LIMIT 50""")
+                rows = cur.fetchall(); cur.close(); c.close()
+                result = [{"user_id":r[0],"tipo":r[1],"nome":r[2],"valor":float(r[3]),
+                           "criado_em":r[4].strftime("%d/%m/%Y %H:%M") if r[4] else ""} for r in rows]
+                self._json({"resgates": result}); return
+
+            if cmd == "creditos_lista":
+                c = db(); cur = c.cursor()
+                cur.execute("SELECT user_id, saldo, atualizado FROM creditos ORDER BY saldo DESC LIMIT 50")
+                rows = cur.fetchall(); cur.close(); c.close()
+                result = [{"user_id":r[0],"saldo":float(r[1]),
+                           "atualizado":r[2].strftime("%d/%m/%Y") if r[2] else ""} for r in rows]
+                self._json({"creditos": result}); return
+
+            if cmd.startswith("credito_add_manual:"):
+                parts = cmd.split(":")
+                uid, val = int(parts[1]), float(parts[2])
+                ok = add_saldo(uid, val)
+                self._json({"ok": ok, "saldo": get_saldo(uid)}); return
+
             self._json({"error": "Comando desconhecido."}, 400)
         except Exception as e:
             logging.error(f"AdminAPI: {e}")
             self._json({"error": str(e)}, 500)
+
+
+    def do_POST(self):
+        """Webhook do Mercado Pago."""
+        try:
+            parsed = urlparse(self.path)
+            if parsed.path == "/webhook/mp":
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                import json
+                data = json.loads(body)
+                if data.get("type") == "payment":
+                    payment_id = str(data.get("data", {}).get("id", ""))
+                    if payment_id:
+                        status = verificar_pagamento_mp(payment_id)
+                        if status == "approved":
+                            c = db(); cur = c.cursor()
+                            cur.execute("SELECT user_id, valor, status FROM pagamentos WHERE payment_id=%s", (payment_id,))
+                            row = cur.fetchone()
+                            if row and row[2] == "pending":
+                                user_id, valor = row[0], float(row[1])
+                                cur.execute("UPDATE pagamentos SET status='approved' WHERE payment_id=%s", (payment_id,))
+                                c.commit()
+                                add_saldo(user_id, valor)
+                                cur.close(); c.close()
+                                # Notifica o usuário
+                                import asyncio
+                                async def _notify():
+                                    from telegram import Bot
+                                    bot = Bot(token=TOKEN)
+                                    saldo = get_saldo(user_id)
+                                    await bot.send_message(
+                                        chat_id=user_id,
+                                        text=f"✅ <b>Pagamento confirmado!</b>\n\n"
+                                             f"💰 R$ {valor:.2f} adicionado ao seu saldo\n"
+                                             f"🏦 Saldo atual: <b>R$ {saldo:.2f}</b>\n\n"
+                                             f"Use /credito para resgatar seus prêmios!",
+                                        parse_mode="HTML"
+                                    )
+                                    # Avisa admin também
+                                    if ADMIN_ID:
+                                        await bot.send_message(
+                                            chat_id=ADMIN_ID,
+                                            text=f"💸 Pagamento recebido!\nUser: {user_id}\nValor: R$ {valor:.2f}",
+                                        )
+                                asyncio.run(_notify())
+                            else:
+                                if row: cur.close(); c.close()
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"OK")
+                return
+        except Exception as e:
+            logging.error(f"Webhook MP: {e}")
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
 
     def log_message(self, *a, **k): pass
 
@@ -356,6 +472,40 @@ def setup_db():
             sent_at   TIMESTAMP NOT NULL,
             PRIMARY KEY (chat_id, item_id, item_type)
         );""")
+
+        # Sistema de créditos
+        cur.execute("""CREATE TABLE IF NOT EXISTS creditos (
+            user_id    BIGINT PRIMARY KEY,
+            saldo      NUMERIC(10,2) DEFAULT 0,
+            atualizado TIMESTAMP DEFAULT NOW()
+        );""")
+        # Prêmios cadastrados pelo admin
+        cur.execute("""CREATE TABLE IF NOT EXISTS premios (
+            id         SERIAL PRIMARY KEY,
+            tipo       TEXT NOT NULL,
+            nome       TEXT NOT NULL,
+            conteudo   TEXT NOT NULL,
+            valor      NUMERIC(10,2) NOT NULL,
+            usado      BOOLEAN DEFAULT FALSE,
+            data_exp   TEXT DEFAULT NULL,
+            criado_em  TIMESTAMP DEFAULT NOW()
+        );""")
+        # Resgates realizados
+        cur.execute("""CREATE TABLE IF NOT EXISTS resgates (
+            id         SERIAL PRIMARY KEY,
+            user_id    BIGINT NOT NULL,
+            premio_id  INTEGER NOT NULL,
+            valor      NUMERIC(10,2) NOT NULL,
+            criado_em  TIMESTAMP DEFAULT NOW()
+        );""")
+        # Pagamentos PIX pendentes
+        cur.execute("""CREATE TABLE IF NOT EXISTS pagamentos (
+            payment_id TEXT PRIMARY KEY,
+            user_id    BIGINT NOT NULL,
+            valor      NUMERIC(10,2) NOT NULL,
+            status     TEXT DEFAULT 'pending',
+            criado_em  TIMESTAMP DEFAULT NOW()
+        );""")
         c.commit(); cur.close(); c.close()
         logging.info("✅ Banco pronto (v8 SaaS)")
     except Exception as e:
@@ -414,7 +564,296 @@ def deletar_propaganda(pid):
         return True
     except: return False
 
+
+# ── Handlers de Crédito ────────────────────────────────────────────────────
+async def cmd_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    saldo = get_saldo(user_id)
+    premios = get_premios_disponiveis()
+
+    # Tipos disponíveis
+    tipos = {}
+    for p in premios:
+        if p["tipo"] not in tipos:
+            tipos[p["tipo"]] = {"qtd": 0, "valor": p["valor"]}
+        tipos[p["tipo"]]["qtd"] += 1
+
+    texto = (
+        f"💰 <b>Seus Créditos StreamFlix</b>\n\n"
+        f"🏦 Saldo atual: <b>R$ {saldo:.2f}</b>\n\n"
+    )
+
+    if tipos:
+        texto += "🎁 <b>Prêmios disponíveis:</b>\n"
+        for tipo, info in tipos.items():
+            emoji = "📺" if tipo == "xtream" else "🎟️" if tipo == "vip" else "🎁"
+            texto += f"{emoji} {info['qtd']}x {tipo.upper()} — R$ {info['valor']:.2f} cada\n"
+        texto += "\nEscolha uma opção abaixo:"
+    else:
+        texto += "⚠️ Nenhum prêmio disponível no momento."
+
+    botoes = []
+    # Botões de recarga
+    botoes.append([
+        InlineKeyboardButton("💳 Adicionar R$2,00", callback_data="pix:2.00"),
+        InlineKeyboardButton("💳 Adicionar R$5,99", callback_data="pix:5.99"),
+    ])
+    botoes.append([
+        InlineKeyboardButton("💳 Adicionar R$10,00", callback_data="pix:10.00"),
+        InlineKeyboardButton("💳 Adicionar R$20,00", callback_data="pix:20.00"),
+    ])
+    # Botões de resgate
+    for tipo, info in tipos.items():
+        emoji = "📺" if tipo == "xtream" else "🎟️" if tipo == "vip" else "🎁"
+        botoes.append([InlineKeyboardButton(
+            f"{emoji} Resgatar {tipo.upper()} — R$ {info['valor']:.2f}",
+            callback_data=f"resgatar:{tipo}"
+        )])
+
+    await update.message.reply_text(texto, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(botoes))
+
+async def callback_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user_id = q.from_user.id
+    data = q.data
+
+    if data.startswith("pix:"):
+        valor = float(data.split(":")[1])
+        saldo_atual = get_saldo(user_id)
+        await q.edit_message_text(
+            f"⏳ Gerando PIX de R$ {valor:.2f}...",
+            parse_mode="HTML"
+        )
+        pix, erro = criar_pix_mp(user_id, valor, f"StreamFlix Créditos R${valor:.2f}")
+        if erro:
+            await q.edit_message_text(
+                f"❌ Erro ao gerar PIX: {erro}\n\nTente novamente mais tarde.",
+                parse_mode="HTML"
+            )
+            return
+        texto = (
+            f"💳 <b>PIX gerado!</b>\n\n"
+            f"💰 Valor: <b>R$ {valor:.2f}</b>\n"
+            f"⏰ Válido por 30 minutos\n\n"
+            f"<b>Código PIX (copia e cola):</b>\n"
+            f"<code>{pix['pix_code']}</code>\n\n"
+            f"✅ Após o pagamento seu saldo será atualizado automaticamente!"
+        )
+        botoes = [[InlineKeyboardButton("🔄 Verificar pagamento", callback_data=f"check:{pix['payment_id']}")]]
+        await q.edit_message_text(texto, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(botoes))
+
+    elif data.startswith("check:"):
+        payment_id = data.split(":", 1)[1]
+        status = verificar_pagamento_mp(payment_id)
+        if status == "approved":
+            await q.edit_message_text(
+                "✅ <b>Pagamento confirmado!</b>\nSeu saldo foi atualizado. Use /credito para resgatar.",
+                parse_mode="HTML"
+            )
+        elif status == "pending":
+            await q.answer("⏳ Aguardando confirmação do pagamento...", show_alert=True)
+        else:
+            await q.answer(f"Status: {status or 'não encontrado'}", show_alert=True)
+
+    elif data.startswith("resgatar:"):
+        tipo = data.split(":", 1)[1]
+        premios = get_premios_disponiveis(tipo)
+        if not premios:
+            await q.answer("⚠️ Nenhum prêmio disponível nessa categoria!", show_alert=True)
+            return
+        valor = premios[0]["valor"]
+        saldo = get_saldo(user_id)
+        if saldo < valor:
+            await q.answer(
+                f"💰 Saldo insuficiente! Você tem R$ {saldo:.2f} e precisa de R$ {valor:.2f}",
+                show_alert=True
+            )
+            return
+        # Confirmar resgate
+        botoes = [
+            [InlineKeyboardButton(f"✅ Confirmar — R$ {valor:.2f}", callback_data=f"confirmar:{tipo}")],
+            [InlineKeyboardButton("❌ Cancelar", callback_data="cancelar")]
+        ]
+        await q.edit_message_text(
+            f"🎁 <b>Confirmar resgate?</b>\n\n"
+            f"Tipo: <b>{tipo.upper()}</b>\n"
+            f"Valor: <b>R$ {valor:.2f}</b>\n"
+            f"Saldo atual: <b>R$ {saldo:.2f}</b>\n"
+            f"Saldo após: <b>R$ {saldo-valor:.2f}</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(botoes)
+        )
+
+    elif data.startswith("confirmar:"):
+        tipo = data.split(":", 1)[1]
+        premio = resgatar_premio(user_id, tipo)
+        if not premio:
+            await q.edit_message_text(
+                "❌ Saldo insuficiente ou prêmio indisponível. Use /credito para ver seu saldo.",
+                parse_mode="HTML"
+            )
+            return
+        # Monta mensagem do prêmio
+        if tipo == "xtream":
+            linhas = premio["conteudo"].split("|")
+            host = linhas[0] if len(linhas)>0 else "—"
+            login = linhas[1] if len(linhas)>1 else "—"
+            senha = linhas[2] if len(linhas)>2 else "—"
+            exp = premio.get("data_exp") or "—"
+            texto = (
+                f"🎉 <b>Prêmio resgatado com sucesso!</b>\n\n"
+                f"📺 <b>Conta Xtream</b>\n"
+                f"🌐 Host: <code>{host}</code>\n"
+                f"👤 Login: <code>{login}</code>\n"
+                f"🔑 Senha: <code>{senha}</code>\n"
+                f"📅 Expira: {exp}\n\n"
+                f"💰 R$ {premio['valor']:.2f} descontado do saldo."
+            )
+        elif tipo == "vip":
+            texto = (
+                f"🎉 <b>Prêmio resgatado com sucesso!</b>\n\n"
+                f"🎟️ <b>Código VIP App</b>\n"
+                f"<code>{premio['conteudo']}</code>\n\n"
+                f"💰 R$ {premio['valor']:.2f} descontado do saldo."
+            )
+        else:
+            texto = (
+                f"🎉 <b>Prêmio resgatado!</b>\n\n"
+                f"🎁 {premio['nome']}\n"
+                f"<code>{premio['conteudo']}</code>\n\n"
+                f"💰 R$ {premio['valor']:.2f} descontado do saldo."
+            )
+        # Avisa admin
+        if ADMIN_ID:
+            try:
+                from telegram import Bot
+                bot_notify = Bot(token=TOKEN)
+                import asyncio
+                async def _notify_admin():
+                    await bot_notify.send_message(
+                        chat_id=ADMIN_ID,
+                        text=f"🎁 Resgate realizado!\nUser: {user_id}\nTipo: {tipo}\nValor: R$ {premio['valor']:.2f}"
+                    )
+                asyncio.run(_notify_admin())
+            except: pass
+        await q.edit_message_text(texto, parse_mode="HTML")
+
+    elif data == "cancelar":
+        await q.edit_message_text("❌ Resgate cancelado.")
+
 # ── Funções de cliente ─────────────────────────────────────────────────────
+
+# ── Sistema de Créditos ────────────────────────────────────────────────────
+def get_saldo(user_id):
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("SELECT saldo FROM creditos WHERE user_id=%s", (user_id,))
+        r = cur.fetchone(); cur.close(); c.close()
+        return float(r[0]) if r else 0.0
+    except: return 0.0
+
+def add_saldo(user_id, valor):
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("""INSERT INTO creditos(user_id, saldo) VALUES(%s,%s)
+            ON CONFLICT(user_id) DO UPDATE SET saldo=creditos.saldo+%s, atualizado=NOW()""",
+            (user_id, valor, valor))
+        c.commit(); cur.close(); c.close()
+        return True
+    except: return False
+
+def sub_saldo(user_id, valor):
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("SELECT saldo FROM creditos WHERE user_id=%s", (user_id,))
+        r = cur.fetchone()
+        if not r or float(r[0]) < valor:
+            cur.close(); c.close(); return False
+        cur.execute("UPDATE creditos SET saldo=saldo-%s, atualizado=NOW() WHERE user_id=%s", (valor, user_id))
+        c.commit(); cur.close(); c.close()
+        return True
+    except: return False
+
+def get_premios_disponiveis(tipo=None):
+    try:
+        c = db(); cur = c.cursor()
+        if tipo:
+            cur.execute("SELECT id, tipo, nome, conteudo, valor, data_exp FROM premios WHERE usado=FALSE AND tipo=%s ORDER BY id", (tipo,))
+        else:
+            cur.execute("SELECT id, tipo, nome, conteudo, valor, data_exp FROM premios WHERE usado=FALSE ORDER BY tipo, id")
+        rows = cur.fetchall(); cur.close(); c.close()
+        return [{"id":r[0],"tipo":r[1],"nome":r[2],"conteudo":r[3],"valor":float(r[4]),"data_exp":r[5]} for r in rows]
+    except: return []
+
+def resgatar_premio(user_id, tipo):
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("SELECT id, nome, conteudo, valor, data_exp FROM premios WHERE usado=FALSE AND tipo=%s ORDER BY id LIMIT 1 FOR UPDATE", (tipo,))
+        r = cur.fetchone()
+        if not r:
+            cur.close(); c.close(); return None
+        pid, nome, conteudo, valor, data_exp = r
+        # Desconta saldo
+        cur.execute("SELECT saldo FROM creditos WHERE user_id=%s", (user_id,))
+        sr = cur.fetchone()
+        if not sr or float(sr[0]) < float(valor):
+            cur.close(); c.close(); return None
+        cur.execute("UPDATE creditos SET saldo=saldo-%s WHERE user_id=%s", (valor, user_id))
+        cur.execute("UPDATE premios SET usado=TRUE WHERE id=%s", (pid,))
+        cur.execute("INSERT INTO resgates(user_id,premio_id,valor) VALUES(%s,%s,%s)", (user_id, pid, valor))
+        c.commit(); cur.close(); c.close()
+        return {"nome":nome,"conteudo":conteudo,"valor":float(valor),"data_exp":data_exp}
+    except Exception as e:
+        logging.error(f"resgatar_premio: {e}"); return None
+
+def criar_pix_mp(user_id, valor, descricao):
+    """Cria cobrança PIX via Mercado Pago e retorna o pix_copy_paste."""
+    if not MP_TOKEN:
+        return None, "MP_ACCESS_TOKEN não configurado"
+    try:
+        import uuid
+        idempotency = str(uuid.uuid4())
+        payload = {
+            "transaction_amount": float(valor),
+            "description": descricao,
+            "payment_method_id": "pix",
+            "payer": {"email": f"user{user_id}@streamflix.bot"},
+            "notification_url": f"{BOT_PUBLIC_URL}/webhook/mp" if BOT_PUBLIC_URL else None
+        }
+        if not payload["notification_url"]:
+            del payload["notification_url"]
+        headers = {
+            "Authorization": f"Bearer {MP_TOKEN}",
+            "Content-Type": "application/json",
+            "X-Idempotency-Key": idempotency
+        }
+        r = requests.post("https://api.mercadopago.com/v1/payments", json=payload, headers=headers, timeout=15)
+        data = r.json()
+        if r.status_code not in (200, 201):
+            return None, data.get("message","Erro MP")
+        payment_id = str(data["id"])
+        pix_code = data.get("point_of_interaction",{}).get("transaction_data",{}).get("qr_code","")
+        # Salva no banco
+        c = db(); cur = c.cursor()
+        cur.execute("INSERT INTO pagamentos(payment_id,user_id,valor) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING",
+            (payment_id, user_id, valor))
+        c.commit(); cur.close(); c.close()
+        return {"payment_id": payment_id, "pix_code": pix_code, "valor": valor}, None
+    except Exception as e:
+        return None, str(e)
+
+def verificar_pagamento_mp(payment_id):
+    """Verifica status de um pagamento no MP."""
+    if not MP_TOKEN: return None
+    try:
+        r = requests.get(f"https://api.mercadopago.com/v1/payments/{payment_id}",
+            headers={"Authorization": f"Bearer {MP_TOKEN}"}, timeout=10)
+        return r.json().get("status")
+    except: return None
+
 def set_nome_canal(chat_id, nome):
     try:
         c = db(); cur = c.cursor()
@@ -1292,6 +1731,9 @@ def main():
     app.add_handler(CommandHandler("stats",    cmd_stats))
     app.add_handler(CommandHandler("config",   cmd_config))
 
+    # Créditos
+    app.add_handler(CommandHandler("credito", cmd_credito))
+    app.add_handler(CallbackQueryHandler(callback_credito, pattern="^(pix:|check:|resgatar:|confirmar:|cancelar)"))
     # Texto e callbacks
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(callback_handler))

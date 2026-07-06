@@ -1209,22 +1209,29 @@ async def send_item(context, chat_id, item, is_tv=False, tipo="movie"):
     caption = build_caption(details, is_tv=is_tv)
     modo     = get_modo(chat_id)
     site     = get_site_url(chat_id)
-    # modo 'completo': botão site personalizado; modo 'simples': só assistir
+    url_trl = get_trailer_url(iid, title, is_tv=is_tv)
+    tem_trailer = "youtu.be/" in url_trl or "youtube.com/watch" in url_trl
+
+    # modo 'simples': só assistir
+    # modo 'completo': assistir + trailer/site lado a lado
     if modo == "simples":
         keyboard = [
             [InlineKeyboardButton("▶️ ASSISTIR AGORA", url=link_streamflix(iid, is_tv=is_tv))]
         ]
     else:
+        row2 = []
+        if tem_trailer:
+            row2.append(InlineKeyboardButton("🎬 Ver Trailer", url=url_trl))
+        row2.append(InlineKeyboardButton("🌐 Visite o Site", url=site))
         keyboard = [
-            [InlineKeyboardButton("▶️ ASSISTIR AGORA",    url=link_streamflix(iid, is_tv=is_tv))],
-            [InlineKeyboardButton("🌐 Visite nosso Site", url=site)]
+            [InlineKeyboardButton("▶️ ASSISTIR AGORA", url=link_streamflix(iid, is_tv=is_tv))],
+            row2
         ]
     post = details.get("poster_path") or item.get("poster_path")
     try:
         if post: await enviar(context, chat_id, photo=f"{IMG_BASE}{post}", caption=caption, markup=InlineKeyboardMarkup(keyboard))
         else:    await enviar(context, chat_id, text=caption, markup=InlineKeyboardMarkup(keyboard))
-        url_trl = get_trailer_url(iid, title, is_tv=is_tv)
-        if "youtu.be/" in url_trl or "youtube.com/watch" in url_trl:
+        if tem_trailer:
             trl_kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton("▶️ Ver Trailer no YouTube", url=url_trl)
             ]])

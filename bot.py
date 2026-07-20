@@ -1891,7 +1891,7 @@ def main():
 
     # Créditos
     app.add_handler(CommandHandler("credito", cmd_credito))
-    app.add_handler(CallbackQueryHandler(callback_credito, pattern="^(pix:|check:|resgatar:|confirmar:|cancelar|voltar_credito)"))
+    app.add_handler(CallbackQueryHandler(callback_credito, pattern="^(pix:|pix_custom|check:|resgatar:|confirmar:|cancelar|voltar_credito)"))
     # Texto e callbacks
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(callback_handler))

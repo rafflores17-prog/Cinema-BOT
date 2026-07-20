@@ -47,6 +47,13 @@ EPOCAS = {
     "🎸 Anos 80":(1980,1989), "💾 Anos 90":(1990,1999),
     "💿 Anos 2000":(2000,2010), "🆕 Recentes":(2020,2026)
 }
+# Nomes amigáveis dos tipos de prêmio — constante do módulo, usada em
+# cmd_credito, callback_credito e voltar_credito (bug anterior: estava
+# definida só localmente em cmd_credito e quebrava com NameError nas outras)
+NOMES_TIPO = {
+    "xtream": "Conta Xtream IPTV",
+    "vip": "Código VIP StreamFlix",
+}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -585,11 +592,6 @@ async def cmd_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
     saldo = get_saldo(user_id)
     premios = get_premios_disponiveis()
 
-    # Tipos disponíveis
-    NOMES_TIPO = {
-        "xtream": "Conta Xtream IPTV",
-        "vip": "Código VIP StreamFlix",
-    }
     # Agrupa por (tipo, valor) — evita misturar planos diferentes (ex: 3 VIPs
     # com preços distintos) sob a mesma chave "tipo"
     tipos = {}
@@ -766,14 +768,12 @@ async def callback_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 from telegram import Bot
                 bot_notify = Bot(token=TOKEN)
-                import asyncio
-                async def _notify_admin():
-                    await bot_notify.send_message(
-                        chat_id=ADMIN_ID,
-                        text=f"🎁 Resgate realizado!\nUser: {user_id}\nTipo: {tipo}\nValor: R$ {premio['valor']:.2f}"
-                    )
-                asyncio.run(_notify_admin())
-            except: pass
+                await bot_notify.send_message(
+                    chat_id=ADMIN_ID,
+                    text=f"🎁 Resgate realizado!\nUser: {user_id}\nTipo: {tipo}\nValor: R$ {premio['valor']:.2f}"
+                )
+            except Exception as e:
+                logging.error(f"Falha ao notificar admin sobre resgate: {e}")
         await q.edit_message_text(texto, parse_mode="HTML")
 
     elif data == "cancelar":
@@ -790,7 +790,6 @@ async def callback_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if chave2 not in tipos2:
                 tipos2[chave2] = {"qtd": 0, "valor": p["valor"]}
             tipos2[chave2]["qtd"] += 1
-        NOMES_TIPO2 = {"xtream": "Conta Xtream IPTV", "vip": "Código VIP StreamFlix"}
         texto2 = f"💰 <b>Seus Créditos StreamFlix</b>\n\n🏦 Saldo atual: <b>R$ {saldo2:.2f}</b>\n\n"
         botoes2 = []
         botoes2.append([
@@ -804,7 +803,7 @@ async def callback_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for (tipo2, valor2), info2 in tipos2.items():
             emoji2 = "📺" if tipo2 == "xtream" else "🎟️" if tipo2 == "vip" else "🎁"
             botoes2.append([InlineKeyboardButton(
-                f"{emoji2} {NOMES_TIPO2.get(tipo2, tipo2.upper())} — R$ {info2['valor']:.2f}",
+                f"{emoji2} {NOMES_TIPO.get(tipo2, tipo2.upper())} — R$ {info2['valor']:.2f}",
                 callback_data=f"resgatar:{tipo2}:{valor2:.2f}"
             )])
         await q.edit_message_text(texto2, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(botoes2))
@@ -1063,6 +1062,8 @@ def set_site_url(chat_id, url):
         logging.error(e); return False
 
 
+def clientes_para_avisar():
+    """Clientes ativos cuja validade vence em até 3 dias e ainda não foram avisados."""
     try:
         c = db(); cur = c.cursor()
         limite = datetime.utcnow() + timedelta(days=3)

@@ -604,12 +604,14 @@ async def cmd_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
     premios = get_premios_disponiveis()
 
     # Agrupa por (tipo, valor) — evita misturar planos diferentes (ex: 3 VIPs
-    # com preços distintos) sob a mesma chave "tipo"
+    # com preços distintos) sob a mesma chave "tipo". Guarda também o "nome"
+    # cadastrado no painel (ex: "StreamFlixVip App — 30 dias") para exibir
+    # a descrição real em vez de um rótulo genérico.
     tipos = {}
     for p in premios:
         chave = (p["tipo"], p["valor"])
         if chave not in tipos:
-            tipos[chave] = {"qtd": 0, "valor": p["valor"], "tipo": p["tipo"]}
+            tipos[chave] = {"qtd": 0, "valor": p["valor"], "tipo": p["tipo"], "nome": p["nome"]}
         tipos[chave]["qtd"] += 1
 
     texto = (
@@ -621,32 +623,64 @@ async def cmd_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
         texto += "🎁 <b>Prêmios disponíveis:</b>\n"
         for (tipo, valor), info in tipos.items():
             emoji = "📺" if tipo == "xtream" else "🎟️" if tipo == "vip" else "🎁"
-            nome_tipo = NOMES_TIPO.get(tipo, tipo.upper())
-            texto += f"{emoji} {info['qtd']}x {nome_tipo} — R$ {info['valor']:.2f} cada\n"
+            texto += f"{emoji} {info['qtd']}x {info['nome']} — R$ {info['valor']:.2f} cada\n"
         texto += "\nEscolha uma opção abaixo:"
     else:
         texto += "⚠️ Nenhum prêmio disponível no momento."
 
     botoes = []
-    # Botões de recarga
-    botoes.append([
-        InlineKeyboardButton("💳 Adicionar R$2,00", callback_data="pix:2.00"),
-        InlineKeyboardButton("💳 Adicionar R$5,99", callback_data="pix:5.99"),
-    ])
-    botoes.append([
-        InlineKeyboardButton("💳 Adicionar R$10,00", callback_data="pix:10.00"),
-        InlineKeyboardButton("💳 Adicionar R$20,00", callback_data="pix:20.00"),
-    ])
+    # Botão de recarga livre — cliente escolhe o valor que quiser
+    botoes.append([InlineKeyboardButton("💳 Depositar valor personalizado", callback_data="pix_custom")])
+    # Atalhos de recarga calculados a partir dos preços reais dos prêmios
+    # cadastrados (não mais valores fixos) — assim eles sempre "fecham
+    # redondo" com o que o cliente pode querer resgatar.
+    valores_premios = sorted({info["valor"] for info in tipos.values()})
+    atalhos = valores_premios[:4] if valores_premios else [10.00, 20.00]
+    linha = []
+    for v in atalhos:
+        linha.append(InlineKeyboardButton(f"💳 R$ {v:.2f}", callback_data=f"pix:{v:.2f}"))
+        if len(linha) == 2:
+            botoes.append(linha); linha = []
+    if linha: botoes.append(linha)
     # Botões de resgate (tipo + valor, para não misturar planos com preços diferentes)
     for (tipo, valor), info in tipos.items():
         emoji = "📺" if tipo == "xtream" else "🎟️" if tipo == "vip" else "🎁"
         botoes.append([InlineKeyboardButton(
-            f"{emoji} {NOMES_TIPO.get(tipo, tipo.upper())} — R$ {info['valor']:.2f}",  # botão resgate
+            f"{emoji} {info['nome']} — R$ {info['valor']:.2f}",  # botão resgate
             callback_data=f"resgatar:{tipo}:{valor:.2f}"
         )])
 
     await update.message.reply_text(texto, parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(botoes))
+
+async def _gerar_e_enviar_pix(context, chat_id, user_id, valor, q=None):
+    """Gera o PIX e envia/edita a mensagem com o código. Reutilizada pelos
+    botões de valor fixo e pelo fluxo de valor digitado livremente."""
+    texto_gerando = f"⏳ Gerando PIX de R$ {valor:.2f}..."
+    if q:
+        await q.edit_message_text(texto_gerando, parse_mode="HTML")
+    else:
+        await context.bot.send_message(chat_id, texto_gerando, parse_mode="HTML")
+
+    pix, erro = criar_pix_mp(user_id, valor, f"StreamFlix Créditos R${valor:.2f}")
+    if erro:
+        msg_erro = f"❌ Erro ao gerar PIX: {erro}\n\nTente novamente mais tarde."
+        if q: await q.edit_message_text(msg_erro, parse_mode="HTML")
+        else: await context.bot.send_message(chat_id, msg_erro, parse_mode="HTML")
+        return
+    texto = (
+        f"💳 <b>PIX gerado!</b>\n\n"
+        f"💰 Valor: <b>R$ {valor:.2f}</b>\n"
+        f"⏰ Válido por 30 minutos\n\n"
+        f"<b>Código PIX (copia e cola):</b>\n"
+        f"<code>{pix['pix_code']}</code>\n\n"
+        f"✅ Após o pagamento seu saldo será atualizado automaticamente!"
+    )
+    botoes = [[InlineKeyboardButton("🔄 Verificar pagamento", callback_data=f"check:{pix['payment_id']}")]]
+    if q:
+        await q.edit_message_text(texto, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(botoes))
+    else:
+        await context.bot.send_message(chat_id, texto, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(botoes))
 
 async def callback_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -654,31 +688,19 @@ async def callback_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = q.from_user.id
     data = q.data
 
-    if data.startswith("pix:"):
-        valor = float(data.split(":")[1])
-        saldo_atual = get_saldo(user_id)
+    if data == "pix_custom":
+        context.user_data["aguardando_valor_pix"] = True
         await q.edit_message_text(
-            f"⏳ Gerando PIX de R$ {valor:.2f}...",
+            "💳 <b>Depósito personalizado</b>\n\n"
+            "Digite o valor que deseja depositar (ex: <code>47</code> ou <code>47,50</code>).\n"
+            "Valor mínimo: R$ 2,00.",
             parse_mode="HTML"
         )
-        pix, erro = criar_pix_mp(user_id, valor, f"StreamFlix Créditos R${valor:.2f}")
-        if erro:
-            await q.edit_message_text(
-                f"❌ Erro ao gerar PIX: {erro}\n\nTente novamente mais tarde.",
-                parse_mode="HTML"
-            )
-            return
-        texto = (
-            f"💳 <b>PIX gerado!</b>\n\n"
-            f"💰 Valor: <b>R$ {valor:.2f}</b>\n"
-            f"⏰ Válido por 30 minutos\n\n"
-            f"<b>Código PIX (copia e cola):</b>\n"
-            f"<code>{pix['pix_code']}</code>\n\n"
-            f"✅ Após o pagamento seu saldo será atualizado automaticamente!"
-        )
-        botoes = [[InlineKeyboardButton("🔄 Verificar pagamento", callback_data=f"check:{pix['payment_id']}")]]
-        await q.edit_message_text(texto, parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(botoes))
+        return
+
+    if data.startswith("pix:"):
+        valor = float(data.split(":")[1])
+        await _gerar_e_enviar_pix(context, q.message.chat_id, user_id, valor, q=q)
 
     elif data.startswith("check:"):
         payment_id = data.split(":", 1)[1]
@@ -799,22 +821,23 @@ async def callback_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for p in premios2:
             chave2 = (p["tipo"], p["valor"])
             if chave2 not in tipos2:
-                tipos2[chave2] = {"qtd": 0, "valor": p["valor"]}
+                tipos2[chave2] = {"qtd": 0, "valor": p["valor"], "nome": p["nome"]}
             tipos2[chave2]["qtd"] += 1
         texto2 = f"💰 <b>Seus Créditos StreamFlix</b>\n\n🏦 Saldo atual: <b>R$ {saldo2:.2f}</b>\n\n"
         botoes2 = []
-        botoes2.append([
-            InlineKeyboardButton("💳 Adicionar R$2,00", callback_data="pix:2.00"),
-            InlineKeyboardButton("💳 Adicionar R$5,99", callback_data="pix:5.99"),
-        ])
-        botoes2.append([
-            InlineKeyboardButton("💳 Adicionar R$10,00", callback_data="pix:10.00"),
-            InlineKeyboardButton("💳 Adicionar R$20,00", callback_data="pix:20.00"),
-        ])
+        botoes2.append([InlineKeyboardButton("💳 Depositar valor personalizado", callback_data="pix_custom")])
+        valores_premios2 = sorted({info2["valor"] for info2 in tipos2.values()})
+        atalhos2 = valores_premios2[:4] if valores_premios2 else [10.00, 20.00]
+        linha2 = []
+        for v2 in atalhos2:
+            linha2.append(InlineKeyboardButton(f"💳 R$ {v2:.2f}", callback_data=f"pix:{v2:.2f}"))
+            if len(linha2) == 2:
+                botoes2.append(linha2); linha2 = []
+        if linha2: botoes2.append(linha2)
         for (tipo2, valor2), info2 in tipos2.items():
             emoji2 = "📺" if tipo2 == "xtream" else "🎟️" if tipo2 == "vip" else "🎁"
             botoes2.append([InlineKeyboardButton(
-                f"{emoji2} {NOMES_TIPO.get(tipo2, tipo2.upper())} — R$ {info2['valor']:.2f}",
+                f"{emoji2} {info2['nome']} — R$ {info2['valor']:.2f}",
                 callback_data=f"resgatar:{tipo2}:{valor2:.2f}"
             )])
         await q.edit_message_text(texto2, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(botoes2))
@@ -1667,6 +1690,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await verificar_acesso(update, context): return
     cid  = update.effective_chat.id
     text = update.message.text
+
+    # Captura o valor de depósito personalizado, se estivermos esperando
+    if context.user_data.get("aguardando_valor_pix"):
+        context.user_data["aguardando_valor_pix"] = False
+        texto_valor = text.strip().replace("R$", "").replace(" ", "").replace(",", ".")
+        try:
+            valor = float(texto_valor)
+        except ValueError:
+            await enviar(context, cid, text=(
+                "⚠️ Valor inválido. Use apenas números, ex: <code>47</code> ou <code>47,50</code>.\n"
+                "Use /credito para tentar de novo."
+            ))
+            return
+        if valor < 2.00:
+            await enviar(context, cid, text=(
+                "⚠️ O valor mínimo para depósito é <b>R$ 2,00</b>.\n"
+                "Use /credito para tentar de novo."
+            ))
+            return
+        user_id = update.effective_user.id
+        await _gerar_e_enviar_pix(context, cid, user_id, valor)
+        return
 
     if text == "🎥 Em Cartaz":
         d = tmdb("movie/now_playing", {"region":"BR"})

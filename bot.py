@@ -576,11 +576,14 @@ async def cmd_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "xtream": "Conta Xtream IPTV",
         "vip": "Código VIP StreamFlix",
     }
+    # Agrupa por (tipo, valor) — evita misturar planos diferentes (ex: 3 VIPs
+    # com preços distintos) sob a mesma chave "tipo"
     tipos = {}
     for p in premios:
-        if p["tipo"] not in tipos:
-            tipos[p["tipo"]] = {"qtd": 0, "valor": p["valor"]}
-        tipos[p["tipo"]]["qtd"] += 1
+        chave = (p["tipo"], p["valor"])
+        if chave not in tipos:
+            tipos[chave] = {"qtd": 0, "valor": p["valor"], "tipo": p["tipo"]}
+        tipos[chave]["qtd"] += 1
 
     texto = (
         f"💰 <b>Seus Créditos StreamFlix</b>\n\n"
@@ -589,7 +592,7 @@ async def cmd_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if tipos:
         texto += "🎁 <b>Prêmios disponíveis:</b>\n"
-        for tipo, info in tipos.items():
+        for (tipo, valor), info in tipos.items():
             emoji = "📺" if tipo == "xtream" else "🎟️" if tipo == "vip" else "🎁"
             nome_tipo = NOMES_TIPO.get(tipo, tipo.upper())
             texto += f"{emoji} {info['qtd']}x {nome_tipo} — R$ {info['valor']:.2f} cada\n"
@@ -607,12 +610,12 @@ async def cmd_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("💳 Adicionar R$10,00", callback_data="pix:10.00"),
         InlineKeyboardButton("💳 Adicionar R$20,00", callback_data="pix:20.00"),
     ])
-    # Botões de resgate
-    for tipo, info in tipos.items():
+    # Botões de resgate (tipo + valor, para não misturar planos com preços diferentes)
+    for (tipo, valor), info in tipos.items():
         emoji = "📺" if tipo == "xtream" else "🎟️" if tipo == "vip" else "🎁"
         botoes.append([InlineKeyboardButton(
             f"{emoji} {NOMES_TIPO.get(tipo, tipo.upper())} — R$ {info['valor']:.2f}",  # botão resgate
-            callback_data=f"resgatar:{tipo}"
+            callback_data=f"resgatar:{tipo}:{valor:.2f}"
         )])
 
     await update.message.reply_text(texto, parse_mode="HTML",
@@ -664,8 +667,12 @@ async def callback_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer(f"Status: {status or 'não encontrado'}", show_alert=True)
 
     elif data.startswith("resgatar:"):
-        tipo = data.split(":", 1)[1]
+        partes = data.split(":")
+        tipo = partes[1]
+        valor_filtro = float(partes[2]) if len(partes) > 2 else None
         premios = get_premios_disponiveis(tipo)
+        if valor_filtro is not None:
+            premios = [p for p in premios if abs(p["valor"] - valor_filtro) < 0.001]
         if not premios:
             await q.answer("⚠️ Nenhum prêmio disponível nessa categoria!", show_alert=True)
             return
@@ -686,7 +693,7 @@ async def callback_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         # Confirmar resgate
         botoes = [
-            [InlineKeyboardButton(f"✅ Confirmar — R$ {valor:.2f}", callback_data=f"confirmar:{tipo}")],
+            [InlineKeyboardButton(f"✅ Confirmar — R$ {valor:.2f}", callback_data=f"confirmar:{tipo}:{valor:.2f}")],
             [InlineKeyboardButton("❌ Cancelar", callback_data="cancelar")]
         ]
         await q.edit_message_text(
@@ -700,8 +707,10 @@ async def callback_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data.startswith("confirmar:"):
-        tipo = data.split(":", 1)[1]
-        premio = resgatar_premio(user_id, tipo)
+        partes = data.split(":")
+        tipo = partes[1]
+        valor_filtro = float(partes[2]) if len(partes) > 2 else None
+        premio = resgatar_premio(user_id, tipo, valor_filtro)
         if not premio:
             await q.edit_message_text(
                 "❌ Saldo insuficiente ou prêmio indisponível. Use /credito para ver seu saldo.",
@@ -763,9 +772,10 @@ async def callback_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
         premios2 = get_premios_disponiveis()
         tipos2 = {}
         for p in premios2:
-            if p["tipo"] not in tipos2:
-                tipos2[p["tipo"]] = {"qtd": 0, "valor": p["valor"]}
-            tipos2[p["tipo"]]["qtd"] += 1
+            chave2 = (p["tipo"], p["valor"])
+            if chave2 not in tipos2:
+                tipos2[chave2] = {"qtd": 0, "valor": p["valor"]}
+            tipos2[chave2]["qtd"] += 1
         NOMES_TIPO2 = {"xtream": "Conta Xtream IPTV", "vip": "Código VIP StreamFlix"}
         texto2 = f"💰 <b>Seus Créditos StreamFlix</b>\n\n🏦 Saldo atual: <b>R$ {saldo2:.2f}</b>\n\n"
         botoes2 = []
@@ -777,11 +787,11 @@ async def callback_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("💳 Adicionar R$10,00", callback_data="pix:10.00"),
             InlineKeyboardButton("💳 Adicionar R$20,00", callback_data="pix:20.00"),
         ])
-        for tipo2, info2 in tipos2.items():
+        for (tipo2, valor2), info2 in tipos2.items():
             emoji2 = "📺" if tipo2 == "xtream" else "🎟️" if tipo2 == "vip" else "🎁"
             botoes2.append([InlineKeyboardButton(
                 f"{emoji2} {NOMES_TIPO2.get(tipo2, tipo2.upper())} — R$ {info2['valor']:.2f}",
-                callback_data=f"resgatar:{tipo2}"
+                callback_data=f"resgatar:{tipo2}:{valor2:.2f}"
             )])
         await q.edit_message_text(texto2, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(botoes2))
 
@@ -829,10 +839,19 @@ def get_premios_disponiveis(tipo=None):
         return [{"id":r[0],"tipo":r[1],"nome":r[2],"conteudo":r[3],"valor":float(r[4]),"data_exp":r[5]} for r in rows]
     except: return []
 
-def resgatar_premio(user_id, tipo):
+def resgatar_premio(user_id, tipo, valor_filtro=None):
     try:
         c = db(); cur = c.cursor()
-        cur.execute("SELECT id, nome, conteudo, valor, data_exp FROM premios WHERE usado=FALSE AND tipo=%s ORDER BY id LIMIT 1 FOR UPDATE", (tipo,))
+        if valor_filtro is not None:
+            # Filtra também por valor para não misturar planos com preços
+            # diferentes dentro do mesmo "tipo" (ex: VIP 19,90 / 49,90 / 99,90)
+            cur.execute(
+                "SELECT id, nome, conteudo, valor, data_exp FROM premios "
+                "WHERE usado=FALSE AND tipo=%s AND ABS(valor-%s)<0.001 ORDER BY id LIMIT 1 FOR UPDATE",
+                (tipo, valor_filtro)
+            )
+        else:
+            cur.execute("SELECT id, nome, conteudo, valor, data_exp FROM premios WHERE usado=FALSE AND tipo=%s ORDER BY id LIMIT 1 FOR UPDATE", (tipo,))
         r = cur.fetchone()
         if not r:
             cur.close(); c.close(); return None

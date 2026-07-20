@@ -431,7 +431,18 @@ class AdminHandler(BaseHTTPRequestHandler):
     def log_message(self, *a, **k): pass
 
 def start_health():
-    HTTPServer(("0.0.0.0", int(os.environ.get("PORT","8000"))), AdminHandler).serve_forever()
+    porta = int(os.environ.get("PORT", "8000"))
+    # Durante rolling deploy do Koyeb, a instância antiga pode ainda estar
+    # de saída e segurando a porta por alguns segundos — tenta algumas
+    # vezes com espera curta em vez de morrer direto com OSError.
+    for tentativa in range(10):
+        try:
+            HTTPServer(("0.0.0.0", porta), AdminHandler).serve_forever()
+            return
+        except OSError as e:
+            logging.warning(f"start_health: porta {porta} ocupada ({e}), tentando de novo em 3s...")
+            time.sleep(3)
+    logging.error("start_health: não conseguiu abrir a porta após várias tentativas.")
 
 
 # ── Banco ──────────────────────────────────────────────────────────────────
@@ -1850,11 +1861,29 @@ def main():
         jq.run_daily(job_propaganda, time=datetime.strptime("18:00","%H:%M").time())  # 15h BRT
         jq.run_daily(job_propaganda, time=datetime.strptime("22:00","%H:%M").time())  # 19h BRT
 
+    # Handler de erro global: evita que um Conflict (comum durante rolling
+    # deploy do Koyeb — duas instâncias tentando getUpdates por alguns
+    # segundos) derrube a Application inteira. O PTB já tenta de novo
+    # sozinho; só precisamos não deixar a exceção subir e matar o loop.
+    async def _on_error(update, context):
+        err = context.error
+        from telegram.error import Conflict
+        if isinstance(err, Conflict):
+            logging.warning("Conflict (getUpdates) — provavelmente rolling deploy trocando instância, ignorando.")
+            return
+        logging.error(f"Erro não tratado: {err}")
+    app.add_error_handler(_on_error)
+
     logging.info(f"✅ Bot v8.0 SaaS Online — {SITE_URL}")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     while True:
-        try: main()
+        try:
+            main()
         except Exception as e:
-            logging.error(f"💥 Reiniciando: {e}"); time.sleep(10)
+            # Espera mais tempo antes de tentar de novo — dá tempo da
+            # instância antiga (rolling deploy do Koyeb) sair de vez e
+            # liberar o getUpdates, em vez de entrar em loop de conflito.
+            logging.error(f"💥 Reiniciando em 30s: {e}")
+            time.sleep(30)

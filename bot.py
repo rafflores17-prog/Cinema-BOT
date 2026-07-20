@@ -199,6 +199,20 @@ class AdminHandler(BaseHTTPRequestHandler):
             if cmd.startswith("cliente_del:"):
                 cid = int(cmd.split(":")[1])
                 c = db(); cur = c.cursor()
+                # Mesma proteção usada em token_del/premio_del: não deixa
+                # apagar de forma "muda" um cliente que ainda está ativo e
+                # com validade em dia — evita clique duplo/acidental apagar
+                # um cliente pagante sem querer.
+                cur.execute("SELECT ativo, validade FROM clientes WHERE chat_id=%s", (cid,))
+                row = cur.fetchone()
+                if not row:
+                    cur.close(); c.close()
+                    self._json({"ok": False, "error": "Cliente não encontrado"}); return
+                ativo, validade = row
+                ainda_vigente = bool(ativo) and validade is not None and validade > datetime.utcnow()
+                if ainda_vigente and "force=1" not in cmd:
+                    cur.close(); c.close()
+                    self._json({"ok": False, "error": "Cliente ainda ativo/vigente. Revogue antes ou confirme exclusão forçada."}); return
                 cur.execute("DELETE FROM clientes WHERE chat_id=%s", (cid,))
                 c.commit(); cur.close(); c.close()
                 self._json({"ok": True}); return

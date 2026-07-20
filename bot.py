@@ -22,7 +22,7 @@ from telegram.ext import (Application, CommandHandler, MessageHandler,
 TOKEN         = os.environ.get("TOKEN",        os.environ.get("BOT_TOKEN", ""))
 TMDB_KEY      = os.environ.get("TMDB_API_KEY", "")
 DATABASE_URL  = os.environ.get("DATABASE_URL", "")
-SITE_URL      = os.environ.get("SITE_URL",     "www.streamflixvip.online")
+SITE_URL      = os.environ.get("SITE_URL",     "https://streamflixvip.online/downloads/app-latest.apk")
 APP_URL       = os.environ.get("APP_URL",      "www.streamflixvip.online")
 ADMIN_ID      = int(os.environ.get("ADMIN_ID", "0"))   # Seu user_id do Telegram (não chat_id do canal)
 GRUPO_ID      = int(os.environ.get("GRUPO_ID", "0"))   # Seu canal principal (streamflixofc)
@@ -1290,7 +1290,7 @@ async def send_item(context, chat_id, item, is_tv=False, tipo="movie"):
         row2 = []
         if tem_trailer:
             row2.append(InlineKeyboardButton("🎬 Ver Trailer", url=url_trl))
-        row2.append(InlineKeyboardButton("🌐 Visite o Site", url=site))
+        row2.append(InlineKeyboardButton("⬇️ DOWNLOAD APP", url=site))
         keyboard = [
             [InlineKeyboardButton("▶️ ASSISTIR AGORA", url=link_streamflix(iid, is_tv=is_tv))],
             row2

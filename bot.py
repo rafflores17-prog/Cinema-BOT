@@ -23,7 +23,7 @@ TOKEN         = os.environ.get("TOKEN",        os.environ.get("BOT_TOKEN", ""))
 TMDB_KEY      = os.environ.get("TMDB_API_KEY", "")
 DATABASE_URL  = os.environ.get("DATABASE_URL", "")
 SITE_URL      = os.environ.get("SITE_URL",     "www.streamflixvip.online")
-APP_URL       = os.environ.get("APP_URL",      "https://streamflixvip.online/downloads/app-latest.apk")
+APP_URL       = os.environ.get("APP_URL",      "www.streamflixvip.online")
 ADMIN_ID      = int(os.environ.get("ADMIN_ID", "0"))   # Seu user_id do Telegram (não chat_id do canal)
 GRUPO_ID      = int(os.environ.get("GRUPO_ID", "0"))   # Seu canal principal (streamflixofc)
 CANAL_VIP     = int(os.environ.get("CANAL_VIP", "0"))    # Canal VIP (streamflixvip)
@@ -46,13 +46,6 @@ GENEROS = {
 EPOCAS = {
     "🎸 Anos 80":(1980,1989), "💾 Anos 90":(1990,1999),
     "💿 Anos 2000":(2000,2010), "🆕 Recentes":(2020,2026)
-}
-# Nomes amigáveis dos tipos de prêmio — constante do módulo, usada em
-# cmd_credito, callback_credito e voltar_credito (bug anterior: estava
-# definida só localmente em cmd_credito e quebrava com NameError nas outras)
-NOMES_TIPO = {
-    "xtream": "Conta Xtream IPTV",
-    "vip": "Código VIP StreamFlix",
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -312,12 +305,12 @@ class AdminHandler(BaseHTTPRequestHandler):
 
             if cmd == "premios_lista":
                 c = db(); cur = c.cursor()
-                cur.execute("""SELECT id, tipo, nome, conteudo, valor, usado, data_exp, criado_em
+                cur.execute("""SELECT id, tipo, nome, conteudo, valor, usado, data_exp, criado_em, emoji
                     FROM premios ORDER BY tipo, usado, id DESC""")
                 rows = cur.fetchall(); cur.close(); c.close()
                 result = [{"id":r[0],"tipo":r[1],"nome":r[2],"conteudo":r[3],
                            "valor":float(r[4]),"usado":bool(r[5]),"data_exp":r[6],
-                           "criado_em":r[7].strftime("%d/%m/%Y") if r[7] else ""} for r in rows]
+                           "criado_em":r[7].strftime("%d/%m/%Y") if r[7] else "","emoji":r[8]} for r in rows]
                 # Contagem por tipo
                 from collections import Counter
                 disp = Counter(r["tipo"] for r in result if not r["usado"])
@@ -329,8 +322,8 @@ class AdminHandler(BaseHTTPRequestHandler):
                 raw = unquote(cmd[len("premio_add:"):])
                 data = json.loads(raw)
                 c = db(); cur = c.cursor()
-                cur.execute("INSERT INTO premios(tipo,nome,conteudo,valor,data_exp) VALUES(%s,%s,%s,%s,%s)",
-                    (data["tipo"], data["nome"], data["conteudo"], float(data["valor"]), data.get("data_exp")))
+                cur.execute("INSERT INTO premios(tipo,nome,conteudo,valor,data_exp,emoji) VALUES(%s,%s,%s,%s,%s,%s)",
+                    (data["tipo"], data["nome"], data["conteudo"], float(data["valor"]), data.get("data_exp"), data.get("emoji")))
                 c.commit(); cur.close(); c.close()
                 self._json({"ok": True}); return
 
@@ -475,6 +468,10 @@ def setup_db():
             cur.execute("ALTER TABLE clientes ADD COLUMN IF NOT EXISTS site_url TEXT DEFAULT NULL")
             cur.execute("ALTER TABLE clientes ADD COLUMN IF NOT EXISTS nome_canal TEXT DEFAULT NULL")
             cur.execute("ALTER TABLE tokens ADD COLUMN IF NOT EXISTS criado_em TIMESTAMP DEFAULT NOW()")
+            # Emoji próprio por prêmio — usado pelos tipos "streaming" (Netflix,
+            # Paramount, etc.) e "personalizado", que não têm emoji fixo como
+            # xtream (📺) e vip (🎟️) têm.
+            cur.execute("ALTER TABLE premios ADD COLUMN IF NOT EXISTS emoji TEXT DEFAULT NULL")
             c.commit()
         except: pass
         # Propagandas agendadas
@@ -598,38 +595,55 @@ def deletar_propaganda(pid):
 
 
 # ── Handlers de Crédito ────────────────────────────────────────────────────
-async def cmd_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    saldo = get_saldo(user_id)
-    premios = get_premios_disponiveis()
-
+def _montar_texto_e_botoes_credito(saldo, premios):
+    """Monta o texto e os botões do menu de créditos, agrupando por
+    categoria (VIP StreamFlix / Xtream Premium / Streamings) em vez de uma
+    lista corrida — mais fácil de escanear no celular."""
     # Agrupa por (tipo, valor) — evita misturar planos diferentes (ex: 3 VIPs
     # com preços distintos) sob a mesma chave "tipo". Guarda também o "nome"
-    # cadastrado no painel (ex: "StreamFlixVip App — 30 dias") para exibir
-    # a descrição real em vez de um rótulo genérico.
+    # e "emoji" cadastrados no painel.
     tipos = {}
     for p in premios:
         chave = (p["tipo"], p["valor"])
         if chave not in tipos:
-            tipos[chave] = {"qtd": 0, "valor": p["valor"], "tipo": p["tipo"], "nome": p["nome"]}
+            tipos[chave] = {"qtd": 0, "valor": p["valor"], "tipo": p["tipo"],
+                             "nome": p["nome"], "emoji": p.get("emoji")}
         tipos[chave]["qtd"] += 1
 
     texto = (
         f"💰 <b>Seus Créditos StreamFlix</b>\n\n"
-        f"🏦 Saldo atual: <b>R$ {saldo:.2f}</b>\n\n"
+        f"🏦 Saldo: <b>R$ {saldo:.2f}</b>\n"
     )
 
-    if tipos:
-        texto += "🎁 <b>Prêmios disponíveis:</b>\n"
-        for (tipo, valor), info in tipos.items():
-            emoji = "📺" if tipo == "xtream" else "🎟️" if tipo == "vip" else "🎁"
-            texto += f"{emoji} {info['qtd']}x {info['nome']} — R$ {info['valor']:.2f} cada\n"
-        texto += "\nEscolha uma opção abaixo:"
+    SEP = "━━━━━━━━━━━━━━"
+    vip_items    = [(k, v) for k, v in tipos.items() if k[0] == "vip"]
+    xtream_items = [(k, v) for k, v in tipos.items() if k[0] == "xtream"]
+    outros_items = [(k, v) for k, v in tipos.items() if k[0] not in ("vip", "xtream")]
+
+    if vip_items:
+        texto += f"\n{SEP}\n🎟️ VIP STREAMFLIX\n{SEP}\n"
+        for (tipo, valor), info in vip_items:
+            # Nome já vem como "StreamFlixVip App — 30 dias"; mostra só a
+            # parte depois do "—" (o plano), já que a seção deixa claro o resto.
+            plano = info["nome"].split("—")[-1].strip() if "—" in info["nome"] else info["nome"]
+            texto += f"• {plano} — R$ {info['valor']:.2f} ({info['qtd']} disponíveis)\n"
+
+    if xtream_items:
+        texto += f"\n{SEP}\n📺 XTREAM PREMIUM\n{SEP}\n"
+        for (tipo, valor), info in xtream_items:
+            texto += f"• R$ {info['valor']:.2f} ({info['qtd']} disponíveis)\n"
+
+    if outros_items:
+        texto += f"\n{SEP}\n🎬 STREAMINGS\n{SEP}\n"
+        for (tipo, valor), info in outros_items:
+            texto += f"• {info['nome']} — R$ {info['valor']:.2f} ({info['qtd']} disponíveis)\n"
+
+    if not tipos:
+        texto += "\n⚠️ Nenhum prêmio disponível no momento."
     else:
-        texto += "⚠️ Nenhum prêmio disponível no momento."
+        texto += "\nEscolha uma opção abaixo:"
 
     botoes = []
-    # Botão de recarga livre — cliente escolhe o valor que quiser
     botoes.append([InlineKeyboardButton("💳 Depositar valor personalizado", callback_data="pix_custom")])
     # Atalhos de recarga calculados a partir dos preços reais dos prêmios
     # cadastrados (não mais valores fixos) — assim eles sempre "fecham
@@ -642,14 +656,28 @@ async def cmd_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(linha) == 2:
             botoes.append(linha); linha = []
     if linha: botoes.append(linha)
-    # Botões de resgate (tipo + valor, para não misturar planos com preços diferentes)
-    for (tipo, valor), info in tipos.items():
-        emoji = "📺" if tipo == "xtream" else "🎟️" if tipo == "vip" else "🎁"
+
+    # Botões de resgate — rótulo enxuto (emoji + nome curto + preço) já que
+    # a descrição completa aparece no texto acima, evita corte no botão.
+    for (tipo, valor), info in vip_items + xtream_items + outros_items:
+        emoji = info["emoji"] or ("🎟️" if tipo == "vip" else "📺" if tipo == "xtream" else "✨")
+        if tipo == "vip":
+            rotulo = info["nome"].split("—")[-1].strip() if "—" in info["nome"] else info["nome"]
+        elif tipo == "xtream":
+            rotulo = "Xtream"
+        else:
+            rotulo = info["nome"]
         botoes.append([InlineKeyboardButton(
-            f"{emoji} {info['nome']} — R$ {info['valor']:.2f}",  # botão resgate
+            f"{emoji} {rotulo} — R$ {info['valor']:.2f}",
             callback_data=f"resgatar:{tipo}:{valor:.2f}"
         )])
+    return texto, botoes
 
+async def cmd_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    saldo = get_saldo(user_id)
+    premios = get_premios_disponiveis()
+    texto, botoes = _montar_texto_e_botoes_credito(saldo, premios)
     await update.message.reply_text(texto, parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(botoes))
 
@@ -747,7 +775,7 @@ async def callback_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         await q.edit_message_text(
             f"🎁 <b>Confirmar resgate?</b>\n\n"
-            f"Tipo: <b>{NOMES_TIPO.get(tipo, tipo.upper())}</b>\n"
+            f"Item: <b>{premios[0]['nome']}</b>\n"
             f"Valor: <b>R$ {valor:.2f}</b>\n"
             f"Saldo atual: <b>R$ {saldo:.2f}</b>\n"
             f"Saldo após: <b>R$ {saldo-valor:.2f}</b>",
@@ -813,33 +841,11 @@ async def callback_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("❌ Resgate cancelado.")
 
     elif data == "voltar_credito":
-        # Redireciona para o menu de créditos
+        # Redireciona para o menu de créditos — mesma lógica de cmd_credito
         user_id2 = q.from_user.id
         saldo2 = get_saldo(user_id2)
         premios2 = get_premios_disponiveis()
-        tipos2 = {}
-        for p in premios2:
-            chave2 = (p["tipo"], p["valor"])
-            if chave2 not in tipos2:
-                tipos2[chave2] = {"qtd": 0, "valor": p["valor"], "nome": p["nome"]}
-            tipos2[chave2]["qtd"] += 1
-        texto2 = f"💰 <b>Seus Créditos StreamFlix</b>\n\n🏦 Saldo atual: <b>R$ {saldo2:.2f}</b>\n\n"
-        botoes2 = []
-        botoes2.append([InlineKeyboardButton("💳 Depositar valor personalizado", callback_data="pix_custom")])
-        valores_premios2 = sorted({info2["valor"] for info2 in tipos2.values()})
-        atalhos2 = valores_premios2[:4] if valores_premios2 else [10.00, 20.00]
-        linha2 = []
-        for v2 in atalhos2:
-            linha2.append(InlineKeyboardButton(f"💳 R$ {v2:.2f}", callback_data=f"pix:{v2:.2f}"))
-            if len(linha2) == 2:
-                botoes2.append(linha2); linha2 = []
-        if linha2: botoes2.append(linha2)
-        for (tipo2, valor2), info2 in tipos2.items():
-            emoji2 = "📺" if tipo2 == "xtream" else "🎟️" if tipo2 == "vip" else "🎁"
-            botoes2.append([InlineKeyboardButton(
-                f"{emoji2} {info2['nome']} — R$ {info2['valor']:.2f}",
-                callback_data=f"resgatar:{tipo2}:{valor2:.2f}"
-            )])
+        texto2, botoes2 = _montar_texto_e_botoes_credito(saldo2, premios2)
         await q.edit_message_text(texto2, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(botoes2))
 
 # ── Funções de cliente ─────────────────────────────────────────────────────
@@ -879,11 +885,11 @@ def get_premios_disponiveis(tipo=None):
     try:
         c = db(); cur = c.cursor()
         if tipo:
-            cur.execute("SELECT id, tipo, nome, conteudo, valor, data_exp FROM premios WHERE usado=FALSE AND tipo=%s ORDER BY id", (tipo,))
+            cur.execute("SELECT id, tipo, nome, conteudo, valor, data_exp, emoji FROM premios WHERE usado=FALSE AND tipo=%s ORDER BY id", (tipo,))
         else:
-            cur.execute("SELECT id, tipo, nome, conteudo, valor, data_exp FROM premios WHERE usado=FALSE ORDER BY tipo, id")
+            cur.execute("SELECT id, tipo, nome, conteudo, valor, data_exp, emoji FROM premios WHERE usado=FALSE ORDER BY tipo, id")
         rows = cur.fetchall(); cur.close(); c.close()
-        return [{"id":r[0],"tipo":r[1],"nome":r[2],"conteudo":r[3],"valor":float(r[4]),"data_exp":r[5]} for r in rows]
+        return [{"id":r[0],"tipo":r[1],"nome":r[2],"conteudo":r[3],"valor":float(r[4]),"data_exp":r[5],"emoji":r[6]} for r in rows]
     except: return []
 
 def resgatar_premio(user_id, tipo, valor_filtro=None):
@@ -1290,7 +1296,7 @@ async def send_item(context, chat_id, item, is_tv=False, tipo="movie"):
         row2 = []
         if tem_trailer:
             row2.append(InlineKeyboardButton("🎬 Ver Trailer", url=url_trl))
-        row2.append(InlineKeyboardButton("⬇️ DOWNLOAD APP", url=site))
+        row2.append(InlineKeyboardButton("🌐 Visite o Site", url=site))
         keyboard = [
             [InlineKeyboardButton("▶️ ASSISTIR AGORA", url=link_streamflix(iid, is_tv=is_tv))],
             row2
@@ -1367,7 +1373,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ["🔍 Buscar","❓ Ajuda"]
     ]
     promo = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌐 Visite nosso Site", url=SITE_URL)]
+        [InlineKeyboardButton("📱 Baixar App", url=APP_URL)]
     ])
     await enviar(context, cid,
         text=f"🎬 <b>StreamFlix Bot</b>\n\nOlá {html.escape(user.first_name)}! Pronto para assistir? 🍿",

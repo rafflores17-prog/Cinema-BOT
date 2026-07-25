@@ -1296,7 +1296,7 @@ async def send_item(context, chat_id, item, is_tv=False, tipo="movie"):
         row2 = []
         if tem_trailer:
             row2.append(InlineKeyboardButton("🎬 Ver Trailer", url=url_trl))
-        row2.append(InlineKeyboardButton("🌐 Visite o Site", url=site))
+        row2.append(InlineKeyboardButton("Baixar App Grátis", url=site))
         keyboard = [
             [InlineKeyboardButton("▶️ ASSISTIR AGORA", url=link_streamflix(iid, is_tv=is_tv))],
             row2

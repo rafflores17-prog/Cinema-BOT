@@ -22,8 +22,8 @@ from telegram.ext import (Application, CommandHandler, MessageHandler,
 TOKEN         = os.environ.get("TOKEN",        os.environ.get("BOT_TOKEN", ""))
 TMDB_KEY      = os.environ.get("TMDB_API_KEY", "")
 DATABASE_URL  = os.environ.get("DATABASE_URL", "")
-SITE_URL      = os.environ.get("SITE_URL",     "www.streamflixvip.online")
-APP_URL       = os.environ.get("APP_URL",      "www.streamflixvip.online")
+SITE_URL      = os.environ.get("SITE_URL",     "https://www.streamflixvip.online")
+APP_URL       = os.environ.get("APP_URL",      "https://www.streamflixvip.online/downloads/app-latest.apk")
 ADMIN_ID      = int(os.environ.get("ADMIN_ID", "0"))   # Seu user_id do Telegram (não chat_id do canal)
 GRUPO_ID      = int(os.environ.get("GRUPO_ID", "0"))   # Seu canal principal (streamflixofc)
 CANAL_VIP     = int(os.environ.get("CANAL_VIP", "0"))    # Canal VIP (streamflixvip)
@@ -1161,10 +1161,28 @@ def get_trailer_url(item_id, titulo, is_tv=False):
         if yt: return f"https://youtu.be/{yt['key']}"
     return f"https://www.youtube.com/results?search_query={quote(titulo+' Trailer Oficial')}"
 
-def link_streamflix(item_id, is_tv=False):
-    # Query string funciona no Telegram/Chrome que ignora # em links externos
+def ensure_https(url):
+    """Telegram exige URL absoluta com https:// nos botoes inline."""
+    u = (url or "").strip()
+    if not u:
+        return "https://www.streamflixvip.online"
+    if not u.startswith(("http://", "https://")):
+        u = "https://" + u.lstrip("/")
+    return u.rstrip("/")
+
+def link_app_download():
+    return ensure_https(APP_URL or "https://www.streamflixvip.online/downloads/app-latest.apk")
+
+def link_streamflix(item_id, is_tv=False, site=None):
+    """Link de assistir.
+    No site oficial StreamFlixVIP nao ha player web — manda para o APK.
+    Clientes SaaS com site_url proprio mantem /?id=&type= se tiverem player.
+    """
+    base = ensure_https(site or SITE_URL)
+    if "streamflixvip.online" in base:
+        return link_app_download()
     tipo = "tv" if is_tv else "movie"
-    return f"{SITE_URL}/?id={item_id}&type={tipo}"
+    return f"{base}/?id={item_id}&type={tipo}"
 
 def formatar_estrelas(rating):
     if not rating: return "—"
@@ -1286,19 +1304,22 @@ async def send_item(context, chat_id, item, is_tv=False, tipo="movie"):
     url_trl = get_trailer_url(iid, title, is_tv=is_tv)
     tem_trailer = "youtu.be/" in url_trl or "youtube.com/watch" in url_trl
 
-    # modo 'simples': só assistir
-    # modo 'completo': assistir + trailer/site lado a lado
+    # modo 'simples': so assistir
+    # modo 'completo': assistir + trailer/baixar lado a lado
+    # Site oficial -> APK; cliente SaaS -> site_url dele
+    assist_url = link_streamflix(iid, is_tv=is_tv, site=site)
+    baixar_url = link_app_download() if "streamflixvip.online" in ensure_https(site) else ensure_https(site)
     if modo == "simples":
         keyboard = [
-            [InlineKeyboardButton("▶️ ASSISTIR AGORA", url=link_streamflix(iid, is_tv=is_tv))]
+            [InlineKeyboardButton("📱 BAIXAR APP E ASSISTIR", url=assist_url)]
         ]
     else:
         row2 = []
         if tem_trailer:
             row2.append(InlineKeyboardButton("🎬 Ver Trailer", url=url_trl))
-        row2.append(InlineKeyboardButton("Baixar App Grátis", url=site))
+        row2.append(InlineKeyboardButton("Baixar App Grátis", url=baixar_url))
         keyboard = [
-            [InlineKeyboardButton("▶️ ASSISTIR AGORA", url=link_streamflix(iid, is_tv=is_tv))],
+            [InlineKeyboardButton("📱 BAIXAR APP E ASSISTIR", url=assist_url)],
             row2
         ]
     post = details.get("poster_path") or item.get("poster_path")
@@ -1373,7 +1394,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ["🔍 Buscar","❓ Ajuda"]
     ]
     promo = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📱 Baixar App", url=APP_URL)]
+        [InlineKeyboardButton("📱 Baixar App", url=link_app_download())],
+        [InlineKeyboardButton("🌐 Site oficial", url=ensure_https(SITE_URL))],
     ])
     await enviar(context, cid,
         text=f"🎬 <b>StreamFlix Bot</b>\n\nOlá {html.escape(user.first_name)}! Pronto para assistir? 🍿",

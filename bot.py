@@ -1174,13 +1174,13 @@ def link_app_download():
     return ensure_https(APP_URL or "https://www.streamflixvip.online/downloads/app-latest.apk")
 
 def link_streamflix(item_id, is_tv=False, site=None):
-    """Link de assistir.
-    No site oficial StreamFlixVIP nao ha player web — manda para o APK.
-    Clientes SaaS com site_url proprio mantem /?id=&type= se tiverem player.
+    """Link principal (Assistir).
+    Site oficial StreamFlixVIP: landing (sem player web).
+    Cliente SaaS com site proprio: /?id=&type= se tiver player.
     """
     base = ensure_https(site or SITE_URL)
     if "streamflixvip.online" in base:
-        return link_app_download()
+        return base  # landing de divulgacao
     tipo = "tv" if is_tv else "movie"
     return f"{base}/?id={item_id}&type={tipo}"
 
@@ -1307,19 +1307,21 @@ async def send_item(context, chat_id, item, is_tv=False, tipo="movie"):
     # modo 'simples': so assistir
     # modo 'completo': assistir + trailer/baixar lado a lado
     # Site oficial -> APK; cliente SaaS -> site_url dele
+    # Principal = site (landing); Baixar = APK no oficial
     assist_url = link_streamflix(iid, is_tv=is_tv, site=site)
     baixar_url = link_app_download() if "streamflixvip.online" in ensure_https(site) else ensure_https(site)
     if modo == "simples":
         keyboard = [
-            [InlineKeyboardButton("📱 BAIXAR APP E ASSISTIR", url=assist_url)]
+            [InlineKeyboardButton("🎬 VER NO SITE / APP", url=assist_url)],
+            [InlineKeyboardButton("📱 Baixar APK", url=baixar_url)],
         ]
     else:
         row2 = []
         if tem_trailer:
             row2.append(InlineKeyboardButton("🎬 Ver Trailer", url=url_trl))
-        row2.append(InlineKeyboardButton("Baixar App Grátis", url=baixar_url))
+        row2.append(InlineKeyboardButton("📱 Baixar APK", url=baixar_url))
         keyboard = [
-            [InlineKeyboardButton("📱 BAIXAR APP E ASSISTIR", url=assist_url)],
+            [InlineKeyboardButton("🌐 VER NO SITE / APP", url=assist_url)],
             row2
         ]
     post = details.get("poster_path") or item.get("poster_path")

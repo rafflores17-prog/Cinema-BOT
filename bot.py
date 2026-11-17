@@ -1,12 +1,11 @@
-# ================= BOT DE CINEMA v8.1 — StreamFlix SaaS Edition =================
-# Novidades v8:
-#   ✅ Sistema multi-tenant (vários clientes, um bot)
-#   ✅ Aluguel de 30 dias com renovação automática
-#   ✅ Painel admin completo via Telegram
-#   ✅ Aviso automático 3 dias antes de vencer
-#   ✅ Bloqueio automático ao vencer + mensagem de renovação
-#   ✅ Tokens de ativação seguros
-#   ✅ Postagem automática para TODOS os clientes ativos
+# ================= BOT DE CINEMA v8.2 — StreamFlix SaaS Edition =================
+# Novidades v8.2:
+#   ✅ Menu de comandos em português (privado / grupo / admin)
+#   ✅ /start focado no app, com botões e deep links (start=indique, baixar, ref_)
+#   ✅ Busca liberada no privado (PUBLIC_SEARCH) com limite de frequência
+#   ✅ Escolha entre resultados de /filme e /serie
+#   ✅ Modo inline (@bot nome do filme), se habilitado no BotFather
+#   ✅ Menos spam: trailer extra desligado; propaganda 1x/dia (configurável)
 # =================================================================================
 
 import os, html, time, random, logging, threading, secrets, string
@@ -14,10 +13,15 @@ from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, quote
 import requests, psycopg2
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup,
+    BotCommand, BotCommandScopeDefault, BotCommandScopeAllPrivateChats,
+    BotCommandScopeAllGroupChats, BotCommandScopeChat,
+    InlineQueryResultArticle, InlineQueryResultPhoto, InputTextMessageContent,
+)
 from telegram.ext import (Application, CommandHandler, MessageHandler,
                           filters, ContextTypes, CallbackQueryHandler,
-                          ChatMemberHandler)
+                          ChatMemberHandler, InlineQueryHandler)
 
 # ── Variáveis de ambiente ──────────────────────────────────────────────────
 TOKEN         = os.environ.get("TOKEN",        os.environ.get("BOT_TOKEN", ""))
@@ -64,6 +68,19 @@ POLL_WEEKDAY            = env_int("POLL_WEEKDAY", 4)          # 0=seg ... 4=sext
 POLL_HOUR_UTC           = env_int("POLL_HOUR_UTC", 21)        # 18h America/Fortaleza
 DOWNLOADER_CELULAR      = os.environ.get("DOWNLOADER_CELULAR", "6085325")
 DOWNLOADER_TV           = os.environ.get("DOWNLOADER_TV", "3422972")
+
+# Engajamento v8.2 (todos opcionais; padrões pensados para não lotar o grupo)
+PUBLIC_SEARCH             = env_bool("PUBLIC_SEARCH", True)            # busca no privado sem ser cliente SaaS
+SEND_TRAILER_MESSAGE      = env_bool("SEND_TRAILER_MESSAGE", False)    # 2ª mensagem de trailer (já há botão no card)
+APP_PROMO_INCLUDE_CLIENTS = env_bool("APP_PROMO_INCLUDE_CLIENTS", False)
+POLL_INCLUDE_CLIENTS      = env_bool("POLL_INCLUDE_CLIENTS", False)
+COMMAND_RATE_SECONDS      = env_int("COMMAND_RATE_SECONDS", 8)
+GROUP_SEARCH_RATE_SECONDS = env_int("GROUP_SEARCH_RATE_SECONDS", 30)
+# Horários UTC da propaganda, separados por vírgula. Antes: 13,18,22 (10h/15h/19h Fortaleza).
+# Padrão novo: uma vez às 18:00 UTC (15h America/Fortaleza). Para voltar: PROPAGANDA_HOURS_UTC=13,18,22
+PROPAGANDA_HOURS_UTC      = os.environ.get("PROPAGANDA_HOURS_UTC", "18")
+SET_BOT_PROFILE           = env_bool("SET_BOT_PROFILE", False)         # só altera descrição se ligar (e o usuário aprovar o texto)
+INLINE_MODE               = env_bool("INLINE_MODE", True)
 
 IMG_BASE  = "https://image.tmdb.org/t/p/w500"
 TMDB_BASE = "https://api.themoviedb.org/3"
@@ -1077,7 +1094,7 @@ def usar_token(token, chat_id, topic_id=0):
         logging.error(e); return None
 
 def cliente_ativo(chat_id):
-    if chat_id == GRUPO_ID: return True  # canal do dono sempre liberado
+    if chat_oficial(chat_id): return True  # grupo/canal do dono sempre liberado
     try:
         c = db(); cur = c.cursor()
         cur.execute("SELECT ativo, validade FROM clientes WHERE chat_id=%s", (chat_id,))
@@ -1218,15 +1235,19 @@ def tmdb_details(item_id, is_tv=False):
     tipo = "tv" if is_tv else "movie"
     return tmdb(f"{tipo}/{item_id}", {"append_to_response": "credits,videos"})
 
-def get_trailer_url(item_id, titulo, is_tv=False):
+def trailer_from_videos(videos, titulo):
+    res = (videos or {}).get("results") or []
+    t = next((x for x in res if x.get("type")=="Trailer" and x.get("site")=="YouTube"), None)
+    if t: return f"https://youtu.be/{t['key']}"
+    yt = next((x for x in res if x.get("site")=="YouTube"), None)
+    if yt: return f"https://youtu.be/{yt['key']}"
+    return f"https://www.youtube.com/results?search_query={quote((titulo or '')+' Trailer Oficial')}"
+
+def get_trailer_url(item_id, titulo, is_tv=False, details=None):
+    if details and details.get("videos"):
+        return trailer_from_videos(details.get("videos"), titulo)
     v = tmdb(f"{'tv' if is_tv else 'movie'}/{item_id}/videos")
-    if v and v.get("results"):
-        res = v["results"]
-        t = next((x for x in res if x["type"]=="Trailer" and x["site"]=="YouTube"), None)
-        if t: return f"https://youtu.be/{t['key']}"
-        yt = next((x for x in res if x["site"]=="YouTube"), None)
-        if yt: return f"https://youtu.be/{yt['key']}"
-    return f"https://www.youtube.com/results?search_query={quote(titulo+' Trailer Oficial')}"
+    return trailer_from_videos(v, titulo)
 
 def ensure_https(url):
     """Telegram exige URL absoluta com https:// nos botoes inline."""
@@ -1368,7 +1389,7 @@ async def send_item(context, chat_id, item, is_tv=False, tipo="movie"):
     caption = build_caption(details, is_tv=is_tv)
     modo     = get_modo(chat_id)
     site     = get_site_url(chat_id)
-    url_trl = get_trailer_url(iid, title, is_tv=is_tv)
+    url_trl = get_trailer_url(iid, title, is_tv=is_tv, details=details)
     tem_trailer = "youtu.be/" in url_trl or "youtube.com/watch" in url_trl
 
     # modo 'simples': so assistir
@@ -1398,7 +1419,7 @@ async def send_item(context, chat_id, item, is_tv=False, tipo="movie"):
     try:
         if post: await enviar(context, chat_id, photo=f"{IMG_BASE}{post}", caption=caption, markup=InlineKeyboardMarkup(keyboard))
         else:    await enviar(context, chat_id, text=caption, markup=InlineKeyboardMarkup(keyboard))
-        if tem_trailer:
+        if tem_trailer and SEND_TRAILER_MESSAGE:
             trl_kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton("▶️ Ver Trailer no YouTube", url=url_trl)
             ]])
@@ -1415,64 +1436,162 @@ async def enviar_lista(context, chat_id, itens, is_tv=False, tipo="movie", limit
         await send_item(context, chat_id, item, is_tv=is_tv, tipo=tipo)
 
 # ── Verificação de acesso ──────────────────────────────────────────────────
-async def verificar_acesso(update: Update, context) -> bool:
-    cid = update.effective_chat.id
-    if cliente_ativo(cid): return True
-    await update.message.reply_text(
-        "🔒 <b>Acesso bloqueado!</b>\n\n"
-        "Seu plano não está ativo ou expirou.\n\n"
-        f"Para ativar ou renovar:\n{CANAL_SUPORTE}",
-        parse_mode="HTML"
-    )
+def chat_oficial(chat_id):
+    """Grupo/canal principal do StreamFlix (não só o GRUPO_ID)."""
+    return bool(chat_id) and chat_id in {i for i in (GRUPO_ID, CANAL_VIP) if i}
+
+def acesso_conteudo(chat_id):
+    return chat_oficial(chat_id) or cliente_ativo(chat_id)
+
+def is_privado(update: Update) -> bool:
+    chat = update.effective_chat
+    return bool(chat) and chat.type == "private"
+
+def is_grupo(update: Update) -> bool:
+    chat = update.effective_chat
+    return bool(chat) and chat.type in ("group", "supergroup")
+
+def parse_horas_utc(valor, padrao):
+    horas = []
+    for part in str(valor or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            h = int(part)
+        except ValueError:
+            continue
+        if 0 <= h <= 23 and h not in horas:
+            horas.append(h)
+    return horas or list(padrao)
+
+_rate_bucket = {}  # (user_id, bucket) -> timestamp
+
+def rate_ok(user_id, bucket, seconds):
+    if not seconds or seconds <= 0 or not user_id:
+        return True
+    now = time.time()
+    if len(_rate_bucket) > 4000:
+        cutoff = now - 600
+        stale = [k for k, ts in _rate_bucket.items() if ts < cutoff]
+        for k in stale:
+            _rate_bucket.pop(k, None)
+    key = (user_id, bucket)
+    last = _rate_bucket.get(key, 0)
+    if now - last < seconds:
+        return False
+    _rate_bucket[key] = now
+    return True
+
+async def avisar_aguarde(update: Update, seconds=None):
+    msg = update.effective_message
+    if not msg:
+        return
+    texto = "⏳ Aguarde uns segundos antes de buscar de novo."
+    try:
+        await msg.reply_text(texto)
+    except Exception:
+        pass
+
+async def verificar_acesso(update: Update, context, *, silent=False) -> bool:
+    chat = update.effective_chat
+    if not chat:
+        return False
+    cid = chat.id
+    if acesso_conteudo(cid):
+        return True
+    if chat.type == "private" and PUBLIC_SEARCH:
+        return True
+    if silent or chat.type in ("group", "supergroup", "channel"):
+        return False
+    if update.message:
+        await update.message.reply_text(
+            "🔒 <b>Acesso bloqueado!</b>\n\n"
+            "Seu plano não está ativo ou expirou.\n\n"
+            f"Para ativar ou renovar:\n{CANAL_SUPORTE}",
+            parse_mode="HTML"
+        )
     return False
 
 # ── Comandos de cliente ────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid  = update.effective_chat.id
-    user = update.effective_user
-    if not cliente_ativo(cid):
-        bot_info = await context.bot.get_me()
-        bot_username = bot_info.username
-        await update.message.reply_text(
-            f"👋 Olá <b>{html.escape(user.first_name)}</b>! Bem-vindo ao StreamFlix Bot! 🎬\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📋 <b>COMO CONFIGURAR O BOT NO SEU CANAL</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"<b>1️⃣ Adquira seu plano:</b>\n"
-            f"👉 {CANAL_SUPORTE}\n\n"
-            f"<b>2️⃣ Adicione o bot ao seu canal:</b>\n"
-            f"• Abra seu canal no Telegram\n"
-            f"• Toque nos 3 pontos (⋮) no canto superior\n"
-            f"• Vá em <b>Administradores</b>\n"
-            f"• Toque em <b>Adicionar Administrador</b>\n"
-            f"• Pesquise: <code>@{bot_username}</code>\n"
-            f"• Ative a permissão <b>Enviar Mensagens</b> ✅\n"
-            f"• Confirme\n\n"
-            f"<b>3️⃣ Ative seu plano no canal:</b>\n"
-            f"Digite no seu canal:\n"
-            f"<code>/ativar SEU_TOKEN</code>\n\n"
-            f"<b>4️⃣ Tudo pronto! 🚀</b>\n"
-            f"O bot já começa a postar automaticamente!\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"❓ Dúvidas? {CANAL_SUPORTE}",
-            parse_mode="HTML"
-        )
+    if not update.message:
         return
-    kb = [
-        ["🎥 Em Cartaz","🚀 Em Breve"],
-        ["🌟 Populares","📺 Séries"],
-        ["🔥 Em Alta","🎲 Sugestão"],
-        ["🎭 Por Gênero","🎞️ Por Época"],
-        ["🔍 Buscar","❓ Ajuda"]
-    ]
-    promo = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📱 Baixar App", url=link_app_download())],
-        [InlineKeyboardButton("🌐 Site oficial", url=ensure_https(SITE_URL))],
-    ])
-    await enviar(context, cid,
-        text=f"🎬 <b>StreamFlix Bot</b>\n\nOlá {html.escape(user.first_name)}! Pronto para assistir? 🍿",
-        markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
-    await enviar(context, cid, text="✨ Acesse agora:", markup=promo)
+    chat = update.effective_chat
+    cid  = chat.id
+    user = update.effective_user
+    payload = (context.args[0].strip() if context.args else "")
+    nome = (user.first_name if user else None) or "aí"
+
+    # Nos grupos, não despeja teclado nem o texto longo de SaaS.
+    if chat.type in ("group", "supergroup"):
+        bot_info = await context.bot.get_me()
+        uname = bot_info.username or ""
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💬 Abrir no privado", url=f"https://t.me/{uname}?start=1")],
+            [InlineKeyboardButton("📱 Baixar app", url=link_app_download())],
+        ])
+        await update.message.reply_text(
+            "👋 Eu sou o bot do <b>StreamFlix</b>.\n"
+            "Fale comigo no privado para buscar filmes e baixar o app.",
+            parse_mode="HTML", reply_markup=kb)
+        return
+
+    if payload.lower() in ("saas", "canal", "bot"):
+        bot_info = await context.bot.get_me()
+        saas_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💬 Suporte", url=CANAL_SUPORTE)],
+            [InlineKeyboardButton("⬅️ Voltar", callback_data="start:home")],
+        ])
+        await update.message.reply_text(
+            texto_saas(bot_info.username), parse_mode="HTML", reply_markup=saas_kb)
+        return
+
+    await update.message.reply_text(
+        texto_start_app(nome, payload),
+        parse_mode="HTML",
+        reply_markup=menu_teclado())
+    await update.message.reply_text(
+        "✨ Escolha uma opção:",
+        reply_markup=markup_start_privado())
+
+    if payload.lower() in ("indique", "indicar", "ganhe"):
+        await update.message.reply_text(texto_indique(), parse_mode="HTML",
+                                        reply_markup=markup_cta_app())
+    elif payload.lower() in ("baixar", "app", "download"):
+        await update.message.reply_text(
+            "📱 Toque abaixo para baixar o app:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📱 Baixar app", url=link_app_download())],
+                [InlineKeyboardButton("🌐 Site", url=ensure_https(SITE_URL))],
+            ]))
+    elif payload.lower() in ("lancamentos", "lançamentos", "cartaz"):
+        d = tmdb("movie/now_playing", {"region": "BR"})
+        if d and d.get("results"):
+            await enviar_lista(context, cid, d.get("results", []), tipo="now_playing")
+        else:
+            await enviar(context, cid, text="😕 Não encontrei lançamentos agora. Tente de novo em instantes.")
+
+async def cmd_indique(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    if is_grupo(update):
+        bot_info = await context.bot.get_me()
+        uname = bot_info.username or ""
+        await update.message.reply_text(
+            "🎁 <b>Indique e ganhe +7 dias VIP</b>\n\n"
+            + texto_indique() +
+            "\n\nPara o menu completo, abra o bot no privado.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💬 Abrir no privado", url=f"https://t.me/{uname}?start=indique")],
+                [InlineKeyboardButton("📱 Baixar app", url=link_app_download())],
+            ]))
+        return
+    await update.message.reply_text(
+        "🎁 <b>Indique e ganhe +7 dias VIP</b>\n\n" + texto_indique(),
+        parse_mode="HTML", reply_markup=markup_cta_app())
+
 
 async def cmd_ativar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
@@ -1524,7 +1643,10 @@ async def cmd_meuplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         r = cur.fetchone(); cur.close(); c.close()
     except: r = None
     if not r:
-        await update.message.reply_text(f"❌ Sem plano ativo.\nAdquira em: {CANAL_SUPORTE}")
+        await update.message.reply_text(
+            "ℹ️ Este comando é para quem usa o bot no próprio canal.\n\n"
+            "Para o app StreamFlix, use /indique (ganhe +7 dias VIP) ou /credito.\n"
+            f"Suporte: {CANAL_SUPORTE}")
         return
     ativo, validade = r
     dias_rest = (validade - datetime.utcnow()).days if validade else 0
@@ -1545,7 +1667,13 @@ def is_admin(update: Update) -> bool:
 async def cmd_gerar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         await update.message.reply_text("⛔ Acesso negado."); return
-    qtd    = min(int(context.args[0]) if context.args else 1, 10)
+    try:
+        qtd = min(int(context.args[0]) if context.args else 1, 10)
+        if qtd < 1:
+            qtd = 1
+    except (TypeError, ValueError):
+        await update.message.reply_text("⚠️ Use: <code>/gerar [quantidade]</code>", parse_mode="HTML")
+        return
     tokens = [gerar_token() for _ in range(qtd)]
     msg    = f"🎟️ <b>{qtd} Token(s) gerado(s) — 30 dias:</b>\n\n"
     for t in tokens: msg += f"<code>{t}</code>\n"
@@ -1685,7 +1813,7 @@ async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def job_propaganda(context: ContextTypes.DEFAULT_TYPE):
-    """Roda 3x ao dia: posta propaganda rotativa nos canais principais."""
+    """Posta propaganda rotativa nos canais principais (horários: PROPAGANDA_HOURS_UTC)."""
     canais = []
     if GRUPO_ID: canais.append(GRUPO_ID)
     if CANAL_VIP: canais.append(CANAL_VIP)
@@ -1815,6 +1943,73 @@ def texto_indique():
         f"📺 TV: <code>{html.escape(str(DOWNLOADER_TV))}</code>"
     )
 
+MENU_BOTOES = {
+    "🎥 Em Cartaz", "🚀 Em Breve", "🌟 Populares", "📺 Séries",
+    "🔥 Em Alta", "🎲 Sugestão", "🎭 Por Gênero", "🎞️ Por Época",
+    "🔍 Buscar", "❓ Ajuda",
+}
+
+def menu_teclado():
+    return ReplyKeyboardMarkup([
+        ["🎥 Em Cartaz", "🚀 Em Breve"],
+        ["🌟 Populares", "📺 Séries"],
+        ["🔥 Em Alta", "🎲 Sugestão"],
+        ["🎭 Por Gênero", "🎞️ Por Época"],
+        ["🔍 Buscar", "❓ Ajuda"],
+    ], resize_keyboard=True)
+
+def markup_start_privado():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📱 Baixar app", url=link_app_download()),
+         InlineKeyboardButton("🌐 Site", url=ensure_https(SITE_URL))],
+        [InlineKeyboardButton("🎬 Ver lançamentos", callback_data="start:lancamentos"),
+         InlineKeyboardButton("🎁 Indique e ganhe", callback_data="start:indique")],
+        [InlineKeyboardButton("💬 Suporte", url=CANAL_SUPORTE)],
+    ])
+
+def texto_start_app(first_name, payload=""):
+    nome = html.escape(first_name or "aí")
+    extra = ""
+    if payload.startswith("ref_"):
+        extra = "\nObrigado por vir pelo convite! Use os códigos abaixo no Downloader.\n\n"
+    return (
+        f"👋 Olá, <b>{nome}</b>! Bem-vindo ao <b>StreamFlix</b>.\n\n"
+        f"{extra}"
+        "Filmes, séries e TV no celular e na TV.\n"
+        f"🌐 {html.escape(ensure_https(SITE_URL))}\n\n"
+        f"{texto_indique()}\n\n"
+        "Toque nos botões abaixo ou busque com /filme e /serie."
+    )
+
+def texto_saas(bot_username):
+    return (
+        "📋 <b>QUERO O BOT NO MEU CANAL</b>\n\n"
+        "<b>1️⃣ Adquira seu plano:</b>\n"
+        f"👉 {CANAL_SUPORTE}\n\n"
+        "<b>2️⃣ Adicione o bot ao seu canal:</b>\n"
+        "• Abra seu canal no Telegram\n"
+        "• Toque nos 3 pontos (⋮) no canto superior\n"
+        "• Vá em <b>Administradores</b>\n"
+        "• Toque em <b>Adicionar Administrador</b>\n"
+        f"• Pesquise: <code>@{html.escape(bot_username or '')}</code>\n"
+        "• Ative a permissão <b>Enviar Mensagens</b> ✅\n"
+        "• Confirme\n\n"
+        "<b>3️⃣ Ative seu plano no canal:</b>\n"
+        "Digite no seu canal:\n"
+        "<code>/ativar SEU_TOKEN</code>\n\n"
+        f"❓ Dúvidas? {CANAL_SUPORTE}"
+    )
+
+def teclado_em_linhas(botoes, por_linha=2):
+    rows, linha = [], []
+    for b in botoes:
+        linha.append(b)
+        if len(linha) == por_linha:
+            rows.append(linha); linha = []
+    if linha:
+        rows.append(linha)
+    return InlineKeyboardMarkup(rows)
+
 # ── Boas-vindas a novos membros ────────────────────────────────────────────
 _welcome_last = {}  # chat_id -> timestamp, anti-flood
 
@@ -1929,7 +2124,8 @@ async def job_app_promo(context: ContextTypes.DEFAULT_TYPE):
         f"🌐 {html.escape(ensure_https(SITE_URL))}\n\n"
         f"{texto_indique()}"
     )
-    for cid in chats_destinatarios():
+    destinos = chats_destinatarios() if APP_PROMO_INCLUDE_CLIENTS else [c for c in (GRUPO_ID, CANAL_VIP) if c]
+    for cid in destinos:
         try:
             await enviar(context, cid, text=texto, markup=markup_cta_app())
         except Exception as e:
@@ -1964,7 +2160,8 @@ async def job_enquete_semanal(context: ContextTypes.DEFAULT_TYPE):
         f"🌐 {html.escape(ensure_https(SITE_URL))}\n"
         f"{texto_indique()}"
     )
-    for cid in chats_destinatarios():
+    destinos = chats_destinatarios() if POLL_INCLUDE_CLIENTS else [c for c in (GRUPO_ID, CANAL_VIP) if c]
+    for cid in destinos:
         try:
             kw = {}
             topic = get_topic_id(cid)
@@ -1979,13 +2176,90 @@ async def job_enquete_semanal(context: ContextTypes.DEFAULT_TYPE):
             logging.error(f"Enquete {cid}: {e}")
 
 # ── Handlers de texto ──────────────────────────────────────────────────────
+async def avisar_tmdb_vazio(context, cid):
+    await enviar(context, cid, text="😕 Não encontrei títulos agora. Tente de novo em instantes.")
+
+async def executar_menu(context, cid, text):
+    if text == "🎥 Em Cartaz":
+        d = tmdb("movie/now_playing", {"region":"BR"})
+        if d and d.get("results"):
+            await enviar_lista(context, cid, d.get("results",[]), tipo="now_playing")
+        else:
+            await avisar_tmdb_vazio(context, cid)
+
+    elif text == "🚀 Em Breve":
+        d = tmdb("movie/upcoming", {"region":"BR"})
+        if d and d.get("results"):
+            await enviar_lista(context, cid, d.get("results",[]), tipo="upcoming")
+        else:
+            await avisar_tmdb_vazio(context, cid)
+
+    elif text == "🌟 Populares":
+        d = tmdb("movie/popular", {"region":"BR","page":random.randint(1,5)})
+        if d and d.get("results"):
+            await enviar_lista(context, cid, d.get("results",[]))
+        else:
+            await avisar_tmdb_vazio(context, cid)
+
+    elif text == "📺 Séries":
+        d = tmdb("tv/popular", {"page":random.randint(1,5)})
+        if d and d.get("results"):
+            await enviar_lista(context, cid, d.get("results",[]), is_tv=True, tipo="tv")
+        else:
+            await avisar_tmdb_vazio(context, cid)
+
+    elif text == "🔥 Em Alta":
+        d = tmdb("trending/all/week")
+        if d and d.get("results"):
+            itens = d.get("results",[])[:3]
+            for item in itens:
+                is_tv = item.get("media_type") == "tv"
+                await send_item(context, cid, item, is_tv=is_tv, tipo="tv" if is_tv else "movie")
+        else:
+            await avisar_tmdb_vazio(context, cid)
+
+    elif text == "🎭 Por Gênero":
+        btns = [InlineKeyboardButton(n, callback_data=f"gen_{i}") for n,i in GENEROS.items()]
+        await enviar(context, cid, text="✨ <b>Escolha um gênero:</b>", markup=teclado_em_linhas(btns, 2))
+
+    elif text == "🎞️ Por Época":
+        btns = [InlineKeyboardButton(n, callback_data=f"era_{n}") for n in EPOCAS]
+        await enviar(context, cid, text="⏳ <b>Escolha uma época:</b>", markup=teclado_em_linhas(btns, 2))
+
+    elif text == "🎲 Sugestão":
+        d = tmdb("movie/top_rated", {"page":random.randint(1,20)})
+        if d and d.get("results"):
+            await enviar_lista(context, cid, d["results"], limite=1)
+        else:
+            await avisar_tmdb_vazio(context, cid)
+
+    elif text == "🔍 Buscar":
+        await enviar(context, cid, text=(
+            "⌨️ Use os comandos:\n\n"
+            "<code>/filme Nome do Filme</code>\n"
+            "<code>/serie Nome da Série</code>\n"
+            "<code>/ator Nome do Ator</code>\n"
+            "<code>/top10</code> — mais vistos da semana\n"
+            "<code>/indique</code> — ganhe +7 dias VIP\n\n"
+            "Você também pode buscar em qualquer conversa: digite o @ do bot e o nome do filme."
+        ))
+
+    elif text == "❓ Ajuda":
+        await cmd_ajuda_fn(context, cid)
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await verificar_acesso(update, context): return
-    cid  = update.effective_chat.id
+    if not update.message or not update.message.text:
+        return
+    chat = update.effective_chat
+    cid  = chat.id
     text = update.message.text
+    user = update.effective_user
+    uid  = user.id if user else 0
 
     # Captura o valor de depósito personalizado, se estivermos esperando
     if context.user_data.get("aguardando_valor_pix"):
+        if chat.type != "private":
+            return
         context.user_data["aguardando_valor_pix"] = False
         texto_valor = text.strip().replace("R$", "").replace(" ", "").replace(",", ".")
         try:
@@ -2002,105 +2276,195 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Use /credito para tentar de novo."
             ))
             return
-        user_id = update.effective_user.id
-        await _gerar_e_enviar_pix(context, cid, user_id, valor)
+        await _gerar_e_enviar_pix(context, cid, uid, valor)
         return
 
-    if text == "🎥 Em Cartaz":
-        d = tmdb("movie/now_playing", {"region":"BR"})
-        if d: await enviar_lista(context, cid, d.get("results",[]), tipo="now_playing")
+    # Em grupos, só reage aos botões do menu — nunca responde "acesso bloqueado" no meio do papo.
+    if chat.type in ("group", "supergroup", "channel"):
+        if text not in MENU_BOTOES:
+            return
+        if not acesso_conteudo(cid):
+            return
+        if not rate_ok(uid, "menu", GROUP_SEARCH_RATE_SECONDS):
+            await avisar_aguarde(update)
+            return
+        await executar_menu(context, cid, text)
+        return
 
-    elif text == "🚀 Em Breve":
-        d = tmdb("movie/upcoming", {"region":"BR"})
-        if d: await enviar_lista(context, cid, d.get("results",[]), tipo="upcoming")
+    if not await verificar_acesso(update, context):
+        return
+    if text not in MENU_BOTOES:
+        return
+    if not rate_ok(uid, "menu", COMMAND_RATE_SECONDS):
+        await avisar_aguarde(update)
+        return
+    await executar_menu(context, cid, text)
 
-    elif text == "🌟 Populares":
-        d = tmdb("movie/popular", {"region":"BR","page":random.randint(1,5)})
-        if d: await enviar_lista(context, cid, d.get("results",[]))
+async def enviar_escolhas(context, chat_id, resultados, is_tv, query):
+    if not resultados:
+        tipo = "Série" if is_tv else "Filme"
+        await enviar(context, chat_id, text=f"😕 {tipo} não encontrado: <b>{html.escape(query)}</b>")
+        return
+    if len(resultados) == 1:
+        await send_item(context, chat_id, resultados[0], is_tv=is_tv, tipo="tv" if is_tv else "movie")
+        return
+    botoes = []
+    kind = "tv" if is_tv else "movie"
+    for item in resultados[:5]:
+        title = item.get("name") if is_tv else item.get("title", "?")
+        year = (item.get("first_air_date") if is_tv else item.get("release_date") or "")[:4]
+        label = f"{title} ({year})" if year else (title or "?")
+        if len(label) > 60:
+            label = label[:57] + "…"
+        botoes.append([InlineKeyboardButton(label, callback_data=f"pick:{kind}:{item.get('id')}")])
+    await enviar(
+        context, chat_id,
+        text=f"🔍 Encontrei estes títulos para <b>{html.escape(query)}</b>. Qual você quer?",
+        markup=InlineKeyboardMarkup(botoes),
+    )
 
-    elif text == "📺 Séries":
-        d = tmdb("tv/popular", {"page":random.randint(1,5)})
-        if d: await enviar_lista(context, cid, d.get("results",[]), is_tv=True, tipo="tv")
-
-    elif text == "🔥 Em Alta":
-        d = tmdb("trending/all/week")
-        if d:
-            for item in d.get("results",[])[:4]:
-                is_tv = item.get("media_type") == "tv"
-                await send_item(context, cid, item, is_tv=is_tv, tipo="tv" if is_tv else "movie")
-
-    elif text == "🎭 Por Gênero":
-        btns = [[InlineKeyboardButton(n, callback_data=f"gen_{i}")] for n,i in GENEROS.items()]
-        await enviar(context, cid, text="✨ <b>Escolha um Gênero:</b>", markup=InlineKeyboardMarkup(btns))
-
-    elif text == "🎞️ Por Época":
-        btns = [[InlineKeyboardButton(n, callback_data=f"era_{n}")] for n in EPOCAS]
-        await enviar(context, cid, text="⏳ <b>Escolha uma Época:</b>", markup=InlineKeyboardMarkup(btns))
-
-    elif text == "🎲 Sugestão":
-        d = tmdb("movie/top_rated", {"page":random.randint(1,20)})
-        if d and d.get("results"): await enviar_lista(context, cid, d["results"], limite=1)
-
-    elif text == "🔍 Buscar":
-        await enviar(context, cid, text=(
-            "⌨️ Use os comandos:\n\n"
-            "<code>/filme Nome do Filme</code>\n"
-            "<code>/serie Nome da Série</code>\n"
-            "<code>/ator Nome do Ator</code>\n"
-            "<code>/top10</code> — Top 10 da semana"
-        ))
-
-    elif text == "❓ Ajuda":
-        await cmd_ajuda_fn(context, cid)
+async def callback_start(update, context, acao):
+    q = update.callback_query
+    cid = update.effective_chat.id
+    user = update.effective_user
+    nome = (user.first_name if user else None) or "aí"
+    if acao == "indique":
+        await q.message.reply_text(
+            "🎁 <b>Indique e ganhe +7 dias VIP</b>\n\n" + texto_indique(),
+            parse_mode="HTML", reply_markup=markup_cta_app())
+        return
+    if acao == "lancamentos":
+        if not rate_ok(user.id if user else 0, "menu", COMMAND_RATE_SECONDS):
+            return
+        d = tmdb("movie/now_playing", {"region": "BR"})
+        if d and d.get("results"):
+            await enviar_lista(context, cid, d.get("results", []), tipo="now_playing")
+        else:
+            await avisar_tmdb_vazio(context, cid)
+        return
+    if acao == "saas":
+        bot_info = await context.bot.get_me()
+        await q.message.reply_text(
+            texto_saas(bot_info.username), parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💬 Suporte", url=CANAL_SUPORTE)],
+            ]))
+        return
+    if acao == "home":
+        await q.message.reply_text(
+            texto_start_app(nome), parse_mode="HTML", reply_markup=markup_start_privado())
 
 async def callback_handler(update, context):
-    q   = update.callback_query; await q.answer()
-    cid = update.effective_chat.id
-    if not cliente_ativo(cid):
-        await q.message.reply_text(f"🔒 Acesso bloqueado. Renove em: {CANAL_SUPORTE}"); return
-    data = q.data
+    q = update.callback_query
+    if not q:
+        return
+    data = q.data or ""
+    chat = update.effective_chat
+    cid = chat.id if chat else 0
+    user = update.effective_user
+    uid = user.id if user else 0
+
+    if data.startswith("start:"):
+        await q.answer()
+        if chat and chat.type != "private":
+            return
+        await callback_start(update, context, data.split(":", 1)[1])
+        return
+
+    if data.startswith("pick:"):
+        partes = data.split(":")
+        if len(partes) != 3:
+            await q.answer()
+            return
+        _, kind, sid = partes
+        if not (acesso_conteudo(cid) or (chat and chat.type == "private" and PUBLIC_SEARCH)):
+            await q.answer("Abra o bot no privado para ver este título.", show_alert=True)
+            return
+        segundos = GROUP_SEARCH_RATE_SECONDS if (chat and chat.type in ("group", "supergroup")) else COMMAND_RATE_SECONDS
+        if not rate_ok(uid, "search", segundos):
+            await q.answer("Aguarde uns segundos…", show_alert=False)
+            return
+        await q.answer()
+        try:
+            iid = int(sid)
+        except ValueError:
+            return
+        is_tv = kind == "tv"
+        details = tmdb_details(iid, is_tv=is_tv)
+        if not details:
+            await enviar(context, cid, text="😕 Não consegui abrir este título agora.")
+            return
+        await send_item(context, cid, details, is_tv=is_tv, tipo="tv" if is_tv else "movie")
+        return
+
+    # Gênero / época
+    if not (acesso_conteudo(cid) or (chat and chat.type == "private" and PUBLIC_SEARCH)):
+        await q.answer("Abra o bot no privado para usar este menu.", show_alert=True)
+        return
+    await q.answer()
+    if not rate_ok(uid, "menu", COMMAND_RATE_SECONDS):
+        return
 
     if data.startswith("gen_"):
-        gid = data.split("_")[1]
+        gid = data.split("_", 1)[1]
         d = tmdb("discover/movie", {"with_genres":gid,"sort_by":"popularity.desc","page":random.randint(1,5)})
-        if d and d.get("results"): await enviar_lista(context, cid, d["results"])
+        if d and d.get("results"):
+            await enviar_lista(context, cid, d["results"])
+        else:
+            await avisar_tmdb_vazio(context, cid)
 
     elif data.startswith("era_"):
-        era = data.split("_",1)[1]
+        era = data.split("_", 1)[1]
+        if era not in EPOCAS:
+            return
         inicio, fim = EPOCAS[era]
         ano = random.randint(inicio, fim)
         d = tmdb("discover/movie", {"primary_release_year":ano,"sort_by":"popularity.desc","page":1})
         if d and d.get("results"):
-            await enviar(context, cid, text=f"🎞️ <b>Melhores de {ano}...</b>")
+            await enviar(context, cid, text=f"🎞️ <b>Destaques de {ano}...</b>")
             await enviar_lista(context, cid, d["results"][:10])
+        else:
+            await avisar_tmdb_vazio(context, cid)
 
 # ── Comandos com verificação de acesso ────────────────────────────────────
+async def _guard_busca(update, context) -> bool:
+    if not update.message:
+        return False
+    if not await verificar_acesso(update, context, silent=is_grupo(update)):
+        return False
+    user = update.effective_user
+    uid = user.id if user else 0
+    segundos = GROUP_SEARCH_RATE_SECONDS if is_grupo(update) else COMMAND_RATE_SECONDS
+    if not rate_ok(uid, "search", segundos):
+        await avisar_aguarde(update)
+        return False
+    return True
+
 async def cmd_filme(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await verificar_acesso(update, context): return
+    if not await _guard_busca(update, context):
+        return
     if not context.args:
         await update.message.reply_text("⚠️ Use: /filme Nome do Filme"); return
     cid = update.effective_chat.id
     q   = " ".join(context.args)
     d   = tmdb("search/movie", {"query": q})
     res = d.get("results",[]) if d else []
-    if not res:
-        await enviar(context, cid, text=f"😕 Filme não encontrado: <b>{html.escape(q)}</b>"); return
-    await send_item(context, cid, res[0], tipo="movie")
+    await enviar_escolhas(context, cid, res, is_tv=False, query=q)
 
 async def cmd_serie(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await verificar_acesso(update, context): return
+    if not await _guard_busca(update, context):
+        return
     if not context.args:
         await update.message.reply_text("⚠️ Use: /serie Nome da Série"); return
     cid = update.effective_chat.id
     q   = " ".join(context.args)
     d   = tmdb("search/tv", {"query": q})
     res = d.get("results",[]) if d else []
-    if not res:
-        await enviar(context, cid, text=f"😕 Série não encontrada: <b>{html.escape(q)}</b>"); return
-    await send_item(context, cid, res[0], is_tv=True, tipo="tv")
+    await enviar_escolhas(context, cid, res, is_tv=True, query=q)
 
 async def cmd_ator(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await verificar_acesso(update, context): return
+    if not await _guard_busca(update, context):
+        return
     if not context.args:
         await update.message.reply_text("⚠️ Use: /ator Nome do Ator"); return
     cid = update.effective_chat.id
@@ -2118,50 +2482,238 @@ async def cmd_ator(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await enviar_lista(context, cid, filmes[:10], tipo="movie", limite=3)
 
 async def cmd_top10(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await verificar_acesso(update, context): return
+    if not await _guard_busca(update, context):
+        return
     cid = update.effective_chat.id
     d   = tmdb("trending/all/week")
     if not d or not d.get("results"):
         await enviar(context, cid, text="😕 Não foi possível buscar o Top 10."); return
     itens  = d["results"][:10]
-    linhas = ["🏆 <b>TOP 10 DA SEMANA:</b>\n"]
+    linhas = ["🏆 <b>Mais vistos da semana:</b>\n"]
     for i, item in enumerate(itens, 1):
         is_tv = item.get("media_type") == "tv"
         name  = item.get("name") if is_tv else item.get("title","?")
         ano   = (item.get("first_air_date","") if is_tv else item.get("release_date",""))[:4]
         nota  = item.get("vote_average",0)
         tipo  = "📺" if is_tv else "🎬"
-        url   = link_streamflix(item.get("id"), is_tv=is_tv)
-        linhas.append(f"{i}. {tipo} <a href=\"{url}\">{html.escape(name)}</a> ({ano}) — ⭐{nota:.1f}")
-    await enviar(context, cid, text="\n".join(linhas))
+        linhas.append(f"{i}. {tipo} {html.escape(name)} ({ano}) — ⭐{nota:.1f}")
+    await enviar(context, cid, text="\n".join(linhas), markup=markup_cta_app())
 
-async def cmd_ajuda_fn(context, cid):
+async def cmd_ajuda_fn(context, cid, bot_username=None):
+    inline = ""
+    if bot_username:
+        inline = f"\n🔎 Em qualquer conversa: <code>@{html.escape(bot_username)} nome do filme</code>\n"
     await enviar(context, cid, text=(
-        "❓ <b>Comandos:</b>\n\n"
-        "🎥 <b>Em Cartaz</b> — cinemas agora\n"
+        "❓ <b>Como usar o StreamFlix Bot</b>\n\n"
+        "🎥 <b>Em Cartaz</b> — nos cinemas agora\n"
         "🚀 <b>Em Breve</b> — próximos lançamentos\n"
         "🌟 <b>Populares</b> — mais vistos\n"
         "📺 <b>Séries</b> — séries em alta\n"
-        "🔥 <b>Em Alta</b> — trending da semana\n"
+        "🔥 <b>Em Alta</b> — destaques da semana\n"
         "🎭 <b>Por Gênero</b> — filtre por estilo\n"
         "🎞️ <b>Por Época</b> — por década\n"
         "🎲 <b>Sugestão</b> — surpresa aleatória\n\n"
-        "<code>/filme Nome</code> — busca filme\n"
-        "<code>/serie Nome</code> — busca série\n"
+        "<code>/filme Nome</code> — busca um filme\n"
+        "<code>/serie Nome</code> — busca uma série\n"
         "<code>/ator Nome</code> — filmes de um ator\n"
-        "<code>/top10</code> — ranking semanal\n"
-        "<code>/meuplano</code> — ver seu plano\n"
-    ))
+        "<code>/top10</code> — mais vistos da semana\n"
+        "<code>/indique</code> — +7 dias VIP no app\n"
+        "<code>/credito</code> — saldo, PIX e resgates\n"
+        "<code>/meuplano</code> — plano do bot no canal\n"
+        f"{inline}\n"
+        f"{texto_indique()}\n\n"
+        f"💬 Suporte: {CANAL_SUPORTE}"
+    ), markup=markup_cta_app())
 
 async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await verificar_acesso(update, context): return
-    await cmd_ajuda_fn(context, update.effective_chat.id)
+    # Ajuda sempre liberada no privado e nos grupos oficiais; nos outros grupos, silêncio.
+    if not update.message:
+        return
+    if is_grupo(update) and not acesso_conteudo(update.effective_chat.id):
+        return
+    uname = None
+    try:
+        uname = (await context.bot.get_me()).username
+    except Exception:
+        pass
+    await cmd_ajuda_fn(context, update.effective_chat.id, uname)
+
+# ── Perfil, comandos e modo inline ────────────────────────────────────────
+BOT_SHORT_DESCRIPTION_PADRAO = (
+    "Filmes, séries e TV no StreamFlix. Baixe o app, busque títulos e ganhe +7 dias VIP indicando amigos."
+)
+BOT_DESCRIPTION_PADRAO = (
+    "O StreamFlix Bot te ajuda a encontrar filmes e séries e a baixar o app.\n\n"
+    "🌐 Site: https://www.streamflixvip.online\n\n"
+    "📱 Baixe o app (Downloader):\n"
+    "• Celular: 6085325\n"
+    "• TV: 3422972\n\n"
+    "🎁 Indique e ganhe +7 dias VIP\n\n"
+    "O que você pode fazer:\n"
+    "• Buscar filme, série ou ator\n"
+    "• Ver os mais assistidos da semana\n"
+    "• Receber lançamentos e enquetes no grupo\n"
+    "• Falar com o suporte\n\n"
+    "No privado, toque em /start para baixar o app e começar."
+)
+
+def comandos_privado():
+    return [
+        BotCommand("start", "Abrir o menu e baixar o app"),
+        BotCommand("filme", "Buscar um filme"),
+        BotCommand("serie", "Buscar uma série"),
+        BotCommand("ator", "Filmes de um ator ou atriz"),
+        BotCommand("top10", "Mais vistos da semana"),
+        BotCommand("indique", "Indique e ganhe +7 dias VIP"),
+        BotCommand("credito", "Saldo, PIX e resgates"),
+        BotCommand("ajuda", "Como usar o bot"),
+        BotCommand("meuplano", "Ver o plano do bot no canal"),
+    ]
+
+def comandos_grupo():
+    return [
+        BotCommand("filme", "Buscar um filme"),
+        BotCommand("serie", "Buscar uma série"),
+        BotCommand("top10", "Mais vistos da semana"),
+        BotCommand("indique", "Indique e ganhe +7 dias VIP"),
+        BotCommand("ajuda", "Como usar o bot"),
+    ]
+
+def comandos_admin():
+    return comandos_privado() + [
+        BotCommand("gerar", "Gerar tokens de ativação"),
+        BotCommand("clientes", "Ver clientes do bot"),
+        BotCommand("renovar", "Renovar um cliente"),
+        BotCommand("revogar", "Revogar um cliente"),
+        BotCommand("stats", "Números do bot"),
+        BotCommand("config", "Modo e site do cliente"),
+    ]
+
+async def configurar_comandos(bot):
+    await bot.set_my_commands(comandos_privado(), scope=BotCommandScopeDefault())
+    await bot.set_my_commands(comandos_privado(), scope=BotCommandScopeAllPrivateChats())
+    await bot.set_my_commands(comandos_grupo(), scope=BotCommandScopeAllGroupChats())
+    if ADMIN_ID:
+        await bot.set_my_commands(comandos_admin(), scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+
+def texto_perfil_curto():
+    return (os.environ.get("BOT_SHORT_DESCRIPTION") or BOT_SHORT_DESCRIPTION_PADRAO).strip()
+
+def texto_perfil_longo():
+    custom = (os.environ.get("BOT_DESCRIPTION") or "").strip()
+    if custom:
+        return custom
+    return (
+        "O StreamFlix Bot te ajuda a encontrar filmes e séries e a baixar o app.\n\n"
+        f"🌐 Site: {ensure_https(SITE_URL)}\n\n"
+        "📱 Baixe o app (Downloader):\n"
+        f"• Celular: {DOWNLOADER_CELULAR}\n"
+        f"• TV: {DOWNLOADER_TV}\n\n"
+        "🎁 Indique e ganhe +7 dias VIP\n\n"
+        "O que você pode fazer:\n"
+        "• Buscar filme, série ou ator\n"
+        "• Ver os mais assistidos da semana\n"
+        "• Receber lançamentos e enquetes no grupo\n"
+        "• Falar com o suporte\n\n"
+        "No privado, toque em /start para baixar o app e começar."
+    )
+
+async def configurar_perfil(bot):
+    short = texto_perfil_curto()
+    desc  = texto_perfil_longo()
+    if short:
+        await bot.set_my_short_description(short[:120])
+    if desc:
+        await bot.set_my_description(desc[:512])
+
+async def post_init(application):
+    try:
+        await configurar_comandos(application.bot)
+        logging.info("Menu de comandos atualizado (pt-BR).")
+    except Exception as e:
+        logging.warning(f"Não foi possível configurar o menu de comandos: {e}")
+    if SET_BOT_PROFILE:
+        try:
+            await configurar_perfil(application.bot)
+            logging.info("Descrição do bot atualizada (SET_BOT_PROFILE=1).")
+        except Exception as e:
+            logging.warning(f"Não foi possível atualizar a descrição do bot: {e}")
+
+async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not INLINE_MODE or not update.inline_query:
+        return
+    iq = update.inline_query
+    uid = iq.from_user.id if iq.from_user else 0
+    q = (iq.query or "").strip()
+    if len(q) < 2:
+        await iq.answer(
+            [], cache_time=10, is_personal=False,
+            switch_pm_text="Abrir o StreamFlix Bot",
+            switch_pm_parameter="inline",
+        )
+        return
+    if not rate_ok(uid, "inline", 2):
+        await iq.answer([], cache_time=1, is_personal=True)
+        return
+    d = tmdb("search/multi", {"query": q}) or {}
+    resultados = []
+    for item in d.get("results") or []:
+        media = item.get("media_type")
+        if media not in ("movie", "tv"):
+            continue
+        is_tv = media == "tv"
+        title = item.get("name") if is_tv else item.get("title") or "?"
+        year = (item.get("first_air_date") if is_tv else item.get("release_date") or "")[:4]
+        poster = item.get("poster_path")
+        sinopse = (item.get("overview") or "").strip()
+        if len(sinopse) > 180:
+            sinopse = sinopse[:180].rsplit(" ", 1)[0] + "…"
+        caption = f"{'📺' if is_tv else '🎬'} <b>{html.escape(title)}</b>"
+        if year:
+            caption += f" ({html.escape(year)})"
+        if sinopse:
+            caption += f"\n\n{html.escape(sinopse)}"
+        site = ensure_https(SITE_URL)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("▶️ Assista no StreamFlix", url=site)],
+            [InlineKeyboardButton("📱 Baixar app", url=link_app_download())],
+        ])
+        rid = f"{media}-{item.get('id')}"
+        titulo_r = f"{title} ({year})" if year else title
+        desc = sinopse or ("Série" if is_tv else "Filme")
+        if poster:
+            resultados.append(InlineQueryResultPhoto(
+                id=rid,
+                photo_url=f"{IMG_BASE}{poster}",
+                thumbnail_url=f"https://image.tmdb.org/t/p/w92{poster}",
+                title=titulo_r[:64],
+                description=desc[:120],
+                caption=caption[:1024],
+                parse_mode="HTML",
+                reply_markup=kb,
+            ))
+        else:
+            resultados.append(InlineQueryResultArticle(
+                id=rid,
+                title=titulo_r[:64],
+                description=desc[:120],
+                input_message_content=InputTextMessageContent(caption[:4096], parse_mode="HTML"),
+                reply_markup=kb,
+            ))
+        if len(resultados) >= 8:
+            break
+    await iq.answer(
+        resultados, cache_time=30, is_personal=False,
+        switch_pm_text="Abrir o StreamFlix Bot",
+        switch_pm_parameter="inline",
+    )
+
 
 # ── Main ───────────────────────────────────────────────────────────────────
 def main():
     setup_db()
     threading.Thread(target=start_health, daemon=True).start()
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
 
     # Comandos de cliente
     app.add_handler(CommandHandler("start",    cmd_start))
@@ -2173,6 +2725,7 @@ def main():
     app.add_handler(CommandHandler("serie",    cmd_serie))
     app.add_handler(CommandHandler("ator",     cmd_ator))
     app.add_handler(CommandHandler("top10",    cmd_top10))
+    app.add_handler(CommandHandler("indique",  cmd_indique))
 
     # Painel admin (só você usa — protegido por ADMIN_ID)
     app.add_handler(CommandHandler("gerar",    cmd_gerar))
@@ -2185,9 +2738,10 @@ def main():
     # Créditos
     app.add_handler(CommandHandler("credito", cmd_credito))
     app.add_handler(CallbackQueryHandler(callback_credito, pattern="^(pix:|pix_custom|check:|resgatar:|confirmar:|cancelar|voltar_credito)"))
-    # Texto e callbacks
+    # Texto, callbacks e modo inline
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(InlineQueryHandler(inline_query))
     # Boas-vindas (serviço + chat_member; rate-limit evita flood)
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_chat_members))
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
@@ -2198,9 +2752,9 @@ def main():
         jq.run_daily(job_diario_manha,           time=datetime.strptime("11:00","%H:%M").time())  # 8h BRT
         jq.run_daily(job_diario_noite,           time=datetime.strptime("23:00","%H:%M").time())  # 20h BRT
         jq.run_repeating(job_verificar_vencimentos, interval=3600, first=60)                       # a cada 1h
-        jq.run_daily(job_propaganda, time=datetime.strptime("13:00","%H:%M").time())  # 10h BRT
-        jq.run_daily(job_propaganda, time=datetime.strptime("18:00","%H:%M").time())  # 15h BRT
-        jq.run_daily(job_propaganda, time=datetime.strptime("22:00","%H:%M").time())  # 19h BRT
+        # Propaganda: padrão 18:00 UTC (15h Fortaleza). Antes eram 13,18,22.
+        for _h in parse_horas_utc(PROPAGANDA_HOURS_UTC, [18]):
+            jq.run_daily(job_propaganda, time=datetime.strptime(f"{_h:02d}:00","%H:%M").time())
         # Novos jobs (horários em UTC, iguais aos existentes: UTC = BRT+3)
         promo_h = max(0, min(23, APP_PROMO_HOUR_UTC))
         poll_h  = max(0, min(23, POLL_HOUR_UTC))
@@ -2221,7 +2775,7 @@ def main():
         logging.error(f"Erro não tratado: {err}")
     app.add_error_handler(_on_error)
 
-    logging.info(f"✅ Bot v8.1 SaaS Online — {SITE_URL}")
+    logging.info(f"✅ Bot v8.2 SaaS Online — {SITE_URL}")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

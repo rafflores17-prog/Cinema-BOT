@@ -90,7 +90,7 @@ NOITE_HOUR_UTC            = env_int("NOITE_HOUR_UTC", 23)             # 20h Amer
 MANHA_INCLUIR_SERIE       = env_bool("MANHA_INCLUIR_SERIE", True)      # 1 filme + 1 série de manhã (senão 2 filmes)
 PROPAGANDA_USE_DB         = env_bool("PROPAGANDA_USE_DB", False)       # 1 = usa textos de propaganda salvos no painel
 DIAS_SEM_REPETIR          = env_int("DIAS_SEM_REPETIR", 30)
-TMDB_POSTER_SIZE          = (os.environ.get("TMDB_POSTER_SIZE", "w780") or "w780").strip()
+TMDB_POSTER_SIZE          = (os.environ.get("TMDB_POSTER_SIZE", "w500") or "w500").strip()
 MANHA_HEADER              = os.environ.get("MANHA_HEADER", "🌅 Bom dia! Lançamentos de hoje 👇")
 NOITE_HEADER              = os.environ.get("NOITE_HEADER", "🌙 Boa noite! Sugestão da noite 👇")
 
@@ -1413,7 +1413,7 @@ async def atmdb_details(item_id, is_tv=False):
 
 def tmdb_details(item_id, is_tv=False):
     tipo = "tv" if is_tv else "movie"
-    return tmdb(f"{tipo}/{item_id}", {"append_to_response": "credits,videos"})
+    return tmdb(f"{tipo}/{item_id}", {"append_to_response": "videos"})
 
 def trailer_from_videos(videos, titulo):
     res = (videos or {}).get("results") or []
@@ -3622,12 +3622,117 @@ def buscar_pessoa(query, grupo=False):
     cands.sort(key=lambda p: p.get("popularity") or 0, reverse=True)
     return cands[0] if cands else None
 
+def titulo_relevante(alvo, r):
+    """O título bate com o texto? Exato, ou todas as palavras digitadas aparecem
+    (palavra igual, começo de palavra ou 1-2 letras erradas) no nome pt-BR ou original."""
+    ws = alvo.split()
+    if not ws:
+        return False
+    for nome in (_nome_pt(r), _nome_orig(r)):
+        if not nome:
+            continue
+        if nome == alvo:
+            return True
+        ns = nome.split()
+        livres = list(ns)
+        ok = True
+        for w in ws:
+            # palavra igual ou com 1-2 letras erradas (sem prefixo: "chan" não vira "changed")
+            achou = next((n for n in livres if n == w or
+                          (len(w) >= 4 and _distancia(w, n, 2) <= (1 if len(w) <= 5 else 2))), None)
+            if achou is None:
+                ok = False
+                break
+            livres.remove(achou)
+        if ok:
+            return True
+    return False
+
 def planejar_busca(query, grupo=False):
     """Decide o que mostrar para um texto digitado. Devolve:
-    ('card', item) | ('lista', itens, rotulo) | ('pessoa', pessoa) | (None,)."""
+    ('card', item) | ('lista', itens, rotulo) | ('pessoa', pessoa) | (None,).
+    Títulos que não batem com o texto nunca entram (nada de lista de lixo)."""
+    from concurrent.futures import ThreadPoolExecutor
     alvo = normalizar_busca(query)
     if not alvo:
         return (None,)
+    nome_de_pessoa = 2 <= len(alvo.split()) <= 4
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f1 = ex.submit(tmdb, "search/multi", {"query": query, "include_adult": "false", "language": "pt-BR", "page": 1})
+        f2 = ex.submit(tmdb, "search/multi", {"query": query, "include_adult": "false", "language": "pt-BR", "page": 2})
+        f3 = ex.submit(buscar_pessoa, query, grupo) if nome_de_pessoa else None
+        res = []
+        for f in (f1, f2):
+            try:
+                res += [r for r in ((f.result() or {}).get("results") or []) if r.get("id")]
+            except Exception:
+                pass
+        try:
+            pessoa_b = f3.result() if f3 else None
+        except Exception:
+            pessoa_b = None
+    vistos, titulos = set(), []
+    for r in _so_titulos(res):
+        k = (r.get("media_type"), r.get("id"))
+        if k not in vistos:
+            vistos.add(k)
+            titulos.append(r)
+    pessoas = [r for r in res if r.get("media_type") == "person"]
+    pop = lambda r: r.get("popularity") or 0
+
+    # 1) título exato: nome em pt-BR primeiro, depois original
+    exatos = sorted([r for r in titulos if _nome_pt(r) == alvo and item_forte(r)], key=pop, reverse=True)
+    exatos += sorted([r for r in titulos if _nome_orig(r) == alvo and r not in exatos and item_forte(r)],
+                     key=pop, reverse=True)
+    relevantes = [r for r in titulos if r not in exatos and item_decente(r) and titulo_relevante(alvo, r)]
+
+    cand_p = [p for p in pessoas[:8] if _pessoa_bate(alvo, p, grupo)]
+    if pessoa_b and all(p.get("id") != pessoa_b.get("id") for p in cand_p):
+        cand_p.append(pessoa_b)
+    cand_p.sort(key=lambda p: (normalizar_busca(p.get("name") or "") == alvo, pop(p)), reverse=True)
+    pessoa = cand_p[0] if cand_p else None
+
+    if exatos:
+        top = exatos[0]
+        pop_top = pop(top)
+        if pessoa and normalizar_busca(pessoa.get("name") or "") == alvo \
+                and pop(pessoa) >= 10 and pop_top * 2 < pop(pessoa):
+            return ("pessoa", pessoa)
+        if len(exatos) >= 2:
+            seg = exatos[1]
+            if not (pop_top >= 3 * max(pop(seg), 0.1) and (top.get("vote_count") or 0) >= 50):
+                return ("lista", exatos + relevantes, query)
+        # concorrente próximo: título parecido tão popular quanto
+        rivais = [r for r in relevantes if _bate_parcial(alvo, r) and pop(r) >= 0.8 * max(pop_top, 0.1)]
+        if rivais:
+            return ("lista", [top] + rivais + [r for r in exatos[1:] if r not in rivais], query)
+        return ("card", top)
+
+    # 2) pessoa (tolerante: jack -> jackie), já que não há título exato
+    if pessoa:
+        return ("pessoa", pessoa)
+
+    # 3) títulos que batem com o texto (todas as palavras); no grupo, também conhecidos
+    if grupo:
+        relevantes = [r for r in relevantes if (r.get("vote_count") or 0) >= 20 or pop(r) >= 5 or item_recente(r)]
+    if relevantes:
+        relevantes.sort(key=lambda r: (not _bate_parcial(alvo, r), -pop(r)))
+        if len(relevantes) == 1 and item_forte(relevantes[0]):
+            return ("card", relevantes[0])
+        return ("lista", relevantes, query)
+
+    # 4) último recurso: variantes (diminutivo/artigo) e en-US, só com nome exato
+    for v, lang in [(v, "pt-BR") for v in variantes_busca(query)[1:]] + [(query, "en-US")]:
+        nv = normalizar_busca(v)
+        tv_res = _so_titulos(buscar_multi(v, lang, paginas=1))
+        ex = [r for r in tv_res if nv in (_nome_pt(r), _nome_orig(r)) and item_forte(r)]
+        if grupo:
+            ex = [r for r in ex if (r.get("vote_count") or 0) >= 20 or pop(r) >= 5 or item_recente(r)]
+        if len(ex) == 1:
+            return ("card", ex[0])
+        if ex:
+            return ("lista", ex, v)
+    return (None,)
     res = buscar_multi(query, "pt-BR")
     titulos = _so_titulos(res)
     pessoas = [r for r in res if r.get("media_type") == "person"]

@@ -38,7 +38,7 @@ async def main():
     bot.AI_ENABLED=False
     await bot.handle_text(mkupdate("duna","private",5),ctx); print("private 'duna':",[(s[0],s[2][:40]) for s in sent]); sent.clear()
     bot._rate_bucket.clear()
-    await bot.handle_text(mkupdate("dun","private",5),ctx); print("private 'dun':",[(s[0],s[2][:60]) for s in sent], len(sent[-1][3].inline_keyboard)); sent.clear()
+    await bot.handle_text(mkupdate("dun","private",5),ctx); print("private 'dun':",[(s[0],s[2][:60]) for s in sent]); assert "Não encontrei" in sent[-1][2]; sent.clear()
     bot._rate_bucket.clear()
     await bot.handle_text(mkupdate("bom dia","supergroup",-100),ctx); print("group 'bom dia':",sent); 
     await bot.handle_text(mkupdate("Duna","supergroup",-100),ctx); print("group 'Duna':",[(s[0],s[2][:30]) for s in sent]); sent.clear()

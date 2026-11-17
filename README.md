@@ -127,7 +127,7 @@ Para desligar um recurso: `WELCOME_ENABLED=0`, `APP_PROMO_ENABLED=0`, `POLL_ENAB
 | `MANHA_INCLUIR_SERIE` | `1` | `1` = 1 filme + 1 série de manhã; `0` = 2 filmes |
 | `MANHA_HEADER` / `NOITE_HEADER` | (textos padrão) | Cabeçalhos curtos das postagens de 8h e 20h |
 | `DIAS_SEM_REPETIR` | `30` | Dias sem repetir o mesmo título no mesmo chat |
-| `TMDB_POSTER_SIZE` | `w780` | Tamanho do pôster no TMDB (`w500`, `w780`, `w1280`) |
+| `TMDB_POSTER_SIZE` | `w500` | Tamanho do pôster no TMDB (`w500`, `w780`, `w1280`) |
 | `PROPAGANDA_USE_DB` | `0` | `1` = usa os textos de propaganda salvos no painel (senão, os textos novos do app) |
 | `AI_ENABLED` | `0` | Liga o assistente (`/ia`, menção ou resposta ao bot, e texto no privado) |
 | `AI_BASE_URL` | `https://api.groq.com/openai/v1` | Endpoint compatível com OpenAI `/chat/completions` |

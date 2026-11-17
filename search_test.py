@@ -51,7 +51,21 @@ JACK_RUIM = {"id": 777, "media_type": "person", "name": "Jack Chandler", "popula
 SCARLETT = {"id": 1245, "media_type": "person", "name": "Scarlett Johansson", "popularity": 60, "known_for_department": "Acting",
             "profile_path": "/sj.jpg", "known_for": [{"title": "Viúva Negra"}]}
 DB["jackie chan"] = [JACKIE]
-DB["jack chan"] = [JACK_RUIM, {"id": 900, "media_type": "movie", "title": "Jack", "poster_path": "/j.jpg", "vote_count": 500, "popularity": 9}]
+# espelha a resposta real do TMDB para "Jack Chan" (títulos fracos, sem o Jackie no multi)
+DB["jack chan"] = [
+    {"id": 901, "media_type": "tv", "name": "Gentleman Jack Changed My Life", "original_name": "Gentleman Jack Changed My Life",
+     "poster_path": "/g.jpg", "overview": "doc", "vote_count": 2, "popularity": 1.1, "first_air_date": "2020-01-01"},
+    {"id": 902, "media_type": "movie", "title": "Jack Bensinger", "original_title": "Jack Bensinger",
+     "poster_path": "/jb.jpg", "vote_count": 1, "popularity": 0.6},
+    {"id": 903, "media_type": "tv", "name": "ブラック・ジャック", "original_name": "ブラック・ジャック",
+     "poster_path": "/bj.jpg", "vote_count": 30, "popularity": 6},
+    {"id": 904, "media_type": "movie", "title": "A Última Chance", "original_title": "Last Chance",
+     "poster_path": "/uc.jpg", "vote_count": 80, "popularity": 7},
+    {"id": 905, "media_type": "movie", "title": "Emperor of Hemp: The Jack Herer Story", "original_title": "Emperor of Hemp",
+     "poster_path": "/eh.jpg", "vote_count": 10, "popularity": 1.5},
+    JACK_RUIM,
+]
+DB["lixo total"] = DB["jack chan"][:5]
 PESSOAS = {"jack chan": [JACK_RUIM, JACKIE], "scarlet johanson": [SCARLETT], "scarlet johansson": [SCARLETT]}
 calls = []
 def fake_tmdb(ep, params=None):
@@ -94,6 +108,10 @@ for q, esperado in [("Jack Chan", 18897), ("Jackie Chan", 18897), ("jackie chan"
         p = bot.planejar_busca(q, grupo=g)
         print(q, "grupo" if g else "privado", "->", p[0], p[1].get("name") if p[0] == "pessoa" else "")
         assert p[0] == "pessoa" and p[1]["id"] == esperado, (q, g)
+assert bot.planejar_busca("lixo total")[0] is None            # títulos que não batem não viram lista
+assert bot.planejar_busca("lixo total", grupo=True)[0] is None
+assert not bot.titulo_relevante("jack chan", DB["jack chan"][0])   # "chan" não vira "changed"
+assert bot.titulo_relevante("duna", DB["duna"][2]) and bot.titulo_relevante("matrx", DB["matrix"][0])
 assert bot.nome_pessoa_bate("jack chan", "jackie chan") and bot.nome_pessoa_bate("scarlet johanson", "scarlett johansson")
 assert not bot.nome_pessoa_bate("jack", "jackie chan") and not bot.nome_pessoa_bate("pedro", "pedro pascal")
 assert bot.nome_pessoa_bate("zendya", "zendaya") and not bot.nome_pessoa_bate("bom dia", "bomani diaz")

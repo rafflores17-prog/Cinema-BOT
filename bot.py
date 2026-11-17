@@ -19,6 +19,7 @@ from telegram import (
     InlineQueryResultArticle, InlineQueryResultPhoto, InputTextMessageContent,
     InlineQueryResultsButton,
 )
+from telegram.request import HTTPXRequest
 from telegram.ext import (Application, CommandHandler, MessageHandler,
                           filters, ContextTypes, CallbackQueryHandler,
                           ChatMemberHandler, InlineQueryHandler)
@@ -918,7 +919,7 @@ async def _gerar_e_enviar_pix(context, chat_id, user_id, valor, q=None):
 
 async def callback_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
+    await responder_cb(q)
     user_id = q.from_user.id
     data = q.data
 
@@ -945,9 +946,9 @@ async def callback_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML"
             )
         elif status == "pending":
-            await q.answer("⏳ Aguardando confirmação do pagamento...", show_alert=True)
+            await responder_cb(q, "⏳ Aguardando confirmação do pagamento...", show_alert=True)
         else:
-            await q.answer(f"Status: {status or 'não encontrado'}", show_alert=True)
+            await responder_cb(q, f"Status: {status or 'não encontrado'}", show_alert=True)
 
     elif data.startswith("resgatar:"):
         partes = data.split(":")
@@ -957,12 +958,12 @@ async def callback_credito(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if valor_filtro is not None:
             premios = [p for p in premios if abs(p["valor"] - valor_filtro) < 0.001]
         if not premios:
-            await q.answer("⚠️ Nenhum prêmio disponível nessa categoria!", show_alert=True)
+            await responder_cb(q, "⚠️ Nenhum prêmio disponível nessa categoria!", show_alert=True)
             return
         valor = premios[0]["valor"]
         saldo = get_saldo(user_id)
         if saldo < valor:
-            await q.answer("💰 Saldo insuficiente!", show_alert=True)
+            await responder_cb(q, "💰 Saldo insuficiente!", show_alert=True)
             await q.edit_message_text(
                 f"❌ <b>Saldo insuficiente!</b>\n\n"
                 f"💰 Seu saldo: <b>R$ {saldo:.2f}</b>\n"
@@ -1201,6 +1202,7 @@ def token_valido(token):
     except: return False
 
 def usar_token(token, chat_id, topic_id=0):
+    limpar_cache_cliente(chat_id)
     try:
         c = db(); cur = c.cursor()
         validade = datetime.utcnow() + timedelta(days=DIAS_PLANO)
@@ -1215,8 +1217,35 @@ def usar_token(token, chat_id, topic_id=0):
     except Exception as e:
         logging.error(e); return None
 
+_cache_cli = {}          # (função, chat_id) -> (expira_em, valor)
+CACHE_CLIENTE_SEGUNDOS = 120
+
+def _cache_get(nome, chat_id):
+    v = _cache_cli.get((nome, chat_id))
+    if v and v[0] > time.time():
+        return True, v[1]
+    return False, None
+
+def _cache_put(nome, chat_id, valor):
+    if len(_cache_cli) > 5000:
+        _cache_cli.clear()
+    _cache_cli[(nome, chat_id)] = (time.time() + CACHE_CLIENTE_SEGUNDOS, valor)
+    return valor
+
+def limpar_cache_cliente(chat_id=None):
+    if chat_id is None:
+        _cache_cli.clear()
+        return
+    for k in [k for k in _cache_cli if k[1] == chat_id]:
+        _cache_cli.pop(k, None)
+
 def cliente_ativo(chat_id):
     if chat_oficial(chat_id): return True  # grupo/canal do dono sempre liberado
+    ok, v = _cache_get("ativo", chat_id)
+    if ok: return v
+    return _cache_put("ativo", chat_id, _cliente_ativo_db(chat_id))
+
+def _cliente_ativo_db(chat_id):
     try:
         c = db(); cur = c.cursor()
         cur.execute("SELECT ativo, validade FROM clientes WHERE chat_id=%s", (chat_id,))
@@ -1230,6 +1259,12 @@ def cliente_ativo(chat_id):
 
 def get_topic_id(chat_id):
     if chat_id == GRUPO_ID: return TOPIC_ID
+    if chat_id and chat_id > 0: return 0   # conversa privada não tem tópico
+    ok, v = _cache_get("topic", chat_id)
+    if ok: return v
+    return _cache_put("topic", chat_id, _get_topic_id_db(chat_id))
+
+def _get_topic_id_db(chat_id):
     try:
         c = db(); cur = c.cursor()
         cur.execute("SELECT topic_id FROM clientes WHERE chat_id=%s", (chat_id,))
@@ -1246,6 +1281,7 @@ def listar_clientes():
     except: return []
 
 def renovar_cliente(chat_id):
+    limpar_cache_cliente(chat_id)
     try:
         c = db(); cur = c.cursor()
         cur.execute("SELECT validade FROM clientes WHERE chat_id=%s", (chat_id,))
@@ -1261,6 +1297,7 @@ def renovar_cliente(chat_id):
         logging.error(e); return None
 
 def revogar_cliente(chat_id):
+    limpar_cache_cliente(chat_id)
     try:
         c = db(); cur = c.cursor()
         cur.execute("UPDATE clientes SET ativo=FALSE WHERE chat_id=%s", (chat_id,))
@@ -1271,6 +1308,11 @@ def revogar_cliente(chat_id):
 def get_modo(chat_id):
     """Retorna o modo do cliente: 'completo' (padrão) ou 'simples'."""
     if chat_id == GRUPO_ID: return "completo"
+    ok, v = _cache_get("modo", chat_id)
+    if ok: return v
+    return _cache_put("modo", chat_id, _get_modo_db(chat_id))
+
+def _get_modo_db(chat_id):
     try:
         c = db(); cur = c.cursor()
         cur.execute("SELECT modo FROM clientes WHERE chat_id=%s", (chat_id,))
@@ -1280,6 +1322,7 @@ def get_modo(chat_id):
 
 def set_modo(chat_id, modo):
     """Define modo 'completo' ou 'simples' para um cliente."""
+    limpar_cache_cliente(chat_id)
     try:
         c = db(); cur = c.cursor()
         cur.execute("UPDATE clientes SET modo=%s WHERE chat_id=%s", (modo, chat_id))
@@ -1291,6 +1334,11 @@ def set_modo(chat_id, modo):
 def get_site_url(chat_id):
     """Retorna o site_url personalizado do cliente, ou o SITE_URL padrão."""
     if chat_id == GRUPO_ID: return SITE_URL
+    ok, v = _cache_get("site", chat_id)
+    if ok: return v
+    return _cache_put("site", chat_id, _get_site_url_db(chat_id))
+
+def _get_site_url_db(chat_id):
     try:
         c = db(); cur = c.cursor()
         cur.execute("SELECT site_url FROM clientes WHERE chat_id=%s", (chat_id,))
@@ -1299,6 +1347,7 @@ def get_site_url(chat_id):
     except: return SITE_URL
 
 def set_site_url(chat_id, url):
+    limpar_cache_cliente(chat_id)
     try:
         c = db(); cur = c.cursor()
         cur.execute("UPDATE clientes SET site_url=%s WHERE chat_id=%s", (url or None, chat_id))
@@ -1336,6 +1385,7 @@ def marcar_aviso_3d(chat_id):
     except: pass
 
 def marcar_vencido(chat_id):
+    limpar_cache_cliente(chat_id)
     try:
         c = db(); cur = c.cursor()
         cur.execute("UPDATE clientes SET ativo=FALSE, aviso_venc=TRUE WHERE chat_id=%s", (chat_id,))
@@ -1352,6 +1402,13 @@ def tmdb(endpoint, params=None):
         except Exception as e:
             logging.warning(e); time.sleep(1)
     return None
+
+async def atmdb(endpoint, params=None):
+    """tmdb() fora do event loop (requests é bloqueante)."""
+    return await asyncio.to_thread(tmdb, endpoint, params)
+
+async def atmdb_details(item_id, is_tv=False):
+    return await asyncio.to_thread(tmdb_details, item_id, is_tv)
 
 def tmdb_details(item_id, is_tv=False):
     tipo = "tv" if is_tv else "movie"
@@ -1643,7 +1700,7 @@ def registrar_erro_chat(chat_id, e, contexto="Envio"):
 async def enviar(context, chat_id, text=None, photo=None, caption=None, markup=None, parse_mode="HTML"):
     if chat_morto(chat_id):
         return None
-    topic = 0 if chat_id in _topicos_ruins else get_topic_id(chat_id)
+    topic = 0 if (chat_id in _topicos_ruins or (chat_id and chat_id > 0)) else await asyncio.to_thread(get_topic_id, chat_id)
     kw = {"parse_mode": parse_mode}
     if topic:  kw["message_thread_id"] = topic
     if markup: kw["reply_markup"] = markup
@@ -1652,6 +1709,10 @@ async def enviar(context, chat_id, text=None, photo=None, caption=None, markup=N
         elif text: return await context.bot.send_message(chat_id, text, **kw)
     except Exception as e:
         if registrar_erro_chat(chat_id, e):
+            return None
+        if photo and not erro_thread(e):
+            # foto por URL que o Telegram não baixou ou demorou demais: quem chamou decide (texto)
+            logging.warning(f"Envio foto {chat_id}: {type(e).__name__}: {e}")
             return None
         if "message_thread_id" in kw and erro_thread(e):
             if chat_id not in _topicos_ruins:
@@ -1691,24 +1752,41 @@ def markup_card(assist_url, baixar_url, trailer_url=None, modo="completo"):
         [InlineKeyboardButton("📲 Baixar app", url=baixar_url)],
     ])
 
-async def send_item(context, chat_id, item, is_tv=False, tipo="movie", categoria=None):
-    if not item: return
+def _preparar_card(chat_id, item, is_tv=False, categoria=None):
+    """Parte bloqueante do card (TMDB + banco), roda numa thread."""
     iid     = item.get("id")
-    details = tmdb_details(iid, is_tv=is_tv) or item
+    details = item if (item.get("videos") is not None and item.get("genres") is not None) else None
+    details = details or tmdb_details(iid, is_tv=is_tv) or item
     title   = details.get("name") if is_tv else details.get("title","?")
     caption = build_caption(details, is_tv=is_tv, categoria=categoria)
     modo     = get_modo(chat_id)
     site     = get_site_url(chat_id)
     url_trl = get_trailer_url(iid, title, is_tv=is_tv, details=details)
     tem_trailer = "youtu.be/" in url_trl or "youtube.com/watch" in url_trl
-
     assist_url = link_streamflix(iid, is_tv=is_tv, site=site)
     baixar_url = link_app_download() if "streamflixvip.online" in ensure_https(site) else ensure_https(site)
     keyboard = markup_card(assist_url, baixar_url, url_trl if tem_trailer else None, modo=modo)
     foto = url_imagem(details, item)
+    return iid, caption, keyboard, foto, url_trl, tem_trailer
+
+async def send_item(context, chat_id, item, is_tv=False, tipo="movie", categoria=None):
+    """Card completo. Pedidos do usuário nunca são filtrados por 'já enviado'."""
+    if not item: return None
     try:
-        if foto: await enviar(context, chat_id, photo=foto, caption=caption, markup=keyboard)
-        else:    await enviar(context, chat_id, text=caption, markup=keyboard)
+        iid, caption, keyboard, foto, url_trl, tem_trailer = await asyncio.to_thread(
+            _preparar_card, chat_id, item, is_tv, categoria)
+    except Exception as e:
+        logging.error(f"Card {item.get('id')}: {type(e).__name__}: {e}")
+        return None
+    try:
+        if foto:
+            r = await enviar(context, chat_id, photo=foto, caption=caption, markup=keyboard)
+            if r is None and not chat_morto(chat_id):
+                # Telegram não conseguiu baixar/mandar o pôster: manda o card em texto
+                logging.warning(f"Card {iid}: pôster falhou em {chat_id}; enviando em texto")
+                r = await enviar(context, chat_id, text=caption, markup=keyboard)
+        else:
+            r = await enviar(context, chat_id, text=caption, markup=keyboard)
         if tem_trailer and SEND_TRAILER_MESSAGE:
             trl_kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton("▶️ Ver Trailer no YouTube", url=url_trl)
@@ -1716,12 +1794,17 @@ async def send_item(context, chat_id, item, is_tv=False, tipo="movie", categoria
             await enviar(context, chat_id,
                          text="\U0001f3ac <b>Confira o Trailer:</b>\n" + url_trl,
                          markup=trl_kb)
-        marcar_enviado(chat_id, iid, "tv" if is_tv else tipo or "movie")
-    except Exception as e: logging.error(e)
+        if r is not None and not (chat_id and chat_id > 0):
+            # histórico só para grupos/canais (evita repetir nos posts agendados)
+            await asyncio.to_thread(marcar_enviado, chat_id, iid, "tv" if is_tv else tipo or "movie")
+        return r
+    except Exception as e:
+        logging.error(f"Card {iid}: {type(e).__name__}: {e}")
+        return None
 
 async def enviar_lista(context, chat_id, itens, is_tv=False, tipo="movie", limite=3, categoria=None, permitir_repetir=True):
     """Mantido para fluxos que ainda enviam cards seguidos (jobs usam send_item direto)."""
-    itens = filtrar(chat_id, itens, tipo, permitir_repetir=permitir_repetir)
+    itens = await asyncio.to_thread(filtrar, chat_id, itens, tipo, permitir_repetir)
     if permitir_repetir:
         random.shuffle(itens)
     for item in itens[:limite]:
@@ -1775,6 +1858,18 @@ def rate_ok(user_id, bucket, seconds):
         return False
     _rate_bucket[key] = now
     return True
+
+def rate_espera(user_id, bucket, seconds):
+    """0 se pode; senão quantos segundos faltam (e não consome)."""
+    if not seconds or seconds <= 0 or not user_id:
+        return 0
+    now = time.time()
+    last = _rate_bucket.get((user_id, bucket), 0)
+    falta = seconds - (now - last)
+    if falta > 0:
+        return max(1, int(falta + 0.999))
+    _rate_bucket[(user_id, bucket)] = now
+    return 0
 
 async def avisar_aguarde(update: Update, seconds=None):
     msg = update.effective_message
@@ -1865,7 +1960,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("🌐 Site", url=ensure_https(SITE_URL))],
             ]))
     elif payload.lower() in ("lancamentos", "lançamentos", "cartaz"):
-        d = tmdb("movie/now_playing", {"region": "BR"})
+        d = await atmdb("movie/now_playing", {"region": "BR"})
         if d and d.get("results"):
             await enviar_vitrine(context, cid, d.get("results", []),
                                  categoria="🎬 LANÇAMENTO", titulo="🎬 Em cartaz agora")
@@ -2185,7 +2280,7 @@ async def job_verificar_vencimentos(context: ContextTypes.DEFAULT_TYPE):
 
 async def job_diario_todos(context: ContextTypes.DEFAULT_TYPE, turno="manha"):
     """Posta conteúdo para TODOS os clientes ativos, com tema e cards novos."""
-    chats = chats_destinatarios()
+    chats = await asyncio.to_thread(chats_destinatarios)
     for cid in chats:
         try:
             if turno == "manha":
@@ -2247,18 +2342,18 @@ def _pick_novos(chat_id, itens, is_tv, qtd=2):
 async def postar_manha(context, cid):
     header = MANHA_HEADER or "🌅 Bom dia! Lançamentos de hoje 👇"
     await enviar(context, cid, text=f"<b>{html.escape(header)}</b>")
-    filmes = ((tmdb("movie/now_playing", {"region": "BR"}) or {}).get("results") or [])
+    filmes = ((await atmdb("movie/now_playing", {"region": "BR"}) or {}).get("results") or [])
     escolhidos = []
     if MANHA_INCLUIR_SERIE:
-        series = ((tmdb("tv/on_the_air") or {}).get("results") or [])
-        fm = _pick_novos(cid, filmes, False, 1)
-        sr = _pick_novos(cid, series, True, 1)
+        series = ((await atmdb("tv/on_the_air") or {}).get("results") or [])
+        fm = await asyncio.to_thread(_pick_novos, cid, filmes, False, 1)
+        sr = await asyncio.to_thread(_pick_novos, cid, series, True, 1)
         if fm:
             escolhidos.append((fm[0], False, "🎬 LANÇAMENTO"))
         if sr:
             escolhidos.append((sr[0], True, "📺 SÉRIE"))
     if len(escolhidos) < 2:
-        extra = _pick_novos(cid, filmes, False, 2)
+        extra = await asyncio.to_thread(_pick_novos, cid, filmes, False, 2)
         for item in extra:
             if all(item.get("id") != e[0].get("id") for e in escolhidos):
                 escolhidos.append((item, False, "🎬 LANÇAMENTO"))
@@ -2288,19 +2383,19 @@ async def postar_noite(context, cid):
         elif tema.get("genres"):
             params["with_genres"] = tema["genres"]
         endpoint = "discover/tv" if is_tv else "discover/movie"
-        itens = ((tmdb(endpoint, params) or {}).get("results") or [])
-        escolhidos = _pick_novos(cid, itens, is_tv, 2)
+        itens = ((await atmdb(endpoint, params) or {}).get("results") or [])
+        escolhidos = await asyncio.to_thread(_pick_novos, cid, itens, is_tv, 2)
         cat = tema["cat"]
         for item in escolhidos:
             await send_item(context, cid, item, is_tv=is_tv, tipo="tv" if is_tv else "movie", categoria=cat)
         if escolhidos:
             return
     # Fallback: populares / top, gêneros variados
-    d = tmdb("movie/popular", {"region": "BR", "page": random.randint(1, 3)}) or {}
-    escolhidos = _pick_novos(cid, d.get("results") or [], False, 2)
+    d = await atmdb("movie/popular", {"region": "BR", "page": random.randint(1, 3)}) or {}
+    escolhidos = await asyncio.to_thread(_pick_novos, cid, d.get("results") or [], False, 2)
     if len(escolhidos) < 2:
-        d2 = tmdb("movie/top_rated", {"page": random.randint(1, 5)}) or {}
-        for item in _pick_novos(cid, d2.get("results") or [], False, 2):
+        d2 = await atmdb("movie/top_rated", {"page": random.randint(1, 5)}) or {}
+        for item in await asyncio.to_thread(_pick_novos, cid, d2.get("results") or [], False, 2):
             if all(item.get("id") != e.get("id") for e in escolhidos):
                 escolhidos.append(item)
             if len(escolhidos) >= 2:
@@ -2499,7 +2594,7 @@ async def _apagar_mensagem(context):
 async def enviar_boas_vindas(context, chat_id, users):
     if not WELCOME_ENABLED or not users:
         return
-    if chat_id not in chats_boas_vindas():
+    if chat_id not in await asyncio.to_thread(chats_boas_vindas):
         return
     now = time.time()
     last = _welcome_last.get(chat_id, 0)
@@ -2555,7 +2650,7 @@ async def job_app_promo(context: ContextTypes.DEFAULT_TYPE):
     if not APP_PROMO_ENABLED:
         return
     texto = texto_promo_app()
-    destinos = chats_destinatarios() if APP_PROMO_INCLUDE_CLIENTS else [c for c in (GRUPO_ID, CANAL_VIP) if c]
+    destinos = await asyncio.to_thread(chats_destinatarios) if APP_PROMO_INCLUDE_CLIENTS else [c for c in (GRUPO_ID, CANAL_VIP) if c]
     for cid in destinos:
         try:
             await enviar(context, cid, text=texto, markup=markup_cta_app())
@@ -2565,7 +2660,7 @@ async def job_app_promo(context: ContextTypes.DEFAULT_TYPE):
 async def job_enquete_semanal(context: ContextTypes.DEFAULT_TYPE):
     if not POLL_ENABLED:
         return
-    d = tmdb("trending/all/week") or {}
+    d = await atmdb("trending/all/week") or {}
     itens = list(d.get("results") or [])
     filmes = [i for i in itens if i.get("media_type") in ("movie", None) and i.get("title")]
     if len(filmes) < 2:
@@ -2591,7 +2686,7 @@ async def job_enquete_semanal(context: ContextTypes.DEFAULT_TYPE):
         f"🌐 {html.escape(ensure_https(SITE_URL))}\n"
         f"{texto_indique()}"
     )
-    destinos = chats_destinatarios() if POLL_INCLUDE_CLIENTS else [c for c in (GRUPO_ID, CANAL_VIP) if c]
+    destinos = await asyncio.to_thread(chats_destinatarios) if POLL_INCLUDE_CLIENTS else [c for c in (GRUPO_ID, CANAL_VIP) if c]
     for cid in destinos:
         if chat_morto(cid):
             continue
@@ -2737,7 +2832,7 @@ def texto_vitrine(titulo, fatia, primeiro_num, is_tv=False, total=None, rodape=N
 
 async def enviar_vitrine(context, chat_id, itens, is_tv=False, categoria=None,
                          titulo="🎬 Títulos", page=0, lista_id=None, destacar=True,
-                         por_pagina=6, dedupe=True, avisar_vazio=True):
+                         por_pagina=6, dedupe=False, avisar_vazio=True):
     """Lista organizada: (opcional) card completo do nº 1 + lista numerada com botões
     que abrem o mesmo card da busca individual, com paginação Mais ▶️."""
     if not lista_id:
@@ -2749,8 +2844,10 @@ async def enviar_vitrine(context, chat_id, itens, is_tv=False, categoria=None,
             return
         if dedupe:
             tipo = "tv" if is_tv else "movie"
-            novos = filtrar(chat_id, itens, tipo, permitir_repetir=False)
+            novos = await asyncio.to_thread(filtrar, chat_id, itens, tipo, False)
             itens = novos or itens
+        if not _GENEROS_TMDB:
+            await asyncio.to_thread(nomes_generos, [28])   # aquece o cache fora do loop
         lista_id = _vitrine_guardar(itens, is_tv, categoria, titulo)
         _vitrines[lista_id]["por_pagina"] = max(1, min(int(por_pagina or 6), 10))
         _vitrines[lista_id]["destacar"] = bool(destacar)
@@ -3159,9 +3256,10 @@ async def _entregar_ia(update, context, pergunta):
                 "Exemplo: <code>/ia um filme de comédia para hoje</code>",
                 parse_mode="HTML")
         return
-    if not rate_ok(uid, "ia", AI_RATE_SECONDS):
+    espera = rate_espera(uid, "ia", AI_RATE_SECONDS)
+    if espera:
         if msg:
-            await msg.reply_text("⏳ Aguarde uns segundos antes de perguntar de novo.")
+            await msg.reply_text(f"⏳ Aguarde {espera}s para perguntar de novo.")
         return
     if not ai_quota_ok(uid):
         if msg:
@@ -3205,27 +3303,27 @@ async def avisar_tmdb_vazio(context, cid):
 
 async def executar_menu(context, cid, text):
     if text == "🎥 Em Cartaz":
-        d = tmdb("movie/now_playing", {"region":"BR"})
+        d = await atmdb("movie/now_playing", {"region":"BR"})
         await enviar_vitrine(context, cid, (d or {}).get("results") or [],
                              categoria="🎬 LANÇAMENTO", titulo="🎬 Em cartaz agora")
 
     elif text == "🚀 Em Breve":
-        d = tmdb("movie/upcoming", {"region":"BR"})
+        d = await atmdb("movie/upcoming", {"region":"BR"})
         await enviar_vitrine(context, cid, (d or {}).get("results") or [],
                              categoria="🎬 LANÇAMENTO", titulo="🚀 Em breve")
 
     elif text == "🌟 Populares":
-        d = tmdb("movie/popular", {"region":"BR","page":random.randint(1,5)})
+        d = await atmdb("movie/popular", {"region":"BR","page":random.randint(1,5)})
         await enviar_vitrine(context, cid, (d or {}).get("results") or [],
                              categoria="🎬 FILME", titulo="🌟 Populares")
 
     elif text == "📺 Séries":
-        d = tmdb("tv/popular", {"page":random.randint(1,5)})
+        d = await atmdb("tv/popular", {"page":random.randint(1,5)})
         await enviar_vitrine(context, cid, (d or {}).get("results") or [], is_tv=True,
                              categoria="📺 SÉRIE", titulo="📺 Séries em alta")
 
     elif text == "🔥 Em Alta":
-        d = tmdb("trending/all/week")
+        d = await atmdb("trending/all/week")
         await enviar_vitrine(context, cid, (d or {}).get("results") or [],
                              titulo="🔥 Em alta nesta semana")
 
@@ -3238,9 +3336,9 @@ async def executar_menu(context, cid, text):
         await enviar(context, cid, text="⏳ <b>Escolha uma época:</b>", markup=teclado_em_linhas(btns, 2))
 
     elif text == "🎲 Sugestão":
-        d = tmdb("movie/top_rated", {"page":random.randint(1,20)})
+        d = await atmdb("movie/top_rated", {"page":random.randint(1,20)})
         itens = (d or {}).get("results") or []
-        novos = filtrar(cid, itens, "movie", permitir_repetir=False) or itens
+        novos = await asyncio.to_thread(filtrar, cid, itens, "movie", False) or itens
         if not novos:
             await avisar_tmdb_vazio(context, cid)
             return
@@ -3632,7 +3730,7 @@ async def callback_start(update, context, acao):
     if acao == "lancamentos":
         if not rate_ok(user.id if user else 0, "menu", COMMAND_RATE_SECONDS):
             return
-        d = tmdb("movie/now_playing", {"region": "BR"})
+        d = await atmdb("movie/now_playing", {"region": "BR"})
         if d and d.get("results"):
             await enviar_vitrine(context, cid, d.get("results", []),
                                  categoria="🎬 LANÇAMENTO", titulo="🎬 Em cartaz agora")
@@ -3651,6 +3749,15 @@ async def callback_start(update, context, acao):
         await q.message.reply_text(
             texto_start_app(nome), parse_mode="HTML", reply_markup=markup_start_privado())
 
+async def responder_cb(q, *args, **kwargs):
+    """Responde o callback sem deixar um erro (ex.: 'query is too old') parar o handler."""
+    try:
+        await q.answer(*args, **kwargs)
+    except Exception as e:
+        logging.info(f"callback answer: {type(e).__name__}")
+
+CARD_RATE_SECONDS = env_int("CARD_RATE_SECONDS", 3)   # abrir card pela lista, no privado
+
 async def callback_handler(update, context):
     q = update.callback_query
     if not q:
@@ -3662,7 +3769,7 @@ async def callback_handler(update, context):
     uid = user.id if user else 0
 
     if data.startswith("start:"):
-        await q.answer()
+        await responder_cb(q)
         if chat and chat.type != "private":
             return
         await callback_start(update, context, data.split(":", 1)[1])
@@ -3671,23 +3778,24 @@ async def callback_handler(update, context):
     if data.startswith("pick:") or data.startswith("ver:"):
         partes = data.split(":")
         if len(partes) != 3:
-            await q.answer()
+            await responder_cb(q)
             return
         _, kind, sid = partes
         if not (acesso_conteudo(cid) or (chat and chat.type == "private" and PUBLIC_SEARCH)):
-            await q.answer("Abra o bot no privado para ver este título.", show_alert=True)
+            await responder_cb(q, "Abra o bot no privado para ver este título.", show_alert=True)
             return
-        segundos = GROUP_SEARCH_RATE_SECONDS if (chat and chat.type in ("group", "supergroup")) else COMMAND_RATE_SECONDS
-        if not rate_ok(uid, "search", segundos):
-            await q.answer("Aguarde uns segundos…", show_alert=False)
+        segundos = GROUP_SEARCH_RATE_SECONDS if (chat and chat.type in ("group", "supergroup")) else CARD_RATE_SECONDS
+        espera = rate_espera(uid, "card", segundos)
+        if espera:
+            await responder_cb(q, f"⏳ Aguarde {espera}s…", show_alert=False)
             return
-        await q.answer()
+        await responder_cb(q, "Abrindo…")
         try:
             iid = int(sid)
         except ValueError:
             return
         is_tv = kind == "tv"
-        details = tmdb_details(iid, is_tv=is_tv)
+        details = await atmdb_details(iid, is_tv=is_tv)
         if not details:
             await enviar(context, cid, text="😕 Não consegui abrir este título agora.")
             return
@@ -3698,13 +3806,13 @@ async def callback_handler(update, context):
     if data.startswith("pg:"):
         partes = data.split(":")
         if len(partes) != 3:
-            await q.answer()
+            await responder_cb(q)
             return
         _, lid, spage = partes
         if not (acesso_conteudo(cid) or (chat and chat.type == "private" and PUBLIC_SEARCH)):
-            await q.answer("Abra o bot no privado para ver isto.", show_alert=True)
+            await responder_cb(q, "Abra o bot no privado para ver isto.", show_alert=True)
             return
-        await q.answer()
+        await responder_cb(q)
         try:
             page = int(spage)
         except ValueError:
@@ -3714,26 +3822,26 @@ async def callback_handler(update, context):
 
     if data == "sugestao":
         if not (acesso_conteudo(cid) or (chat and chat.type == "private" and PUBLIC_SEARCH)):
-            await q.answer("Abra o bot no privado.", show_alert=True)
+            await responder_cb(q, "Abra o bot no privado.", show_alert=True)
             return
         if not rate_ok(uid, "menu", COMMAND_RATE_SECONDS):
-            await q.answer("Aguarde uns segundos…")
+            await responder_cb(q, "Aguarde uns segundos…")
             return
-        await q.answer()
+        await responder_cb(q)
         await executar_menu(context, cid, "🎲 Sugestão")
         return
 
     # Gênero / época
     if not (acesso_conteudo(cid) or (chat and chat.type == "private" and PUBLIC_SEARCH)):
-        await q.answer("Abra o bot no privado para usar este menu.", show_alert=True)
+        await responder_cb(q, "Abra o bot no privado para usar este menu.", show_alert=True)
         return
-    await q.answer()
+    await responder_cb(q)
     if not rate_ok(uid, "menu", COMMAND_RATE_SECONDS):
         return
 
     if data.startswith("gen_"):
         gid = data.split("_", 1)[1]
-        d = tmdb("discover/movie", {"with_genres":gid,"sort_by":"popularity.desc","page":random.randint(1,5)})
+        d = await atmdb("discover/movie", {"with_genres":gid,"sort_by":"popularity.desc","page":random.randint(1,5)})
         nome = next((n for n,i in GENEROS.items() if str(i)==str(gid)), "Gênero")
         await enviar_vitrine(context, cid, (d or {}).get("results") or [],
                              categoria="🎬 FILME", titulo=f"✨ {nome}")
@@ -3744,7 +3852,7 @@ async def callback_handler(update, context):
             return
         inicio, fim = EPOCAS[era]
         ano = random.randint(inicio, fim)
-        d = tmdb("discover/movie", {"primary_release_year":ano,"sort_by":"popularity.desc","page":1})
+        d = await atmdb("discover/movie", {"primary_release_year":ano,"sort_by":"popularity.desc","page":1})
         await enviar_vitrine(context, cid, (d or {}).get("results") or [],
                              categoria="🎬 FILME", titulo=f"🎞️ Destaques de {ano}")
 
@@ -3769,7 +3877,7 @@ async def cmd_filme(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Use: /filme Nome do Filme"); return
     cid = update.effective_chat.id
     q   = " ".join(context.args)
-    d   = tmdb("search/movie", {"query": q})
+    d   = await atmdb("search/movie", {"query": q})
     res = d.get("results",[]) if d else []
     await enviar_escolhas(context, cid, res, is_tv=False, query=q)
 
@@ -3780,7 +3888,7 @@ async def cmd_serie(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Use: /serie Nome da Série"); return
     cid = update.effective_chat.id
     q   = " ".join(context.args)
-    d   = tmdb("search/tv", {"query": q})
+    d   = await atmdb("search/tv", {"query": q})
     res = d.get("results",[]) if d else []
     await enviar_escolhas(context, cid, res, is_tv=True, query=q)
 
@@ -3791,12 +3899,12 @@ async def cmd_ator(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Use: /ator Nome do Ator"); return
     cid = update.effective_chat.id
     q   = " ".join(context.args)
-    d   = tmdb("search/person", {"query": q})
+    d   = await atmdb("search/person", {"query": q})
     pessoas = d.get("results",[]) if d else []
     if not pessoas:
         await enviar(context, cid, text=f"😕 Ator não encontrado: <b>{html.escape(q)}</b>"); return
     pessoa   = pessoas[0]; nome = pessoa.get("name",""); pid = pessoa.get("id")
-    filmes_d = tmdb(f"person/{pid}/movie_credits")
+    filmes_d = await atmdb(f"person/{pid}/movie_credits")
     filmes   = sorted(filmes_d.get("cast",[]) if filmes_d else [], key=lambda x: x.get("popularity",0), reverse=True)
     if not filmes:
         await enviar(context, cid, text=f"😕 Nenhum filme encontrado para <b>{html.escape(nome)}</b>"); return
@@ -3809,7 +3917,7 @@ async def cmd_top10(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _guard_busca(update, context):
         return
     cid = update.effective_chat.id
-    d   = tmdb("trending/all/week")
+    d   = await atmdb("trending/all/week")
     if not d or not d.get("results"):
         await enviar(context, cid, text="😕 Não foi possível buscar o Top 10."); return
     await enviar_vitrine(context, cid, d["results"][:10], titulo="🏆 Top 10 da semana",
@@ -4036,6 +4144,10 @@ async def post_init(application):
             await limpar_teclado_grupos(application.bot)
         except Exception as e:
             logging.warning(f"Não foi possível limpar o teclado dos grupos: {e}")
+    try:
+        await asyncio.to_thread(nomes_generos, [28])
+    except Exception:
+        pass
     if SET_BOT_PROFILE:
         try:
             await configurar_perfil(application.bot)
@@ -4058,7 +4170,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rate_ok(uid, "inline", 2):
         await iq.answer([], cache_time=1, is_personal=True)
         return
-    d = tmdb("search/multi", {"query": q}) or {}
+    d = await atmdb("search/multi", {"query": q}) or {}
     resultados = []
     for item in d.get("results") or []:
         media = item.get("media_type")
@@ -4112,44 +4224,76 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
+CONCURRENT_UPDATES = env_int("CONCURRENT_UPDATES", 16)   # um usuário lento não trava os outros
+HANDLER_SLOW_MS    = env_int("HANDLER_SLOW_MS", 3000)
+
+def cronometrado(fn):
+    """Loga nome do handler + tempo (sem conteúdo de mensagem nem tokens)."""
+    import functools
+    nome = getattr(fn, "__name__", "handler")
+    @functools.wraps(fn)
+    async def _wrap(update, context):
+        t0 = time.monotonic()
+        erro = None
+        try:
+            return await fn(update, context)
+        except Exception as e:
+            erro = e
+            raise
+        finally:
+            ms = int((time.monotonic() - t0) * 1000)
+            chat = getattr(update, "effective_chat", None)
+            tipo = getattr(chat, "type", "-") if chat else "-"
+            txt = f"⏱ {nome} {ms} ms ({tipo})" + (f" erro={type(erro).__name__}" if erro else "")
+            (logging.warning if ms >= HANDLER_SLOW_MS or erro else logging.info)(txt)
+    return _wrap
+
 def main():
     setup_db()
     iniciar_health_uma_vez()
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    # Timeouts maiores: foto por URL faz o Telegram baixar o pôster do TMDB e pode
+    # passar dos 5 s padrão do PTB ("Timed out"). Pool maior para updates em paralelo.
+    req = HTTPXRequest(connection_pool_size=16, connect_timeout=15.0, read_timeout=45.0,
+                       write_timeout=45.0, pool_timeout=15.0)
+    req_updates = HTTPXRequest(connection_pool_size=2, connect_timeout=15.0, read_timeout=45.0,
+                               write_timeout=15.0, pool_timeout=15.0)
+    app = (Application.builder().token(TOKEN).post_init(post_init)
+           .request(req).get_updates_request(req_updates)
+           .concurrent_updates(CONCURRENT_UPDATES).build())
 
     # Comandos de cliente
-    app.add_handler(CommandHandler("start",    cmd_start))
-    app.add_handler(CommandHandler("ativar",   cmd_ativar))
-    app.add_handler(CommandHandler("meuplano", cmd_meuplan))
-    app.add_handler(CommandHandler("ajuda",    cmd_ajuda))
-    app.add_handler(CommandHandler("help",     cmd_ajuda))
-    app.add_handler(CommandHandler("filme",    cmd_filme))
-    app.add_handler(CommandHandler("serie",    cmd_serie))
-    app.add_handler(CommandHandler("ator",     cmd_ator))
-    app.add_handler(CommandHandler("top10",    cmd_top10))
-    app.add_handler(CommandHandler("indique",  cmd_indique))
-    app.add_handler(CommandHandler("comandos", cmd_comandos))
-    app.add_handler(CommandHandler("tutorial", cmd_comandos))
-    app.add_handler(CommandHandler("ia",       cmd_ia))
+    app.add_handler(CommandHandler("start", cronometrado(cmd_start)))
+    app.add_handler(CommandHandler("ativar", cronometrado(cmd_ativar)))
+    app.add_handler(CommandHandler("meuplano", cronometrado(cmd_meuplan)))
+    app.add_handler(CommandHandler("ajuda", cronometrado(cmd_ajuda)))
+    app.add_handler(CommandHandler("help", cronometrado(cmd_ajuda)))
+    app.add_handler(CommandHandler("filme", cronometrado(cmd_filme)))
+    app.add_handler(CommandHandler("serie", cronometrado(cmd_serie)))
+    app.add_handler(CommandHandler("ator", cronometrado(cmd_ator)))
+    app.add_handler(CommandHandler("top10", cronometrado(cmd_top10)))
+    app.add_handler(CommandHandler("indique", cronometrado(cmd_indique)))
+    app.add_handler(CommandHandler("comandos", cronometrado(cmd_comandos)))
+    app.add_handler(CommandHandler("tutorial", cronometrado(cmd_comandos)))
+    app.add_handler(CommandHandler("ia", cronometrado(cmd_ia)))
 
     # Painel admin (só você usa — protegido por ADMIN_ID)
-    app.add_handler(CommandHandler("gerar",    cmd_gerar))
-    app.add_handler(CommandHandler("clientes", cmd_clientes))
-    app.add_handler(CommandHandler("renovar",  cmd_renovar))
-    app.add_handler(CommandHandler("revogar",  cmd_revogar))
-    app.add_handler(CommandHandler("stats",    cmd_stats))
-    app.add_handler(CommandHandler("config",   cmd_config))
+    app.add_handler(CommandHandler("gerar", cronometrado(cmd_gerar)))
+    app.add_handler(CommandHandler("clientes", cronometrado(cmd_clientes)))
+    app.add_handler(CommandHandler("renovar", cronometrado(cmd_renovar)))
+    app.add_handler(CommandHandler("revogar", cronometrado(cmd_revogar)))
+    app.add_handler(CommandHandler("stats", cronometrado(cmd_stats)))
+    app.add_handler(CommandHandler("config", cronometrado(cmd_config)))
 
     # Créditos
-    app.add_handler(CommandHandler("credito", cmd_credito))
-    app.add_handler(CallbackQueryHandler(callback_credito, pattern="^(pix:|pix_custom|check:|resgatar:|confirmar:|cancelar|voltar_credito)"))
+    app.add_handler(CommandHandler("credito", cronometrado(cmd_credito)))
+    app.add_handler(CallbackQueryHandler(cronometrado(callback_credito), pattern="^(pix:|pix_custom|check:|resgatar:|confirmar:|cancelar|voltar_credito)"))
     # Texto, callbacks e modo inline
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(InlineQueryHandler(inline_query))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cronometrado(handle_text)))
+    app.add_handler(CallbackQueryHandler(cronometrado(callback_handler)))
+    app.add_handler(InlineQueryHandler(cronometrado(inline_query)))
     # Boas-vindas (serviço + chat_member; rate-limit evita flood)
-    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_chat_members))
-    app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, cronometrado(on_new_chat_members)))
+    app.add_handler(ChatMemberHandler(cronometrado(on_chat_member), ChatMemberHandler.CHAT_MEMBER))
 
     # Jobs automáticos
     jq = app.job_queue

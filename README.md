@@ -103,6 +103,9 @@ Para desligar um recurso: `WELCOME_ENABLED=0`, `APP_PROMO_ENABLED=0`, `POLL_ENAB
 | `POLL_INCLUDE_CLIENTS` | `0` | Se `1`, a enquete semanal também vai para clientes SaaS |
 | `COMMAND_RATE_SECONDS` | `8` | Intervalo mínimo entre buscas no privado. `0` desliga |
 | `GROUP_SEARCH_RATE_SECONDS` | `30` | Intervalo mínimo entre buscas no mesmo usuário, nos grupos |
+| `CARD_RATE_SECONDS` | `3` | Intervalo mínimo para abrir cards pela lista, no privado |
+| `CONCURRENT_UPDATES` | `16` | Updates processados em paralelo (um usuário lento não trava os outros) |
+| `HANDLER_SLOW_MS` | `3000` | Acima disso o tempo do handler vira WARNING no log |
 | `TEXT_SEARCH` | `1` | Buscar digitando só o nome do filme/série (sem /filme) |
 | `GROUP_TEXT_SEARCH` | `1` | Também no grupo (só textos curtos com cara de título; sem resultado = silêncio) |
 | `GROUP_TEXT_SEARCH_USER_SECONDS` | `60` | Intervalo mínimo por pessoa na busca por texto no grupo |

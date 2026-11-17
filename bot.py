@@ -3169,6 +3169,32 @@ async def configurar_perfil(bot):
     if desc:
         await bot.set_my_description(desc[:512])
 
+async def limpar_teclado_grupos(bot):
+    """Remove o teclado fixo antigo dos grupos (a mensagem some sozinha em seguida)."""
+    for cid in chats_destinatarios():
+        try:
+            chat = await bot.get_chat(cid)
+            if chat.type not in ("group", "supergroup"):
+                continue
+            kw = {}
+            try:
+                m = await bot.send_message(cid, "✅ Bot atualizado! Use o menu / ou /comandos.",
+                                           reply_markup=ReplyKeyboardRemove(), disable_notification=True)
+            except Exception:
+                if not TOPIC_ID:
+                    raise
+                m = await bot.send_message(cid, "✅ Bot atualizado! Use o menu / ou /comandos.",
+                                           reply_markup=ReplyKeyboardRemove(), disable_notification=True,
+                                           message_thread_id=TOPIC_ID)
+            await asyncio.sleep(5)
+            try:
+                await bot.delete_message(cid, m.message_id)
+            except Exception:
+                pass
+            logging.info(f"Teclado removido no chat {cid}")
+        except Exception as e:
+            logging.warning(f"Limpar teclado falhou em {cid}: {e}")
+
 async def post_init(application):
     try:
         global _bot_username
@@ -3181,6 +3207,11 @@ async def post_init(application):
         logging.info("Menu de comandos atualizado (pt-BR).")
     except Exception as e:
         logging.warning(f"Não foi possível configurar o menu de comandos: {e}")
+    if os.environ.get("CLEAR_GROUP_KEYBOARD", "1") == "1":
+        try:
+            await limpar_teclado_grupos(application.bot)
+        except Exception as e:
+            logging.warning(f"Não foi possível limpar o teclado dos grupos: {e}")
     if SET_BOT_PROFILE:
         try:
             await configurar_perfil(application.bot)

@@ -79,6 +79,9 @@ EPOCAS = {
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# Não logar URLs da API do Telegram (contêm o token)
+for _n in ("httpx", "httpcore", "telegram.request"):
+    logging.getLogger(_n).setLevel(logging.WARNING)
 
 # ── Servidor HTTP (healthcheck + API do painel) ────────────────────────────
 PANEL_PASS = os.environ.get("PANEL_PASS", "")  # Senha do painel web

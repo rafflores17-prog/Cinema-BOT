@@ -141,6 +141,8 @@ async def enviar_seguro(bot, chat_id, text, markup=None, parse_mode="HTML", forc
     """Envia com as mesmas proteções do bot: tópico inexistente -> sem tópico,
     chat inacessível -> registra, HTML inválido -> texto puro. Devolve (ok, erro).
     forcar=True (painel): tenta mesmo um chat marcado como inacessível."""
+    if chat_desativado(chat_id):
+        return False, "destino removido (desativado no painel)"
     if chat_morto(chat_id) and not forcar:
         return False, f"chat inacessível ({_chats_mortos.get(chat_id, '')})"
     topic = 0
@@ -176,7 +178,7 @@ def enviar_do_http(chat_ids, text, markup=None, parse_mode="HTML", timeout=90):
     Devolve {"enviados": n, "total": n, "falhas": [{"chat_id", "erro"}]}."""
     alvos, vistos = [], set()
     for c in chat_ids or []:
-        if c and c not in vistos:
+        if c and c not in vistos and not chat_desativado(c):   # removidos pelo dono: nem tenta
             vistos.add(c); alvos.append(c)
     async def _todos(bot):
         enviados, falhas = 0, []
@@ -210,11 +212,21 @@ def destinos_painel():
     except Exception as e:
         logging.warning(f"destinos painel: {type(e).__name__}")
     lista = []
+    des = chats_desativados()
     for cid in list(nomes) + [x for x in (GRUPO_ID, CANAL_VIP) if x]:
+        if cid in des:
+            continue
         if cid and cid not in [d["chat_id"] for d in lista]:
             lista.append({"chat_id": cid, "nome": nomes.get(cid, ""),
                           "origem": "cliente" if cid in nomes else ("GRUPO_ID" if cid == GRUPO_ID else "CANAL_VIP")})
     return lista
+
+def desativados_painel():
+    env = _ids_env_desativados()
+    origem = {GRUPO_ID: "GRUPO_ID", CANAL_VIP: "CANAL_VIP"}
+    return [{"chat_id": c, "origem": origem.get(c, ""), "fixo": c in env,
+             "nome": "antigo canal STREAMFLIXVIP" if c == -1003083067544 else ""}
+            for c in sorted(chats_desativados(recarregar=True)) if c]
 
 def info_chats_do_http(destinos, timeout=30):
     """Completa com título/tipo/tópico vindos do Telegram (e se o bot tem acesso)."""
@@ -473,7 +485,21 @@ class AdminHandler(BaseHTTPRequestHandler):
                     dest = info_chats_do_http(dest)
                 except Exception as e:
                     logging.warning(f"destinos info: {type(e).__name__}")
-                self._json({"destinos": dest, "grupo_id": GRUPO_ID, "canal_vip": CANAL_VIP}); return
+                self._json({"destinos": dest, "desativados": desativados_painel(),
+                            "grupo_id": GRUPO_ID, "canal_vip": CANAL_VIP}); return
+
+            if cmd.startswith("destino_desativar:") or cmd.startswith("destino_reativar:"):
+                acao, _, cid = cmd.partition(":")
+                try:
+                    cid = int(cid.strip())
+                except ValueError:
+                    self._json({"ok": False, "error": "Chat ID inválido"}); return
+                if acao == "destino_desativar":
+                    desativar_chat(cid); ok, err = True, ""
+                else:
+                    ok, err = reativar_chat(cid)
+                self._json({"ok": ok, "error": err, "chat_id": cid,
+                            "desativados": desativados_painel()}); return
 
             if cmd == "propagandas_lista":
                 rows = listar_propagandas()
@@ -530,7 +556,7 @@ class AdminHandler(BaseHTTPRequestHandler):
                 chats = [r[0] for r in cur.fetchall()]; cur.close(); c.close()
                 incluir = bool((body_json or {}).get("incluir_oficiais"))
                 if incluir:
-                    chats += [x for x in (GRUPO_ID, CANAL_VIP) if x]
+                    chats += sem_desativados([GRUPO_ID, CANAL_VIP])
                 if not chats:
                     self._json({"ok": False, "enviados": 0, "total": 0, "falhas": [],
                                 "error": "Nenhum cliente ativo."}); return
@@ -1812,8 +1838,86 @@ ERROS_CHAT_MORTO = (
     "need administrator rights", "peer_id_invalid",
 )
 
+# ── Destinos desativados (removidos pelo dono) ─────────────────────────────
+# Lista persistente em bot_kv ("disabled_chat_ids", JSON) + env DISABLED_CHAT_IDS.
+# Nenhum envio do bot vai para esses chats (propaganda, avisos, enquete, boas-vindas...).
+DESATIVADOS_PADRAO = [-1003083067544]   # antigo canal STREAMFLIXVIP (Chat_restricted)
+KV_DESATIVADOS = "disabled_chat_ids"
+_desat = {"t": 0.0, "ids": None}
+_desat_lock = threading.Lock()
+
+def _ids_env_desativados():
+    out = set()
+    for part in (os.environ.get("DISABLED_CHAT_IDS") or "").replace(";", ",").split(","):
+        part = part.strip()
+        if part:
+            try:
+                out.add(int(part))
+            except ValueError:
+                logging.warning(f"DISABLED_CHAT_IDS inválido: {part}")
+    return out
+
+def _ler_desativados_db():
+    import json
+    v = kv_get(KV_DESATIVADOS)            # pode levantar erro (sem banco)
+    if v is None:                         # primeira vez: grava o padrão
+        kv_set(KV_DESATIVADOS, json.dumps(DESATIVADOS_PADRAO))
+        return set(DESATIVADOS_PADRAO)
+    try:
+        return {int(x) for x in json.loads(v)}
+    except Exception:
+        logging.warning("disabled_chat_ids inválido no bot_kv; usando o padrão")
+        return set(DESATIVADOS_PADRAO)
+
+def _gravar_desativados(ids):
+    import json
+    kv_set(KV_DESATIVADOS, json.dumps(sorted(ids)))
+    with _desat_lock:
+        _desat["ids"], _desat["t"] = set(ids), time.time()
+
+def chats_desativados(recarregar=False):
+    with _desat_lock:
+        if not recarregar and _desat["ids"] is not None and time.time() - _desat["t"] < 60:
+            return _desat["ids"] | _ids_env_desativados()
+        anterior = _desat["ids"]
+    try:
+        ids = _ler_desativados_db()
+    except Exception:
+        ids = anterior if anterior is not None else set(DESATIVADOS_PADRAO)
+    with _desat_lock:
+        _desat["ids"], _desat["t"] = set(ids), time.time()
+    return set(ids) | _ids_env_desativados()
+
+def chat_desativado(chat_id):
+    try:
+        return bool(chat_id) and int(chat_id) in chats_desativados()
+    except (TypeError, ValueError):
+        return False
+
+def desativar_chat(chat_id):
+    ids = set(chats_desativados(recarregar=True)) - _ids_env_desativados()
+    ids.add(int(chat_id))
+    _gravar_desativados(ids)
+    logging.info(f"Destino {chat_id} desativado pelo painel")
+    return True
+
+def reativar_chat(chat_id):
+    chat_id = int(chat_id)
+    if chat_id in _ids_env_desativados():
+        return False, "Este chat está em DISABLED_CHAT_IDS (variável do Koyeb); tire de lá para reativar."
+    ids = set(chats_desativados(recarregar=True)) - _ids_env_desativados()
+    ids.discard(chat_id)
+    _gravar_desativados(ids)
+    _chats_mortos.pop(chat_id, None)
+    logging.info(f"Destino {chat_id} reativado pelo painel")
+    return True, ""
+
+def sem_desativados(chats):
+    des = chats_desativados()
+    return [c for c in chats if c and c not in des]
+
 def chat_morto(chat_id):
-    return chat_id in _chats_mortos
+    return chat_id in _chats_mortos or chat_desativado(chat_id)
 
 def erro_thread(e):
     return "thread not found" in str(e).lower() or "topic_closed" in str(e).lower()
@@ -1828,6 +1932,13 @@ def registrar_erro_chat(chat_id, e, contexto="Envio"):
                             "pulando este chat até reiniciar.")
         return True
     return False
+
+async def _send_ativo(bot, chat_id, *a, **kw):
+    """send_message que ignora destinos desativados."""
+    if chat_desativado(chat_id):
+        logging.info(f"Envio para {chat_id} ignorado: destino desativado")
+        return None
+    return await bot.send_message(chat_id, *a, **kw)
 
 async def enviar(context, chat_id, text=None, photo=None, caption=None, markup=None, parse_mode="HTML"):
     if chat_morto(chat_id):
@@ -1946,7 +2057,7 @@ async def enviar_lista(context, chat_id, itens, is_tv=False, tipo="movie", limit
 # ── Verificação de acesso ──────────────────────────────────────────────────
 def chat_oficial(chat_id):
     """Grupo/canal principal do StreamFlix (não só o GRUPO_ID)."""
-    return bool(chat_id) and chat_id in {i for i in (GRUPO_ID, CANAL_VIP) if i}
+    return bool(chat_id) and chat_id in {i for i in (GRUPO_ID, CANAL_VIP) if i} and not chat_desativado(chat_id)
 
 def acesso_conteudo(chat_id):
     return chat_oficial(chat_id) or cliente_ativo(chat_id)
@@ -2242,7 +2353,7 @@ async def cmd_renovar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Cliente <code>{cid}</code> renovado!\nNova validade: <b>{nova.strftime('%d/%m/%Y')}</b>",
             parse_mode="HTML")
         try:
-            await context.bot.send_message(cid,
+            await _send_ativo(context.bot, cid,
                 f"✅ <b>Plano renovado!</b>\n\nSeu acesso foi renovado até <b>{nova.strftime('%d/%m/%Y')}</b>.\n\nObrigado! 🎬",
                 parse_mode="HTML")
         except: pass
@@ -2258,7 +2369,7 @@ async def cmd_revogar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if revogar_cliente(cid):
         await update.message.reply_text(f"✅ Acesso de <code>{cid}</code> revogado.", parse_mode="HTML")
         try:
-            await context.bot.send_message(cid,
+            await _send_ativo(context.bot, cid,
                 f"⚠️ Seu acesso foi cancelado.\n\nPara reativar: {CANAL_SUPORTE}")
         except: pass
     else:
@@ -2342,8 +2453,7 @@ async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def job_propaganda(context: ContextTypes.DEFAULT_TYPE):
     """Posta propaganda rotativa nos canais principais (horários: PROPAGANDA_HOURS_UTC)."""
     canais = []
-    if GRUPO_ID: canais.append(GRUPO_ID)
-    if CANAL_VIP: canais.append(CANAL_VIP)
+    canais = sem_desativados([GRUPO_ID, CANAL_VIP])
     if not canais: return
 
     custom = get_propagandas() if PROPAGANDA_USE_DB else []
@@ -2368,8 +2478,7 @@ async def job_propaganda(context: ContextTypes.DEFAULT_TYPE):
 async def enviar_propaganda_agora(context, texto_custom=None):
     """Disparo manual de propaganda pelo painel."""
     canais = []
-    if GRUPO_ID: canais.append(GRUPO_ID)
-    if CANAL_VIP: canais.append(CANAL_VIP)
+    canais = sem_desativados([GRUPO_ID, CANAL_VIP])
     if not canais: return 0
     if texto_custom:
         texto = aplicar_contato(texto_custom)
@@ -2385,7 +2494,7 @@ async def job_verificar_vencimentos(context: ContextTypes.DEFAULT_TYPE):
     """Roda a cada hora: avisa quem vence em 3 dias e bloqueia quem venceu."""
     for cid in clientes_para_avisar():
         try:
-            await context.bot.send_message(cid,
+            await _send_ativo(context.bot, cid,
                 f"⚠️ <b>Seu plano vence em 3 dias!</b>\n\n"
                 f"Renove agora para continuar assistindo:\n{CANAL_SUPORTE}",
                 parse_mode="HTML")
@@ -2399,7 +2508,7 @@ async def job_verificar_vencimentos(context: ContextTypes.DEFAULT_TYPE):
     for cid in clientes_vencidos():
         try:
             marcar_vencido(cid)
-            await context.bot.send_message(cid,
+            await _send_ativo(context.bot, cid,
                 f"🔴 <b>Seu plano expirou!</b>\n\n"
                 f"O bot foi suspenso automaticamente.\n\n"
                 f"Para renovar e reativar:\n{CANAL_SUPORTE}",
@@ -2551,7 +2660,7 @@ def chats_destinatarios():
         chats.append(GRUPO_ID)
     if CANAL_VIP and CANAL_VIP not in chats:
         chats.append(CANAL_VIP)
-    return [c for c in chats if not chat_morto(c)]
+    return [c for c in chats if not chat_morto(c)]   # chat_morto já exclui desativados
 
 def label_botao_assistir():
     return "▶️ Assista no StreamFlix" if BUTTON_ASSISTA else "🌐 VER NO SITE / APP"
@@ -2715,7 +2824,7 @@ def chats_boas_vindas():
     if WELCOME_INCLUDE_CLIENTS:
         for cid in chats_destinatarios():
             chats.add(cid)
-    return chats
+    return set(sem_desativados(chats))
 
 async def _apagar_mensagem(context):
     data = context.job.data or {}
@@ -2783,7 +2892,7 @@ async def job_app_promo(context: ContextTypes.DEFAULT_TYPE):
     if not APP_PROMO_ENABLED:
         return
     texto = texto_promo_app()
-    destinos = await asyncio.to_thread(chats_destinatarios) if APP_PROMO_INCLUDE_CLIENTS else [c for c in (GRUPO_ID, CANAL_VIP) if c]
+    destinos = await asyncio.to_thread(chats_destinatarios) if APP_PROMO_INCLUDE_CLIENTS else sem_desativados([GRUPO_ID, CANAL_VIP])
     for cid in destinos:
         try:
             await enviar(context, cid, text=texto, markup=markup_cta_app())
@@ -2819,7 +2928,7 @@ async def job_enquete_semanal(context: ContextTypes.DEFAULT_TYPE):
         f"🌐 {html.escape(ensure_https(SITE_URL))}\n"
         f"{texto_indique()}"
     )
-    destinos = await asyncio.to_thread(chats_destinatarios) if POLL_INCLUDE_CLIENTS else [c for c in (GRUPO_ID, CANAL_VIP) if c]
+    destinos = await asyncio.to_thread(chats_destinatarios) if POLL_INCLUDE_CLIENTS else sem_desativados([GRUPO_ID, CANAL_VIP])
     for cid in destinos:
         if chat_morto(cid):
             continue

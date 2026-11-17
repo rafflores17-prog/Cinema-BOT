@@ -104,13 +104,13 @@ class FakeBot:
             raise BadRequest("Message thread not found")
         return types.SimpleNamespace(message_id=1)
 ctx = types.SimpleNamespace(bot=FakeBot())
-bot.get_topic_id = lambda cid: 55 if cid == -1003083067544 else 0
+bot.get_topic_id = lambda cid: 55 if cid == -1004378949622 else 0
 async def run():
-    r = await bot.enviar(ctx, -1003083067544, text="oi")
-    assert r and calls == [(-1003083067544, 55), (-1003083067544, None)]
+    r = await bot.enviar(ctx, -1004378949622, text="oi")
+    assert r and calls == [(-1004378949622, 55), (-1004378949622, None)]
     calls.clear()
-    await bot.enviar(ctx, -1003083067544, text="oi")
-    assert calls == [(-1003083067544, None)]          # lembra que o tópico não existe
+    await bot.enviar(ctx, -1004378949622, text="oi")
+    assert calls == [(-1004378949622, None)]          # lembra que o tópico não existe
     calls.clear()
     assert await bot.enviar(ctx, -1003177664821, text="oi") is None
     assert await bot.enviar(ctx, -1003177664821, text="oi") is None

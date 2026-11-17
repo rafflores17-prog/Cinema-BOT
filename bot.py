@@ -1963,7 +1963,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         d = await atmdb("movie/now_playing", {"region": "BR"})
         if d and d.get("results"):
             await enviar_vitrine(context, cid, d.get("results", []),
-                                 categoria="🎬 LANÇAMENTO", titulo="🎬 Em cartaz agora")
+                                 categoria="🎬 LANÇAMENTO", titulo="🎬 Em cartaz agora", min_votos=0)
         else:
             await enviar(context, cid, text="😕 Não encontrei lançamentos agora. Tente de novo em instantes.")
 
@@ -2310,9 +2310,10 @@ TEMAS_NOITE = {
         "genres": "", "kind": "movie", "cat": "🍿 SUGESTÃO DA NOITE", "classicos": True},
 }
 
-def _pick_novos(chat_id, itens, is_tv, qtd=2):
+def _pick_novos(chat_id, itens, is_tv, qtd=2, min_votos=100):
     tipo = "tv" if is_tv else "movie"
-    novos = filtrar(chat_id, list(itens or []), tipo, permitir_repetir=False)
+    itens = curar_itens(list(itens or []), min_votos=min_votos)
+    novos = filtrar(chat_id, itens, tipo, permitir_repetir=False)
     if not novos:
         return []
     # varia entre os primeiros, sem repetir gênero no mesmo envio quando der
@@ -2832,7 +2833,8 @@ def texto_vitrine(titulo, fatia, primeiro_num, is_tv=False, total=None, rodape=N
 
 async def enviar_vitrine(context, chat_id, itens, is_tv=False, categoria=None,
                          titulo="🎬 Títulos", page=0, lista_id=None, destacar=True,
-                         por_pagina=6, dedupe=False, avisar_vazio=True):
+                         por_pagina=6, dedupe=False, avisar_vazio=True,
+                         min_votos=None, permitir_doc=False):
     """Lista organizada: (opcional) card completo do nº 1 + lista numerada com botões
     que abrem o mesmo card da busca individual, com paginação Mais ▶️."""
     if not lista_id:
@@ -2842,6 +2844,8 @@ async def enviar_vitrine(context, chat_id, itens, is_tv=False, categoria=None,
             if avisar_vazio:
                 await avisar_tmdb_vazio(context, chat_id)
             return
+        if min_votos is not None:
+            itens = curar_itens(itens, min_votos=min_votos, permitir_doc=permitir_doc)
         if dedupe:
             tipo = "tv" if is_tv else "movie"
             novos = await asyncio.to_thread(filtrar, chat_id, itens, tipo, False)
@@ -3305,27 +3309,27 @@ async def executar_menu(context, cid, text):
     if text == "🎥 Em Cartaz":
         d = await atmdb("movie/now_playing", {"region":"BR"})
         await enviar_vitrine(context, cid, (d or {}).get("results") or [],
-                             categoria="🎬 LANÇAMENTO", titulo="🎬 Em cartaz agora")
+                             categoria="🎬 LANÇAMENTO", titulo="🎬 Em cartaz agora", min_votos=0)
 
     elif text == "🚀 Em Breve":
         d = await atmdb("movie/upcoming", {"region":"BR"})
         await enviar_vitrine(context, cid, (d or {}).get("results") or [],
-                             categoria="🎬 LANÇAMENTO", titulo="🚀 Em breve")
+                             categoria="🎬 LANÇAMENTO", titulo="🚀 Em breve", min_votos=0)
 
     elif text == "🌟 Populares":
         d = await atmdb("movie/popular", {"region":"BR","page":random.randint(1,5)})
         await enviar_vitrine(context, cid, (d or {}).get("results") or [],
-                             categoria="🎬 FILME", titulo="🌟 Populares")
+                             categoria="🎬 FILME", titulo="🌟 Populares", min_votos=200)
 
     elif text == "📺 Séries":
         d = await atmdb("tv/popular", {"page":random.randint(1,5)})
         await enviar_vitrine(context, cid, (d or {}).get("results") or [], is_tv=True,
-                             categoria="📺 SÉRIE", titulo="📺 Séries em alta")
+                             categoria="📺 SÉRIE", titulo="📺 Séries em alta", min_votos=200)
 
     elif text == "🔥 Em Alta":
         d = await atmdb("trending/all/week")
         await enviar_vitrine(context, cid, (d or {}).get("results") or [],
-                             titulo="🔥 Em alta nesta semana")
+                             titulo="🔥 Em alta nesta semana", min_votos=100)
 
     elif text == "🎭 Por Gênero":
         btns = [InlineKeyboardButton(n, callback_data=f"gen_{i}") for n,i in GENEROS.items()]
@@ -3338,6 +3342,7 @@ async def executar_menu(context, cid, text):
     elif text == "🎲 Sugestão":
         d = await atmdb("movie/top_rated", {"page":random.randint(1,20)})
         itens = (d or {}).get("results") or []
+        itens = curar_itens(itens, min_votos=200)
         novos = await asyncio.to_thread(filtrar, cid, itens, "movie", False) or itens
         if not novos:
             await avisar_tmdb_vazio(context, cid)
@@ -3430,9 +3435,38 @@ def parece_titulo(texto, grupo=False):
         return 2 <= len(t) <= 40 and len(n.split()) <= 6 and len(n) >= 3
     return 2 <= len(t) <= 60
 
-def buscar_titulos(query):
+def _log_ignorado(motivo, texto):
+    logging.info(f"Grupo: texto ignorado ({motivo}): {(texto or '')[:40]!r}")
+    return None
+
+_DIMINUTIVOS = {"mamae": "mae", "papai": "pai", "vovo": "avo", "titia": "tia", "titio": "tio",
+                "maezinha": "mae", "paizinho": "pai", "filhinho": "filho", "filhinha": "filha"}
+
+def variantes_busca(query):
+    """Outras formas do texto para buscar: sem diminutivo, com/sem artigo."""
+    base = " ".join((query or "").split())
+    norm = normalizar_busca(base)
+    palavras = norm.split()
+    vs = []
+    def add(v):
+        v = " ".join(v.split())
+        if v and normalizar_busca(v) not in [normalizar_busca(x) for x in vs]:
+            vs.append(v)
+    add(base)
+    trocada = " ".join(_DIMINUTIVOS.get(p, p) for p in palavras)
+    if trocada != norm:
+        add(trocada)
+    for v in list(vs):
+        nv = normalizar_busca(v)
+        if nv.split()[0] in ("a", "o", "as", "os", "the"):
+            add(" ".join(nv.split()[1:]))
+        else:
+            add("a " + nv)
+    return vs[:4]
+
+def buscar_titulos(query, lang="pt-BR"):
     """search/multi só com filmes e séries, na ordem de relevância do TMDB."""
-    d = tmdb("search/multi", {"query": query, "include_adult": "false"}) or {}
+    d = tmdb("search/multi", {"query": query, "include_adult": "false", "language": lang}) or {}
     return [r for r in d.get("results") or []
             if r.get("media_type") in ("movie", "tv") and r.get("id")]
 
@@ -3440,6 +3474,25 @@ def _nomes_item(r):
     tv = item_is_tv(r)
     return {normalizar_busca(r.get("name" if tv else "title") or ""),
             normalizar_busca(r.get("original_name" if tv else "original_title") or "")} - {""}
+
+GENEROS_EXCLUIR_ALEATORIO = {99, 10763, 10764, 10767}   # documentário, news, reality, talk show
+
+def curar_itens(itens, min_votos=200, permitir_doc=False):
+    """Para listas/sugestões aleatórias: títulos conhecidos e sem documentário/reality,
+    a menos que pedido. Afrouxa se sobrar pouco."""
+    itens = [i for i in (itens or []) if i.get("id")]
+    def gen_ok(i):
+        if permitir_doc:
+            return True
+        ids = set(i.get("genre_ids") or []) | {g.get("id") for g in i.get("genres") or [] if isinstance(g, dict)}
+        return not (ids & GENEROS_EXCLUIR_ALEATORIO)
+    base = [i for i in itens if gen_ok(i) and item_decente(i)]
+    fortes = [i for i in base if (i.get("vote_count") or 0) >= (min_votos or 0)]
+    if len(fortes) >= 4 or (fortes and len(base) < 4):
+        return fortes
+    if base:
+        return sorted(base, key=lambda i: (i.get("vote_count") or 0), reverse=True)
+    return itens
 
 def item_decente(r):
     return bool(r.get("poster_path") or (r.get("overview") or "").strip())
@@ -3507,7 +3560,8 @@ async def enviar_genero(context, cid, genero):
         i.setdefault("media_type", tipo)
     titulo = f"{nome} — {'séries' if is_tv else 'filmes'}"
     await enviar_vitrine(context, cid, itens, is_tv=is_tv,
-                         categoria="📺 SÉRIE" if is_tv else "🎬 FILME", titulo=titulo)
+                         categoria="📺 SÉRIE" if is_tv else "🎬 FILME", titulo=titulo,
+                         min_votos=80, permitir_doc=(gid == 99))
 
 def escolher_resultado(query, resultados):
     """Devolve ('card', item) se houver um match forte, ('lista', itens) se vários,
@@ -3567,6 +3621,26 @@ async def responder_busca(context, chat_id, query, resultados, *, silencioso=Fal
                          destacar=False, por_pagina=6, dedupe=False, avisar_vazio=not silencioso)
     return True
 
+def buscar_com_variantes(query, grupo=False):
+    """Tenta o texto e variantes (sem diminutivo, com/sem artigo, depois en-US).
+    Devolve (resultados, variante_usada). No grupo exige título que bata de verdade."""
+    tentativas = [(v, "pt-BR") for v in variantes_busca(query)] + [(query, "en-US")]
+    melhor = ([], query)
+    for v, lang in tentativas:
+        res = buscar_titulos(v, lang)
+        if grupo:
+            bons = match_relevante(v, res)
+            if bons:
+                return bons, v
+            continue
+        decentes = [r for r in res if item_decente(r)]
+        exatos = [r for r in decentes if normalizar_busca(v) in _nomes_item(r)]
+        if exatos:
+            return res, v
+        if decentes and not melhor[0]:
+            melhor = (res, v)
+    return melhor
+
 async def busca_por_texto(update, context, texto, *, grupo=False):
     cid = update.effective_chat.id
     query = " ".join(texto.split())[:60]
@@ -3575,15 +3649,10 @@ async def busca_por_texto(update, context, texto, *, grupo=False):
             await context.bot.send_chat_action(cid, "typing")
         except Exception:
             pass
-    resultados = await asyncio.to_thread(buscar_titulos, query)
-    if grupo:
-        resultados = match_relevante(query, resultados)
-        if not resultados:
-            return False                      # silêncio no grupo
-        return await responder_busca(context, cid, query, resultados, silencioso=True)
+    resultados, usada = await asyncio.to_thread(buscar_com_variantes, query, grupo)
     if not resultados:
-        return False
-    return await responder_busca(context, cid, query, resultados)
+        return False                          # grupo: silêncio; privado: quem chamou decide
+    return await responder_busca(context, cid, usada, resultados, silencioso=grupo)
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -3667,23 +3736,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = update.message
             if not (TEXT_SEARCH and GROUP_TEXT_SEARCH and acesso_conteudo(cid)):
                 return
-            if msg.sender_chat or (user and user.is_bot) or msg.via_bot or msg.forward_origin:
-                return
+            # Admin anônimo ("Envio anônimo") chega com sender_chat = o próprio grupo.
+            anonimo = bool(msg.sender_chat and msg.sender_chat.id == cid
+                           and not getattr(msg, "is_automatic_forward", False))
+            if msg.sender_chat and not anonimo:
+                return _log_ignorado("canal", text)
+            if (user and user.is_bot and not anonimo) or msg.via_bot or msg.forward_origin:
+                return _log_ignorado("bot/encaminhada", text)
             if msg.reply_to_message:
-                return                        # resposta a outra pessoa = conversa
+                return _log_ignorado("resposta a outra pessoa", text)
+            quem = cid if anonimo else uid     # anônimo: limite por grupo
             if genero and GROUP_TEXT_SEARCH:
-                if rate_ok(uid, "txt", GROUP_TEXT_SEARCH_USER_SECONDS) and \
+                if rate_ok(quem, "txt", GROUP_TEXT_SEARCH_USER_SECONDS) and \
                         rate_ok(cid, "txt_grupo", GROUP_TEXT_SEARCH_CHAT_SECONDS):
                     await enviar_genero(context, cid, genero)
+                else:
+                    _log_ignorado("limite de tempo", text)
                 return
             if not parece_titulo(text, grupo=True):
-                return
+                return _log_ignorado("não parece título", text)
             # anti-spam: por pessoa e por grupo (silencioso)
-            if not rate_ok(uid, "txt", GROUP_TEXT_SEARCH_USER_SECONDS):
-                return
+            if not rate_ok(quem, "txt", GROUP_TEXT_SEARCH_USER_SECONDS):
+                return _log_ignorado("limite por pessoa", text)
             if not rate_ok(cid, "txt_grupo", GROUP_TEXT_SEARCH_CHAT_SECONDS):
-                return
-            await busca_por_texto(update, context, text, grupo=True)
+                return _log_ignorado("limite do grupo", text)
+            if not await busca_por_texto(update, context, text, grupo=True):
+                _log_ignorado("sem resultado forte no TMDB", text)
             return
         return
 
@@ -3733,7 +3811,7 @@ async def callback_start(update, context, acao):
         d = await atmdb("movie/now_playing", {"region": "BR"})
         if d and d.get("results"):
             await enviar_vitrine(context, cid, d.get("results", []),
-                                 categoria="🎬 LANÇAMENTO", titulo="🎬 Em cartaz agora")
+                                 categoria="🎬 LANÇAMENTO", titulo="🎬 Em cartaz agora", min_votos=0)
         else:
             await avisar_tmdb_vazio(context, cid)
         return
@@ -3844,7 +3922,7 @@ async def callback_handler(update, context):
         d = await atmdb("discover/movie", {"with_genres":gid,"sort_by":"popularity.desc","page":random.randint(1,5)})
         nome = next((n for n,i in GENEROS.items() if str(i)==str(gid)), "Gênero")
         await enviar_vitrine(context, cid, (d or {}).get("results") or [],
-                             categoria="🎬 FILME", titulo=f"✨ {nome}")
+                             categoria="🎬 FILME", titulo=f"✨ {nome}", min_votos=200)
 
     elif data.startswith("era_"):
         era = data.split("_", 1)[1]
@@ -3854,7 +3932,7 @@ async def callback_handler(update, context):
         ano = random.randint(inicio, fim)
         d = await atmdb("discover/movie", {"primary_release_year":ano,"sort_by":"popularity.desc","page":1})
         await enviar_vitrine(context, cid, (d or {}).get("results") or [],
-                             categoria="🎬 FILME", titulo=f"🎞️ Destaques de {ano}")
+                             categoria="🎬 FILME", titulo=f"🎞️ Destaques de {ano}", min_votos=200)
 
 # ── Comandos com verificação de acesso ────────────────────────────────────
 async def _guard_busca(update, context) -> bool:

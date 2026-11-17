@@ -26,12 +26,12 @@ def fake_tmdb(ep, params=None):
     if ep.startswith("movie/") : return {"id":10,"title":"Duna","release_date":"2021","overview":"x","genres":[],"poster_path":"/p.jpg","videos":{"results":[]}}
     return {"results":RES}
 bot.tmdb=fake_tmdb
-def mkupdate(text, chat_type, cid, reply=None):
-    msg=MagicMock(); msg.text=text; msg.caption=None; msg.reply_to_message=reply; msg.sender_chat=None; msg.via_bot=None; msg.forward_origin=None
+def mkupdate(text, chat_type, cid, reply=None, sender_chat=None, user_is_bot=False):
+    msg=MagicMock(); msg.text=text; msg.caption=None; msg.reply_to_message=reply; msg.sender_chat=sender_chat; msg.is_automatic_forward=False; msg.via_bot=None; msg.forward_origin=None
     msg.reply_text=AsyncMock()
     u=MagicMock(); u.message=msg; u.effective_message=msg
     u.effective_chat=types.SimpleNamespace(id=cid,type=chat_type)
-    u.effective_user=types.SimpleNamespace(id=7,first_name="A",is_bot=False)
+    u.effective_user=types.SimpleNamespace(id=1087968824 if user_is_bot else 7,first_name="A",is_bot=user_is_bot)
     return u
 ctx=MagicMock(); ctx.bot=FakeBot(); ctx.user_data={}
 async def main():
@@ -85,3 +85,12 @@ async def cb():
     print("2º toque imediato:", q.answer.call_args)
     ctx.bot.photo_fail=False
 asyncio.run(cb())
+
+async def anon():
+    bot.AI_ENABLED=False; bot._rate_bucket.clear(); sent.clear()
+    await bot.handle_text(mkupdate("Duna","supergroup",-100,sender_chat=types.SimpleNamespace(id=-100),user_is_bot=True),ctx)
+    print("anônimo do grupo:", [(s[0], (s[2] or "")[:20]) for s in sent]); assert sent
+    sent.clear(); bot._rate_bucket.clear()
+    await bot.handle_text(mkupdate("Duna","supergroup",-100,sender_chat=types.SimpleNamespace(id=-200),user_is_bot=True),ctx)
+    print("outro canal:", sent); assert not sent
+asyncio.run(anon())

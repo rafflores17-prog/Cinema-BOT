@@ -119,3 +119,16 @@ print(limpo)
 assert "botão" not in limpo and "3422972" in limpo
 assert bot.limpar_frases_botao("Pronto! Clique no card abaixo para ver mais. Bom filme!") == "Pronto! Bom filme!"
 print("OK: gêneros/match/frases")
+
+# ---- variantes de busca e curadoria ----
+v = bot.variantes_busca("Outra mamãe")
+print(v)
+assert v[0] == "Outra mamãe" and "outra mae" in v and "a outra mae" in v
+docs = [{"id": i, "name": f"Doc {i}", "genre_ids": [99], "vote_count": 5000, "poster_path": "/d.jpg"} for i in range(1, 4)]
+pop = [{"id": 10 + i, "title": f"Filme {i}", "genre_ids": [28], "vote_count": 300 + i, "poster_path": "/p.jpg"} for i in range(5)]
+fracos = [{"id": 50, "title": "Obscuro", "genre_ids": [28], "vote_count": 3, "poster_path": "/o.jpg"}]
+cur = bot.curar_itens(docs + pop + fracos, min_votos=200)
+assert {i["id"] for i in cur} == {10, 11, 12, 13, 14}
+assert {i["id"] for i in bot.curar_itens(docs, permitir_doc=True)} == {1, 2, 3}
+assert bot.curar_itens(fracos + docs, min_votos=200)[0]["id"] == 50   # afrouxa, mas sem doc
+print("OK: variantes/curadoria")

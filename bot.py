@@ -3304,7 +3304,8 @@ def main():
         jq.run_daily(job_diario_noite, time=datetime.strptime(f"{noite_h:02d}:00","%H:%M").time())  # padrão 20h Fortaleza
         jq.run_repeating(job_verificar_vencimentos, interval=3600, first=60)                       # a cada 1h
         # Propaganda: padrão 18:00 UTC (15h Fortaleza). Antes eram 13,18,22.
-        for _h in parse_horas_utc(PROPAGANDA_HOURS_UTC, [18]):
+        # PROPAGANDA_ENABLED=0 (padrão): o post do app das 17h já cobre a divulgação
+        for _h in (parse_horas_utc(PROPAGANDA_HOURS_UTC, [18]) if os.environ.get("PROPAGANDA_ENABLED", "0") == "1" else []):
             jq.run_daily(job_propaganda, time=datetime.strptime(f"{_h:02d}:00","%H:%M").time())
         # Novos jobs (horários em UTC, iguais aos existentes: UTC = BRT+3)
         promo_h = max(0, min(23, APP_PROMO_HOUR_UTC))

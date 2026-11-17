@@ -6,7 +6,7 @@
 # =================================================================================
 
 import asyncio
-import os, html, time, random, logging, threading, secrets, string, unicodedata
+import os, re, html, time, random, logging, threading, secrets, string, unicodedata
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from urllib.parse import urlparse, quote
@@ -134,6 +134,139 @@ for _n in ("httpx", "httpcore", "telegram.request"):
 # ── Servidor HTTP (healthcheck + API do painel) ────────────────────────────
 PANEL_PASS = os.environ.get("PANEL_PASS", "")  # Senha do painel web
 
+# ── Envio a partir do painel (thread do servidor HTTP) ─────────────────────
+_APP = [None, None]   # [Application, event loop] — preenchido no post_init
+
+async def enviar_seguro(bot, chat_id, text, markup=None, parse_mode="HTML", forcar=True):
+    """Envia com as mesmas proteções do bot: tópico inexistente -> sem tópico,
+    chat inacessível -> registra, HTML inválido -> texto puro. Devolve (ok, erro).
+    forcar=True (painel): tenta mesmo um chat marcado como inacessível."""
+    if chat_morto(chat_id) and not forcar:
+        return False, f"chat inacessível ({_chats_mortos.get(chat_id, '')})"
+    topic = 0
+    if chat_id and chat_id < 0 and chat_id not in _topicos_ruins:
+        topic = await asyncio.to_thread(get_topic_id, chat_id)
+    kw = {"reply_markup": markup} if markup else {}
+    if parse_mode:
+        kw["parse_mode"] = parse_mode
+    if topic:
+        kw["message_thread_id"] = topic
+    for _ in range(3):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, **kw)
+            _chats_mortos.pop(chat_id, None)
+            return True, None
+        except Exception as e:
+            msg = str(e).lower()
+            if registrar_erro_chat(chat_id, e, "Painel"):
+                return False, str(e)[:200]
+            if "message_thread_id" in kw and erro_thread(e):
+                _topicos_ruins.add(chat_id)
+                kw.pop("message_thread_id", None)
+                continue
+            if "parse_mode" in kw and ("parse entities" in msg or "can't parse" in msg or "unsupported start tag" in msg):
+                kw.pop("parse_mode", None)
+                text = html.unescape(re.sub(r"<[^>]+>", "", text)) if "<" in text else text
+                continue
+            return False, f"{type(e).__name__}: {str(e)[:180]}"
+    return False, "falhou após novas tentativas"
+
+def enviar_do_http(chat_ids, text, markup=None, parse_mode="HTML", timeout=90):
+    """Chamado na thread do HTTP. Usa o bot/loop da aplicação; sem eles, um Bot avulso.
+    Devolve {"enviados": n, "total": n, "falhas": [{"chat_id", "erro"}]}."""
+    alvos, vistos = [], set()
+    for c in chat_ids or []:
+        if c and c not in vistos:
+            vistos.add(c); alvos.append(c)
+    async def _todos(bot):
+        enviados, falhas = 0, []
+        for cid in alvos:
+            ok, erro = await enviar_seguro(bot, cid, text, markup=markup, parse_mode=parse_mode)
+            if ok:
+                enviados += 1
+            else:
+                falhas.append({"chat_id": cid, "erro": erro})
+                logging.warning(f"Painel: falha ao enviar para {cid}: {erro}")
+        return {"enviados": enviados, "total": len(alvos), "falhas": falhas}
+    app, loop = _APP
+    if app is not None and loop is not None and loop.is_running():
+        fut = asyncio.run_coroutine_threadsafe(_todos(app.bot), loop)
+        return fut.result(timeout=timeout)
+    async def _avulso():
+        from telegram import Bot
+        async with Bot(token=TOKEN) as b:
+            return await _todos(b)
+    return asyncio.run(_avulso())
+
+def destinos_painel():
+    """Grupos/canais para onde o painel pode enviar: clientes ativos + grupo/canal oficiais."""
+    nomes = {}
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("SELECT chat_id, nome_canal FROM clientes WHERE ativo=TRUE AND validade > NOW()")
+        for cid, nome in cur.fetchall():
+            nomes[cid] = nome or ""
+        cur.close(); c.close()
+    except Exception as e:
+        logging.warning(f"destinos painel: {type(e).__name__}")
+    lista = []
+    for cid in list(nomes) + [x for x in (GRUPO_ID, CANAL_VIP) if x]:
+        if cid and cid not in [d["chat_id"] for d in lista]:
+            lista.append({"chat_id": cid, "nome": nomes.get(cid, ""),
+                          "origem": "cliente" if cid in nomes else ("GRUPO_ID" if cid == GRUPO_ID else "CANAL_VIP")})
+    return lista
+
+def info_chats_do_http(destinos, timeout=30):
+    """Completa com título/tipo/tópico vindos do Telegram (e se o bot tem acesso)."""
+    async def _info(bot):
+        for d in destinos:
+            try:
+                ch = await bot.get_chat(d["chat_id"])
+                d.update({"titulo": ch.title or ch.username or "", "tipo": ch.type,
+                          "acessivel": True, "username": ch.username or ""})
+            except Exception as e:
+                d.update({"acessivel": False, "erro": f"{type(e).__name__}: {str(e)[:120]}"})
+            d["topico"] = get_topic_id(d["chat_id"]) if d["chat_id"] < 0 else 0
+        return destinos
+    app, loop = _APP
+    if app is not None and loop is not None and loop.is_running():
+        return asyncio.run_coroutine_threadsafe(_info(app.bot), loop).result(timeout=timeout)
+    async def _avulso():
+        from telegram import Bot
+        async with Bot(token=TOKEN) as b:
+            return await _info(b)
+    return asyncio.run(_avulso())
+
+def _alvos_escolhidos(body_json, padrao):
+    """Se o painel mandou chat_ids, usa só os que estão entre os permitidos."""
+    pedidos = (body_json or {}).get("chat_ids")
+    if not isinstance(pedidos, list) or not pedidos:
+        return padrao
+    permitidos = {d["chat_id"] for d in destinos_painel()} | set(padrao)
+    out = []
+    for x in pedidos:
+        try:
+            x = int(x)
+        except (TypeError, ValueError):
+            continue
+        if x in permitidos and x not in out:
+            out.append(x)
+    return out
+
+def _texto_painel(cmd, prefixo, body_json):
+    """Texto vindo do POST JSON (msg/texto) ou do legado ?cmd=prefixo:texto."""
+    from urllib.parse import unquote
+    if body_json:
+        for k in ("msg", "texto", "text"):
+            v = body_json.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    resto = cmd[len(prefixo):] if cmd.startswith(prefixo) else ""
+    return unquote(resto).strip() if resto else ""
+
+def _aplicar_contato_seguro(texto):
+    return (texto or "").replace("{contato}", ADMIN_CONTATO)
+
 class AdminHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -252,13 +385,18 @@ class AdminHandler(BaseHTTPRequestHandler):
 
             if cmd.startswith("config_modo:"):
                 _, cid, modo = cmd.split(":", 2)
+                modo = {"basico": "simples", "básico": "simples"}.get(modo.strip().lower(), modo.strip().lower())
+                if modo not in ("simples", "completo"):
+                    self._json({"ok": False, "error": "Modo inválido (use completo ou simples)."}); return
                 ok = set_modo(int(cid), modo)
-                self._json({"ok": ok}); return
+                self._json({"ok": ok, "modo": modo}); return
 
             if cmd.startswith("config_site:"):
                 from urllib.parse import unquote
                 _, cid, url = cmd.split(":", 2)
-                url = unquote(url)
+                url = unquote(url).strip()
+                if url != "remover" and not url.startswith(("http://", "https://")):
+                    self._json({"ok": False, "error": "Site deve começar com http:// ou https://"}); return
                 ok = set_site_url(int(cid), None if url == "remover" else url)
                 self._json({"ok": ok}); return
 
@@ -282,8 +420,9 @@ class AdminHandler(BaseHTTPRequestHandler):
                 c = db(); cur = c.cursor()
                 cur.execute("UPDATE clientes SET nome_canal=%s WHERE chat_id=%s",
                     (None if nome=="remover" else nome, int(cid)))
+                ok = cur.rowcount > 0
                 c.commit(); cur.close(); c.close()
-                self._json({"ok": True}); return
+                self._json({"ok": ok, "error": "" if ok else "Cliente não encontrado"}); return
 
             if cmd.startswith("token_add:"):
                 from urllib.parse import unquote
@@ -328,15 +467,31 @@ class AdminHandler(BaseHTTPRequestHandler):
                 c.commit(); cur.close(); c.close()
                 self._json({"ok": True}); return
 
+            if cmd == "destinos":
+                dest = destinos_painel()
+                try:
+                    dest = info_chats_do_http(dest)
+                except Exception as e:
+                    logging.warning(f"destinos info: {type(e).__name__}")
+                self._json({"destinos": dest, "grupo_id": GRUPO_ID, "canal_vip": CANAL_VIP}); return
+
             if cmd == "propagandas_lista":
                 rows = listar_propagandas()
                 result = [{"id": r[0], "texto": r[1], "ativo": bool(r[2]),
                            "criado_em": r[3].strftime("%d/%m/%Y") if r[3] else ""} for r in rows]
-                self._json({"propagandas": result, "fixas": PROPAGANDAS_FIXAS}); return
+                auto = os.environ.get("PROPAGANDA_ENABLED", "0") == "1"
+                horas = [f"{(h - 3) % 24}h" for h in parse_horas_utc(PROPAGANDA_HOURS_UTC, [18])]
+                self._json({"propagandas": result,
+                            "fixas": textos_propaganda_app(),          # o que o disparo usa de verdade
+                            "usa_personalizadas": PROPAGANDA_USE_DB,
+                            "automatico": auto, "horarios": horas if auto else [],
+                            "promo_diaria": APP_PROMO_ENABLED,
+                            "promo_hora": f"{(APP_PROMO_HOUR_UTC - 3) % 24}h"}); return
 
-            if cmd.startswith("propaganda_add:"):
-                from urllib.parse import unquote
-                texto = unquote(cmd[len("propaganda_add:"):])
+            if cmd.startswith("propaganda_add"):
+                texto = _texto_painel(cmd, "propaganda_add:", body_json)
+                if not texto:
+                    self._json({"ok": False, "error": "Texto vazio"}); return
                 ok = add_propaganda(texto)
                 self._json({"ok": ok}); return
 
@@ -345,35 +500,18 @@ class AdminHandler(BaseHTTPRequestHandler):
                 ok = deletar_propaganda(pid)
                 self._json({"ok": ok}); return
 
-            if cmd.startswith("propaganda_disparo:"):
-                from urllib.parse import unquote
-                import asyncio
-                texto_raw = cmd[len("propaganda_disparo:"):]
-                texto = unquote(texto_raw) if texto_raw else None
-                canais = []
-                if GRUPO_ID: canais.append(GRUPO_ID)
-                if CANAL_VIP: canais.append(CANAL_VIP)
-                txt = (texto or PROPAGANDAS_FIXAS[0]).format(contato=ADMIN_CONTATO)
-                from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton
-                enviados = 0
-                async def _send():
-                    nonlocal enviados
-                    bot = Bot(token=TOKEN)
-                    for cid in canais:
-                        try:
-                            kw2 = {}
-                            if cid == GRUPO_ID and TOPIC_ID:
-                                kw2["message_thread_id"] = TOPIC_ID
-                            await bot.send_message(
-                                chat_id=cid, text=txt, parse_mode="HTML",
-                                reply_markup=InlineKeyboardMarkup([[
-                                    InlineKeyboardButton("💬 Falar com Admin",
-                                        url=f"https://t.me/{ADMIN_CONTATO.lstrip('@')}")
-                                ]]), **kw2)
-                            enviados += 1
-                        except: pass
-                asyncio.run(_send())
-                self._json({"ok": True, "enviados": enviados}); return
+            if cmd.startswith("propaganda_disparo"):
+                texto = _texto_painel(cmd, "propaganda_disparo:", body_json)
+                txt = _aplicar_contato_seguro(texto) if texto else textos_propaganda_app()[0]
+                # grupos/canais atuais: clientes ativos + grupo/canal oficiais (sem chats mortos)
+                alvos = _alvos_escolhidos(body_json, [c for c in chats_destinatarios() if c and c < 0])
+                if not alvos:
+                    self._json({"ok": False, "enviados": 0, "total": 0, "falhas": [],
+                                "error": "Nenhum grupo/canal ativo para enviar."}); return
+                r = enviar_do_http(alvos, txt, markup=markup_cta_app())
+                logging.info(f"Painel: propaganda enviada {r['enviados']}/{r['total']}")
+                self._json({"ok": r["enviados"] > 0, **r,
+                            "error": "" if r["enviados"] else "Nenhum envio deu certo (veja falhas)."}); return
 
             if cmd == "tokens_lista":
                 c = db(); cur = c.cursor()
@@ -383,25 +521,27 @@ class AdminHandler(BaseHTTPRequestHandler):
                            "criado_em": r[2].strftime("%d/%m/%Y %H:%M") if r[2] else ""} for r in rows]
                 self._json({"tokens": result}); return
 
-            if cmd.startswith("broadcast:"):
-                from urllib.parse import unquote
-                msg = unquote(cmd[len("broadcast:"):])
+            if cmd.startswith("broadcast"):
+                msg = _texto_painel(cmd, "broadcast:", body_json)
+                if not msg:
+                    self._json({"ok": False, "error": "Mensagem vazia"}); return
                 c = db(); cur = c.cursor()
                 cur.execute("SELECT chat_id FROM clientes WHERE ativo=TRUE AND validade > NOW()")
                 chats = [r[0] for r in cur.fetchall()]; cur.close(); c.close()
-                enviados = 0
-                import asyncio
-                async def _send_all():
-                    nonlocal enviados
-                    from telegram import Bot
-                    bot = Bot(token=TOKEN)
-                    for cid in chats:
-                        try:
-                            await bot.send_message(chat_id=cid, text=msg)
-                            enviados += 1
-                        except: pass
-                asyncio.run(_send_all())
-                self._json({"ok": True, "enviados": enviados}); return
+                incluir = bool((body_json or {}).get("incluir_oficiais"))
+                if incluir:
+                    chats += [x for x in (GRUPO_ID, CANAL_VIP) if x]
+                if not chats:
+                    self._json({"ok": False, "enviados": 0, "total": 0, "falhas": [],
+                                "error": "Nenhum cliente ativo."}); return
+                chats = _alvos_escolhidos(body_json, chats)
+                if not chats:
+                    self._json({"ok": False, "enviados": 0, "total": 0, "falhas": [],
+                                "error": "Nenhum destino selecionado."}); return
+                r = enviar_do_http(chats, msg)
+                logging.info(f"Painel: mensagem enviada {r['enviados']}/{r['total']}")
+                self._json({"ok": r["enviados"] > 0, **r,
+                            "error": "" if r["enviados"] else "Nenhum envio deu certo (veja falhas)."}); return
 
             if cmd == "historico":
                 c = db(); cur = c.cursor()
@@ -427,11 +567,12 @@ class AdminHandler(BaseHTTPRequestHandler):
                 disp = Counter(r["tipo"] for r in result if not r["usado"])
                 self._json({"premios": result, "disponiveis": dict(disp)}); return
 
-            if cmd.startswith("premio_add:"):
+            if cmd.startswith("premio_add"):
                 from urllib.parse import unquote
                 import json
-                raw = unquote(cmd[len("premio_add:"):])
-                data = json.loads(raw)
+                data = (body_json or {}).get("data")
+                if not isinstance(data, dict):
+                    data = json.loads(unquote(cmd[len("premio_add:"):]))
                 c = db(); cur = c.cursor()
                 cur.execute("INSERT INTO premios(tipo,nome,conteudo,valor,data_exp,emoji) VALUES(%s,%s,%s,%s,%s,%s)",
                     (data["tipo"], data["nome"], data["conteudo"], float(data["valor"]), data.get("data_exp"), data.get("emoji")))
@@ -503,27 +644,17 @@ class AdminHandler(BaseHTTPRequestHandler):
                                 c.commit()
                                 add_saldo(user_id, valor)
                                 cur.close(); c.close()
-                                # Notifica o usuário
-                                import asyncio
-                                async def _notify():
-                                    from telegram import Bot
-                                    bot = Bot(token=TOKEN)
-                                    saldo = get_saldo(user_id)
-                                    await bot.send_message(
-                                        chat_id=user_id,
-                                        text=f"✅ <b>Pagamento confirmado!</b>\n\n"
-                                             f"💰 R$ {valor:.2f} adicionado ao seu saldo\n"
-                                             f"🏦 Saldo atual: <b>R$ {saldo:.2f}</b>\n\n"
-                                             f"Use /credito para resgatar seus prêmios!",
-                                        parse_mode="HTML"
-                                    )
-                                    # Avisa admin também
-                                    if ADMIN_ID:
-                                        await bot.send_message(
-                                            chat_id=ADMIN_ID,
-                                            text=f"💸 Pagamento recebido!\nUser: {user_id}\nValor: R$ {valor:.2f}",
-                                        )
-                                asyncio.run(_notify())
+                                # Notifica o usuário (pelo loop da aplicação)
+                                saldo = get_saldo(user_id)
+                                enviar_do_http([user_id],
+                                    f"✅ <b>Pagamento confirmado!</b>\n\n"
+                                    f"💰 R$ {valor:.2f} adicionado ao seu saldo\n"
+                                    f"🏦 Saldo atual: <b>R$ {saldo:.2f}</b>\n\n"
+                                    f"Use /credito para resgatar seus prêmios!")
+                                if ADMIN_ID:
+                                    enviar_do_http([ADMIN_ID],
+                                        f"💸 Pagamento recebido!\nUser: {user_id}\nValor: R$ {valor:.2f}",
+                                        parse_mode=None)
                             else:
                                 if row: cur.close(); c.close()
                 self.send_response(200)
@@ -4571,6 +4702,7 @@ async def limpar_teclado_grupos(bot):
                 logging.warning(f"Limpar teclado falhou em {cid}: {e}")
 
 async def post_init(application):
+    _APP[0], _APP[1] = application, asyncio.get_running_loop()
     try:
         global _bot_username
         try:

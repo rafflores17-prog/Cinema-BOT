@@ -103,6 +103,10 @@ Para desligar um recurso: `WELCOME_ENABLED=0`, `APP_PROMO_ENABLED=0`, `POLL_ENAB
 | `POLL_INCLUDE_CLIENTS` | `0` | Se `1`, a enquete semanal também vai para clientes SaaS |
 | `COMMAND_RATE_SECONDS` | `8` | Intervalo mínimo entre buscas no privado. `0` desliga |
 | `GROUP_SEARCH_RATE_SECONDS` | `30` | Intervalo mínimo entre buscas no mesmo usuário, nos grupos |
+| `TEXT_SEARCH` | `1` | Buscar digitando só o nome do filme/série (sem /filme) |
+| `GROUP_TEXT_SEARCH` | `1` | Também no grupo (só textos curtos com cara de título; sem resultado = silêncio) |
+| `GROUP_TEXT_SEARCH_USER_SECONDS` | `60` | Intervalo mínimo por pessoa na busca por texto no grupo |
+| `GROUP_TEXT_SEARCH_CHAT_SECONDS` | `20` | Intervalo mínimo por grupo na busca por texto |
 | `PROPAGANDA_HOURS_UTC` | `18` | Horários UTC da propaganda, separados por vírgula. Antes: `13,18,22` |
 | `INLINE_MODE` | `1` | Responde a buscas inline (`@bot nome`). O modo inline precisa estar ligado no BotFather |
 | `SET_BOT_PROFILE` | `0` | Se `1`, aplica descrição/descrição curta na inicialização (não mexe em nome nem foto) |
@@ -127,7 +131,8 @@ Para desligar um recurso: `WELCOME_ENABLED=0`, `APP_PROMO_ENABLED=0`, `POLL_ENAB
 | `AI_MODEL` | `openai/gpt-oss-20b` | Modelo no provedor (padrão Groq) |
 | `AI_RATE_SECONDS` | `20` | Intervalo mínimo entre perguntas do mesmo usuário |
 | `AI_DAILY_CAP` | `15` | Máximo de perguntas por usuário por dia (Fortaleza) |
-| `AI_MAX_TOKENS` | `350` | Teto de tokens da resposta |
+| `AI_MAX_TOKENS` | `700` | Teto de tokens da resposta |
+| `AI_TITLE_BUTTONS` | `1` | Botões para abrir o card dos títulos citados pela IA |
 
 Para ligar a IA no Groq (recomendado, plano gratuito): crie uma chave em https://console.groq.com/keys e no Koyeb defina `AI_ENABLED=1` e `AI_API_KEY` com essa chave. Os outros valores já vêm no padrão. Limites publicados: https://console.groq.com/docs/rate-limits
 

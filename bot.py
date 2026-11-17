@@ -13,7 +13,7 @@ from urllib.parse import urlparse, quote
 import requests, psycopg2
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
+    ReplyKeyboardRemove, LinkPreviewOptions,
     BotCommand, BotCommandScopeDefault, BotCommandScopeAllPrivateChats,
     BotCommandScopeAllGroupChats, BotCommandScopeChat,
     InlineQueryResultArticle, InlineQueryResultPhoto, InputTextMessageContent,
@@ -100,7 +100,15 @@ AI_API_KEY                = os.environ.get("AI_API_KEY", "")
 AI_MODEL                  = (os.environ.get("AI_MODEL") or "openai/gpt-oss-20b").strip()
 AI_RATE_SECONDS           = env_int("AI_RATE_SECONDS", 20)
 AI_DAILY_CAP              = env_int("AI_DAILY_CAP", 15)   # por usuário, por dia (America/Fortaleza)
-AI_MAX_TOKENS             = env_int("AI_MAX_TOKENS", 350)
+AI_MAX_TOKENS             = env_int("AI_MAX_TOKENS", 700)
+AI_TITLE_BUTTONS          = env_bool("AI_TITLE_BUTTONS", True)  # botões dos títulos citados pela IA
+
+# Busca só digitando o nome (sem /filme). No grupo, só textos com cara de título.
+TEXT_SEARCH                    = env_bool("TEXT_SEARCH", True)
+GROUP_TEXT_SEARCH              = env_bool("GROUP_TEXT_SEARCH", True)
+GROUP_TEXT_SEARCH_USER_SECONDS = env_int("GROUP_TEXT_SEARCH_USER_SECONDS", 60)
+GROUP_TEXT_SEARCH_CHAT_SECONDS = env_int("GROUP_TEXT_SEARCH_CHAT_SECONDS", 20)
+SEM_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 IMG_BASE  = f"https://image.tmdb.org/t/p/{TMDB_POSTER_SIZE}"
 TMDB_BASE = "https://api.themoviedb.org/3"
@@ -1679,7 +1687,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif payload.lower() in ("lancamentos", "lançamentos", "cartaz"):
         d = tmdb("movie/now_playing", {"region": "BR"})
         if d and d.get("results"):
-            await enviar_lista(context, cid, d.get("results", []), tipo="now_playing")
+            await enviar_vitrine(context, cid, d.get("results", []),
+                                 categoria="🎬 LANÇAMENTO", titulo="🎬 Em cartaz agora")
         else:
             await enviar(context, cid, text="😕 Não encontrei lançamentos agora. Tente de novo em instantes.")
 
@@ -2230,7 +2239,7 @@ def texto_start_app(first_name, payload=""):
         "Filmes, séries e TV no celular e na TV.\n"
         f"🌐 {html.escape(ensure_https(SITE_URL))}\n\n"
         f"{texto_indique()}\n\n"
-        "Toque nos botões abaixo ou busque com /filme e /serie."
+        "Toque nos botões abaixo ou digite o nome de um filme ou série."
     )
 
 def texto_saas(bot_username):
@@ -2467,32 +2476,100 @@ def _vitrine_guardar(itens, is_tv, categoria, titulo):
     }
     return lid
 
-def rotulo_item(item, is_tv_default=False):
+_GENEROS_TMDB = {}      # id -> nome (pt-BR), filmes + séries
+_GENEROS_TMDB_TS = [0.0]
+
+def nomes_generos(ids, limite=2):
+    """Nomes dos gêneros a partir de genre_ids (cache de 24h da lista do TMDB)."""
+    if not ids:
+        return []
+    agora = time.time()
+    if not _GENEROS_TMDB or agora - _GENEROS_TMDB_TS[0] > 86400:
+        if agora - _GENEROS_TMDB_TS[0] > 300:   # não martela o TMDB se falhar
+            _GENEROS_TMDB_TS[0] = agora
+            for tipo in ("movie", "tv"):
+                d = tmdb(f"genre/{tipo}/list") or {}
+                for g in d.get("genres") or []:
+                    if g.get("id") and g.get("name"):
+                        _GENEROS_TMDB.setdefault(g["id"], g["name"])
+    nomes = []
+    for gid in ids:
+        n = _GENEROS_TMDB.get(gid)
+        if n:
+            n = n.split(" & ")[0]
+            if n not in nomes:
+                nomes.append(n)
+        if len(nomes) >= limite:
+            break
+    return nomes
+
+NUM_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+
+def num_emoji(n):
+    return NUM_EMOJI[n - 1] if 1 <= n <= len(NUM_EMOJI) else f"{n}."
+
+def _titulo_ano(item, is_tv_default=False):
     tv = item_is_tv(item, is_tv_default)
-    title = (item.get("name") if tv else item.get("title")) or "?"
+    title = (item.get("name") if tv else item.get("title")) or item.get("title") or item.get("name") or "?"
     year = ((item.get("first_air_date") if tv else item.get("release_date")) or "")[:4]
-    nota = item.get("vote_average") or 0
-    icone = "📺" if tv else "🎬"
+    return tv, title, year
+
+def rotulo_item(item, is_tv_default=False, numero=None):
+    tv, title, year = _titulo_ano(item, is_tv_default)
+    icone = num_emoji(numero) if numero else ("📺" if tv else "🎬")
     label = f"{icone} {title}"
     if year:
         label += f" ({year})"
-    if nota:
-        label += f" ⭐{nota:.1f}"
-    if len(label) > 64:
-        label = label[:61] + "…"
+    if len(label) > 60:
+        label = label[:57] + "…"
     return label
 
+def linha_item(item, numero, is_tv_default=False):
+    """Linha organizada da lista: número, título (ano), tipo, nota e gêneros."""
+    tv, title, year = _titulo_ano(item, is_tv_default)
+    topo = f"{num_emoji(numero)} <b>{html.escape(title)}</b>"
+    if year:
+        topo += f" ({html.escape(year)})"
+    meta = ["📺 Série" if tv else "🎬 Filme"]
+    nota = item.get("vote_average") or 0
+    if nota and (item.get("vote_count") or 0) >= 5:
+        meta.append(f"⭐ {nota:.1f}".replace(".", ","))
+    gens = nomes_generos(item.get("genre_ids") or [g.get("id") for g in item.get("genres") or []])
+    if gens:
+        meta.append(", ".join(gens))
+    return topo + "\n      " + html.escape(" · ".join(meta))
+
+def texto_vitrine(titulo, fatia, primeiro_num, is_tv=False, total=None, rodape=None):
+    linhas = [f"<b>{html.escape(titulo)}</b>"]
+    if total:
+        ultimo = primeiro_num + len(fatia) - 1
+        linhas.append(f"<i>{primeiro_num}–{ultimo} de {total}</i>")
+    linhas.append("")
+    for n, item in enumerate(fatia, primeiro_num):
+        linhas.append(linha_item(item, n, is_tv))
+    linhas.append("")
+    linhas.append(rodape or "👇 Toque no título para ver sinopse, trailer e onde assistir.")
+    return "\n".join(linhas)
+
 async def enviar_vitrine(context, chat_id, itens, is_tv=False, categoria=None,
-                         titulo="🎬 Títulos", page=0, lista_id=None, destacar=True):
+                         titulo="🎬 Títulos", page=0, lista_id=None, destacar=True,
+                         por_pagina=6, dedupe=True, avisar_vazio=True):
+    """Lista organizada: (opcional) card completo do nº 1 + lista numerada com botões
+    que abrem o mesmo card da busca individual, com paginação Mais ▶️."""
     if not lista_id:
-        itens = [i for i in (itens or []) if i.get("id")]
+        itens = [i for i in (itens or []) if i.get("id")
+                 and i.get("media_type") in (None, "movie", "tv")]
         if not itens:
-            await avisar_tmdb_vazio(context, chat_id)
+            if avisar_vazio:
+                await avisar_tmdb_vazio(context, chat_id)
             return
-        tipo = "tv" if is_tv else "movie"
-        novos = filtrar(chat_id, itens, tipo, permitir_repetir=False)
-        itens = novos or itens
+        if dedupe:
+            tipo = "tv" if is_tv else "movie"
+            novos = filtrar(chat_id, itens, tipo, permitir_repetir=False)
+            itens = novos or itens
         lista_id = _vitrine_guardar(itens, is_tv, categoria, titulo)
+        _vitrines[lista_id]["por_pagina"] = max(1, min(int(por_pagina or 6), 10))
+        _vitrines[lista_id]["destacar"] = bool(destacar)
     data = _vitrines.get(lista_id)
     if not data:
         await enviar(context, chat_id, text="⏳ Essa seleção expirou. Toque de novo no menu.")
@@ -2501,24 +2578,28 @@ async def enviar_vitrine(context, chat_id, itens, is_tv=False, categoria=None,
     is_tv = data["is_tv"]
     categoria = data.get("categoria")
     titulo = data.get("titulo") or titulo
+    por_pagina = data.get("por_pagina", 6)
+    destacar = data.get("destacar", destacar)
 
     if page == 0 and destacar and itens:
         feat = itens[0]
         tv = item_is_tv(feat, is_tv)
         await send_item(context, chat_id, feat, is_tv=tv, tipo="tv" if tv else "movie",
                         categoria=categoria or categoria_padrao(tv))
-        inicio, fim = 1, 6
-    else:
-        inicio = 1 + page * 5 if destacar else page * 5
-        fim = inicio + 5
 
+    inicio = page * por_pagina
+    fim = inicio + por_pagina
     fatia = itens[inicio:fim]
+    if not fatia:
+        if page > 0:
+            await enviar(context, chat_id, text="Não há mais títulos por agora.")
+        return
     botoes = []
-    for item in fatia:
+    for n, item in enumerate(fatia, inicio + 1):
         tv = item_is_tv(item, is_tv)
         kind = "tv" if tv else "movie"
         botoes.append([InlineKeyboardButton(
-            rotulo_item(item, is_tv),
+            rotulo_item(item, is_tv, numero=n),
             callback_data=f"ver:{kind}:{item['id']}")])
     nav = []
     if page > 0:
@@ -2527,14 +2608,16 @@ async def enviar_vitrine(context, chat_id, itens, is_tv=False, categoria=None,
         nav.append(InlineKeyboardButton("Mais ▶️", callback_data=f"pg:{lista_id}:{page+1}"))
     if nav:
         botoes.append(nav)
-    if botoes:
-        await enviar(
-            context, chat_id,
-            text=f"<b>{html.escape(titulo)}</b>\nToque em um título para abrir o card.",
-            markup=InlineKeyboardMarkup(botoes),
-        )
-    elif page > 0:
-        await enviar(context, chat_id, text="Não há mais títulos por agora.")
+    rodape = None
+    if page == 0 and destacar:
+        rodape = "☝️ O nº 1 está no card acima.\n👇 Toque em outro título para ver sinopse, trailer e onde assistir."
+    await enviar(
+        context, chat_id,
+        text=texto_vitrine(titulo, fatia, inicio + 1, is_tv,
+                           total=len(itens) if len(itens) > por_pagina else None,
+                           rodape=rodape),
+        markup=InlineKeyboardMarkup(botoes),
+    )
     if page == 0:
         await enviar_dica(context, chat_id)
 
@@ -2543,8 +2626,17 @@ def ai_system_prompt():
     site = ensure_https(SITE_URL)
     return (
         "Você é o assistente do StreamFlix VIP, um app de filmes e séries. "
-        "Responda sempre em português do Brasil, de forma curta e amigável (no máximo 8 linhas). "
-        "Ajude a recomendar filmes e séries, a usar o bot (/filme, /serie, /top10, /indique) e a instalar o app.\n\n"
+        "Responda sempre em português do Brasil, de forma curta, amigável e organizada. "
+        "Ajude a recomendar filmes e séries, a usar o bot (digitar o nome do filme, /filme, /serie, /top10, /indique) e a instalar o app.\n\n"
+        "FORMATO DA RESPOSTA (obrigatório):\n"
+        "- Comece com uma linha curta de título em **negrito** (pode ter 1 emoji).\n"
+        "- Depois use frases curtas ou tópicos com '- ' (no máximo 5 tópicos). Passos de instalação em lista numerada '1. '.\n"
+        "- Ao recomendar, um tópico por título: **Nome do título** (ano) — motivo em poucas palavras.\n"
+        "- Emojis com moderação (no máximo 3). Sem tabelas, sem títulos com #, sem blocos de código.\n"
+        "- No máximo 900 caracteres.\n"
+        "- Se citar filmes ou séries específicos, termine com uma última linha exatamente assim: "
+        "TITULOS: Nome 1 (ano); Nome 2 (ano) — no máximo 5, com o nome mais conhecido no Brasil. "
+        "Se não citar nenhum título, não escreva essa linha.\n\n"
         "O app NÃO está na Play Store, Samsung ou LG. Ele é instalado pelo site ou pelo app Downloader. Como instalar:\n"
         f"- Celular Android: abra {site}/downloads/app-latest.apk no navegador e instale o APK (permita 'instalar apps desconhecidos'), "
         f"ou no app Downloader digite o código {DOWNLOADER_CELULAR}.\n"
@@ -2601,6 +2693,8 @@ def ai_perguntar(pergunta):
         "max_tokens": AI_MAX_TOKENS,
         "temperature": 0.6,
     }
+    if "gpt-oss" in AI_MODEL:
+        body["reasoning_effort"] = "low"   # sobra mais token para a resposta
     try:
         r = requests.post(url, json=body, headers=headers, timeout=35)
         if r.status_code != 200:
@@ -2611,6 +2705,139 @@ def ai_perguntar(pergunta):
     except Exception as e:
         logging.warning(f"IA falhou: {type(e).__name__}")
         return None
+
+# ── Formatação das respostas da IA (Markdown -> HTML do Telegram) ──────────
+import re as _re
+
+AI_RESPOSTA_MAX = 1200   # caracteres do texto bruto (antes de virar HTML)
+
+def ai_separar_titulos(texto):
+    """Tira a linha final 'TITULOS: A (2020); B' e devolve (texto, [(nome, ano)])."""
+    titulos = []
+    linhas = (texto or "").strip().splitlines()
+    resto = []
+    for ln in linhas:
+        m = _re.match(r"^\s*[*_]*\s*T[IÍ]TULOS\s*[*_]*\s*:\s*(.+)$", ln, flags=_re.I)
+        if m:
+            for parte in _re.split(r"[;|]", m.group(1)):
+                parte = parte.strip(" .*_-•")
+                if not parte:
+                    continue
+                ma = _re.match(r"^(.*?)\s*\((\d{4})\)\s*$", parte)
+                nome, ano = (ma.group(1).strip(), ma.group(2)) if ma else (parte, "")
+                nome = nome.strip(" *_\"'“”")
+                if 1 < len(nome) <= 80 and (nome, ano) not in titulos:
+                    titulos.append((nome, ano))
+            continue
+        resto.append(ln)
+    return "\n".join(resto).strip(), titulos[:5]
+
+def _cortar_texto(texto, limite):
+    if len(texto) <= limite:
+        return texto
+    trecho = texto[:limite]
+    corte = trecho.rfind("\n")
+    if corte < limite * 0.6:
+        corte = max(trecho.rfind(". "), trecho.rfind(" "))
+    return trecho[:corte if corte > 0 else limite].rstrip() + "…"
+
+def _md_inline(s):
+    """s já vem escapado em HTML. Converte negrito/itálico/código/links."""
+    codes = []
+    def _guarda(m):
+        codes.append(m.group(1))
+        return f"\x00{len(codes)-1}\x00"
+    s = _re.sub(r"`([^`\n]+)`", _guarda, s)
+    s = _re.sub(r"\[([^\]\n]+)\]\((https?://[^\s)\"<>]+)\)", r'<a href="\2">\1</a>', s)
+    s = _re.sub(r"\*\*(?!\s)(.+?)(?<!\s)\*\*", r"<b>\1</b>", s)
+    s = _re.sub(r"(?<![\w/])__(?!\s)(.+?)(?<!\s)__(?![\w/])", r"<b>\1</b>", s)
+    s = _re.sub(r"(?<![\w*])\*(?![\s*])([^*\n]+?)(?<![\s*])\*(?![\w*])", r"<i>\1</i>", s)
+    s = _re.sub(r"~~(.+?)~~", r"\1", s)
+    s = _re.sub(r"\x00(\d+)\x00", lambda m: f"<code>{codes[int(m.group(1))]}</code>", s)
+    return s
+
+def md_para_html(texto, limite=AI_RESPOSTA_MAX):
+    """Markdown simples (como os modelos escrevem) -> HTML seguro do Telegram."""
+    texto = (texto or "").replace("\r\n", "\n").strip()
+    texto = _re.sub(r"<think>.*?</think>", "", texto, flags=_re.S).strip()
+    texto = _re.sub(r"```[a-zA-Z]*\n?(.*?)```", lambda m: m.group(1).strip(), texto, flags=_re.S)
+    texto = _cortar_texto(texto, limite)
+    saida = []
+    for ln in texto.split("\n"):
+        bruto = ln.rstrip()
+        if _re.match(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$", bruto):
+            continue                      # separador de tabela
+        if _re.match(r"^\s*([-*_]\s*){3,}$", bruto):
+            continue                      # linha horizontal
+        esc = html.escape(bruto, quote=False)
+        m = _re.match(r"^\s*#{1,6}\s+(.*)$", esc)
+        if m:
+            titulo = _re.sub(r"\*\*|__", "", m.group(1).strip())
+            saida.append(f"<b>{_md_inline(titulo)}</b>")
+            continue
+        if bruto.strip().startswith("|") and bruto.strip().endswith("|"):
+            celulas = [c.strip() for c in bruto.strip().strip("|").split("|") if c.strip()]
+            saida.append("• " + _md_inline(html.escape(" — ".join(celulas), quote=False)))
+            continue
+        m = _re.match(r"^\s*[-*+•]\s+(.*)$", esc)
+        if m:
+            saida.append("• " + _md_inline(m.group(1)))
+            continue
+        m = _re.match(r"^\s*&gt;\s?(.*)$", esc)
+        if m:
+            saida.append("<i>" + _md_inline(m.group(1)) + "</i>")
+            continue
+        saida.append(_md_inline(esc.strip()))
+    out = "\n".join(saida)
+    out = _re.sub(r"\n{3,}", "\n\n", out).strip()
+    return out
+
+def html_para_texto(s):
+    """Fallback: tira as tags e desfaz o escape."""
+    return html.unescape(_re.sub(r"<[^>]+>", "", s or ""))
+
+def md_para_texto(texto, limite=AI_RESPOSTA_MAX):
+    t = _cortar_texto((texto or "").strip(), limite)
+    t = _re.sub(r"^\s*#{1,6}\s+", "", t, flags=_re.M)
+    t = _re.sub(r"^\s*\|?\s*:?-{2,}.*$\n?", "", t, flags=_re.M)
+    t = _re.sub(r"^\s*\|(.*)\|\s*$", lambda m: "• " + " — ".join(
+        c.strip() for c in m.group(1).split("|") if c.strip()), t, flags=_re.M)
+    t = _re.sub(r"\*\*|__|`", "", t)
+    t = _re.sub(r"^\s*[-*+]\s+", "• ", t, flags=_re.M)
+    return t
+
+def _match_titulo_tmdb(nome, ano):
+    """Procura um título citado pela IA no TMDB. Devolve (kind, id, rótulo) ou None."""
+    d = tmdb("search/multi", {"query": nome, "include_adult": "false"}) or {}
+    res = [r for r in d.get("results") or [] if r.get("media_type") in ("movie", "tv")]
+    if not res:
+        return None
+    alvo = normalizar_busca(nome)
+    def _ok(r):
+        tv = r.get("media_type") == "tv"
+        nomes = {normalizar_busca(r.get("name" if tv else "title") or ""),
+                 normalizar_busca(r.get("original_name" if tv else "original_title") or "")}
+        r_ano = ((r.get("first_air_date") if tv else r.get("release_date")) or "")[:4]
+        return alvo in nomes and (not ano or not r_ano or abs(int(ano) - int(r_ano)) <= 1)
+    escolhido = next((r for r in res[:8] if _ok(r)), None)
+    if not escolhido:
+        return None
+    kind = escolhido["media_type"]
+    return kind, escolhido["id"], rotulo_item(escolhido, kind == "tv")
+
+def ai_botoes_titulos(titulos):
+    botoes, vistos = [], set()
+    for nome, ano in titulos[:5]:
+        try:
+            achado = _match_titulo_tmdb(nome, ano)
+        except Exception:
+            achado = None
+        if achado and (achado[0], achado[1]) not in vistos:
+            vistos.add((achado[0], achado[1]))
+            botoes.append([InlineKeyboardButton(achado[2], callback_data=f"ver:{achado[0]}:{achado[1]}")])
+        if len(botoes) >= 4:
+            break
+    return InlineKeyboardMarkup(botoes) if botoes else None
 
 def mensagem_para_o_bot(update):
     """True se a pessoa mencionou o bot ou respondeu uma mensagem dele."""
@@ -2660,16 +2887,33 @@ async def _entregar_ia(update, context, pergunta):
         await context.bot.send_chat_action(cid, "typing")
     except Exception:
         pass
-    resposta = ai_perguntar(pergunta)
+    resposta = await asyncio.to_thread(ai_perguntar, pergunta)
     ai_quota_inc(uid)
     if not resposta:
         if msg:
-            await msg.reply_text("😕 Não consegui responder agora. Tente de novo em instantes, ou use /filme e /serie.")
+            await msg.reply_text("😕 Não consegui responder agora. Tente de novo em instantes, ou digite só o nome do filme.")
         return
-    if len(resposta) > 3500:
-        resposta = resposta[:3490] + "…"
-    if msg:
-        await msg.reply_text(resposta)
+    corpo, titulos = ai_separar_titulos(resposta)
+    markup = None
+    if titulos and AI_TITLE_BUTTONS:
+        try:
+            markup = await asyncio.to_thread(ai_botoes_titulos, titulos)
+        except Exception as e:
+            logging.warning(f"IA botões: {type(e).__name__}")
+    if markup:
+        corpo += "\n\n👇 Toque para abrir o card completo."
+    if not msg:
+        return
+    try:
+        await msg.reply_text(md_para_html(corpo), parse_mode="HTML",
+                             reply_markup=markup, link_preview_options=SEM_PREVIEW)
+    except Exception as e:
+        logging.warning(f"IA HTML recusado ({type(e).__name__}); enviando texto puro")
+        try:
+            await msg.reply_text(md_para_texto(corpo), reply_markup=markup,
+                                 link_preview_options=SEM_PREVIEW)
+        except Exception as e2:
+            logging.error(f"IA envio: {type(e2).__name__}")
 
 async def avisar_tmdb_vazio(context, cid):
     await enviar(context, cid, text="😕 Não encontrei títulos agora. Tente de novo em instantes.")
@@ -2727,7 +2971,10 @@ async def executar_menu(context, cid, text):
         if AI_ENABLED:
             ia_txt = "\n<code>/ia sua pergunta</code> — converse com o assistente\n"
         await enviar(context, cid, text=(
-            "⌨️ Busque assim:\n\n"
+            "🔎 <b>Como buscar</b>\n\n"
+            "Digite só o nome, sem comando. Ex.: <code>Duna</code> ou <code>The Last of Us</code>\n"
+            "No grupo também funciona: mande só o nome do filme.\n\n"
+            "Ou, se preferir:\n"
             "<code>/filme Nome do Filme</code>\n"
             "<code>/serie Nome da Série</code>\n"
             "<code>/ator Nome do Ator</code>\n"
@@ -2740,6 +2987,145 @@ async def executar_menu(context, cid, text):
 
     elif text == "❓ Ajuda":
         await cmd_ajuda_fn(context, cid)
+
+# ── Busca digitando só o nome ──────────────────────────────────────────────
+import re as _re_b
+
+def normalizar_busca(texto):
+    t = unicodedata.normalize("NFKD", (texto or "").lower())
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    t = _re_b.sub(r"[^a-z0-9]+", " ", t)
+    return " ".join(t.split())
+
+PALAVRAS_PERGUNTA = (
+    "como", "qual", "quais", "onde", "por que", "porque", "pq", "o que", "oque", "quando",
+    "quanto", "quantos", "quem", "sera", "tem como", "da pra", "da para", "posso", "pode",
+    "indica", "indique", "recomenda", "recomende", "sugere", "sugira", "sugestao de",
+    "me indica", "me recomenda", "me fala", "me ajuda", "ajuda", "quero", "queria",
+    "preciso", "procuro", "estou procurando", "to procurando", "tem algum", "tem alguma",
+    "algum filme", "alguma serie", "um filme", "uma serie", "filme de", "filmes de",
+    "serie de", "series de", "melhor", "melhores", "vale a pena", "explica", "fale",
+)
+
+CONVERSA_COMUM = {
+    "oi", "ola", "opa", "eae", "e ai", "salve", "bom dia", "boa tarde", "boa noite",
+    "obrigado", "obrigada", "obg", "vlw", "valeu", "ok", "blz", "beleza", "tmj", "sim",
+    "nao", "kkk", "kkkk", "kkkkk", "rs", "rsrs", "haha", "top", "show", "massa", "legal",
+    "otimo", "perfeito", "tudo bem", "td bem", "tudo bom", "boa", "bora", "verdade",
+    "entendi", "certo", "isso", "aqui", "ja", "nada", "teste", "testando", "ajuda", "help",
+    "bem vindo", "bem vinda", "seja bem vindo", "parabens", "amem", "amem amem", "pix",
+    "vip", "app", "aplicativo", "apk", "link", "site", "grupo", "admin", "adm",
+}
+
+def parece_pergunta(texto):
+    t = (texto or "").strip()
+    if "?" in t:
+        return True
+    n = normalizar_busca(t)
+    if len(t) > 60 or len(n.split()) > 8:
+        return True
+    return any(n == p or n.startswith(p + " ") for p in PALAVRAS_PERGUNTA)
+
+def parece_titulo(texto, grupo=False):
+    """Texto curto que parece nome de filme/série (não pergunta, não papo)."""
+    t = (texto or "").strip()
+    if not t or t.startswith("/"):
+        return False
+    if _re_b.search(r"https?://|www\.|t\.me/|@\w", t, flags=_re_b.I):
+        return False
+    if "\n" in t or parece_pergunta(t):
+        return False
+    n = normalizar_busca(t)
+    if not n or n in CONVERSA_COMUM:
+        return False
+    if _re_b.fullmatch(r"(k|h|a|s|r)+", n.replace(" ", "")):
+        return False                          # kkkk, hahaha, rsrs
+    letras = sum(c.isalpha() for c in t)
+    if letras < 2:
+        return False
+    if grupo:
+        return 2 <= len(t) <= 40 and len(n.split()) <= 6 and len(n) >= 3
+    return 2 <= len(t) <= 60
+
+def buscar_titulos(query):
+    """search/multi só com filmes e séries, na ordem de relevância do TMDB."""
+    d = tmdb("search/multi", {"query": query, "include_adult": "false"}) or {}
+    return [r for r in d.get("results") or []
+            if r.get("media_type") in ("movie", "tv") and r.get("id")]
+
+def _nomes_item(r):
+    tv = item_is_tv(r)
+    return {normalizar_busca(r.get("name" if tv else "title") or ""),
+            normalizar_busca(r.get("original_name" if tv else "original_title") or "")} - {""}
+
+def escolher_resultado(query, resultados):
+    """Devolve ('card', item) se houver um match forte, ('lista', itens) se vários,
+    ou (None, []) se nada. Também diz se há algum título que bate com o texto."""
+    if not resultados:
+        return None, []
+    alvo = normalizar_busca(query)
+    exatos = [r for r in resultados if alvo in _nomes_item(r)]
+    if len(resultados) == 1:
+        return "card", resultados[0]
+    if len(exatos) == 1:
+        return "card", exatos[0]
+    if len(exatos) > 1:
+        a, b = exatos[0], exatos[1]
+        if (a.get("popularity") or 0) >= 3 * max(b.get("popularity") or 0, 0.1) \
+                and (a.get("vote_count") or 0) >= 50:
+            return "card", a
+    return "lista", resultados
+
+def match_relevante(query, resultados):
+    """No grupo: só responde se algum título bate de verdade com o texto digitado."""
+    alvo = normalizar_busca(query)
+    if not alvo:
+        return []
+    bons = []
+    for r in resultados[:10]:
+        nomes = _nomes_item(r)
+        populares = (r.get("vote_count") or 0) >= 20 or (r.get("popularity") or 0) >= 5
+        bate = alvo in nomes or any(n.startswith(alvo + " ") or (" " + alvo) in (" " + n) for n in nomes)
+        if bate and populares:
+            bons.append(r)
+    return bons
+
+async def responder_busca(context, chat_id, query, resultados, *, silencioso=False):
+    """Mostra o resultado de uma busca: card completo se for 1 match forte,
+    senão lista organizada com botões (cada um abre o mesmo card)."""
+    modo, alvo = escolher_resultado(query, resultados)
+    if modo is None:
+        if not silencioso:
+            await enviar(context, chat_id, text=(
+                f"😕 Não encontrei <b>{html.escape(query)}</b>.\n"
+                "Confira a grafia ou tente o nome original (em inglês)."))
+        return False
+    if modo == "card":
+        tv = item_is_tv(alvo)
+        await send_item(context, chat_id, alvo, is_tv=tv, tipo="tv" if tv else "movie",
+                        categoria=categoria_padrao(tv))
+        return True
+    await enviar_vitrine(context, chat_id, alvo[:12], titulo=f"🔍 Resultados para “{query[:40]}”",
+                         destacar=False, por_pagina=6, dedupe=False, avisar_vazio=not silencioso)
+    return True
+
+async def busca_por_texto(update, context, texto, *, grupo=False):
+    cid = update.effective_chat.id
+    query = " ".join(texto.split())[:60]
+    if not grupo:
+        try:
+            await context.bot.send_chat_action(cid, "typing")
+        except Exception:
+            pass
+    resultados = await asyncio.to_thread(buscar_titulos, query)
+    if grupo:
+        resultados = match_relevante(query, resultados)
+        if not resultados:
+            return False                      # silêncio no grupo
+        return await responder_busca(context, cid, query, resultados, silencioso=True)
+    if not resultados:
+        return False
+    return await responder_busca(context, cid, query, resultados)
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -2773,14 +3159,58 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _gerar_e_enviar_pix(context, cid, uid, valor)
         return
 
-    # IA: no grupo só se mencionou ou respondeu o bot; no privado, texto livre (se a IA estiver ligada).
+    # Texto livre (fora do menu):
+    # - nome de filme/série -> busca no TMDB (card ou lista com botões)
+    # - pergunta -> IA (no grupo, só se mencionou/respondeu o bot)
     if text not in MENU_BOTOES:
+        ia_on = AI_ENABLED and AI_API_KEY
         para_bot, pergunta_ia = mensagem_para_o_bot(update)
-        if para_bot or (chat.type == "private" and AI_ENABLED and AI_API_KEY):
-            await _entregar_ia(update, context, pergunta_ia or text)
+        if chat.type == "private":
+            if TEXT_SEARCH and parece_titulo(text) and (acesso_conteudo(cid) or PUBLIC_SEARCH):
+                if not rate_ok(uid, "search", COMMAND_RATE_SECONDS):
+                    await avisar_aguarde(update)
+                    return
+                if await busca_por_texto(update, context, text):
+                    return
+                if not ia_on:
+                    await enviar(context, cid, text=(
+                        f"😕 Não encontrei <b>{html.escape(text[:60])}</b>.\n"
+                        "Confira a grafia ou tente o nome original (em inglês)."))
+                    return
+            if ia_on:
+                await _entregar_ia(update, context, pergunta_ia or text)
+            else:
+                await enviar(context, cid, text=(
+                    "🔎 Digite só o nome do filme ou série, por exemplo: <code>Duna</code>\n"
+                    "Ou use o menu abaixo."))
             return
-        if chat.type in ("group", "supergroup", "channel"):
+        if chat.type in ("group", "supergroup"):
+            if para_bot:
+                q_txt = pergunta_ia or ""
+                # "@bot Duna" ou resposta ao bot com um nome -> busca; senão IA
+                if TEXT_SEARCH and q_txt and parece_titulo(q_txt, grupo=True) and acesso_conteudo(cid):
+                    if rate_ok(uid, "txt", GROUP_SEARCH_RATE_SECONDS) and \
+                            await busca_por_texto(update, context, q_txt, grupo=True):
+                        return
+                await _entregar_ia(update, context, q_txt or text)
+                return
+            msg = update.message
+            if not (TEXT_SEARCH and GROUP_TEXT_SEARCH and acesso_conteudo(cid)):
+                return
+            if msg.sender_chat or (user and user.is_bot) or msg.via_bot or msg.forward_origin:
+                return
+            if msg.reply_to_message:
+                return                        # resposta a outra pessoa = conversa
+            if not parece_titulo(text, grupo=True):
+                return
+            # anti-spam: por pessoa e por grupo (silencioso)
+            if not rate_ok(uid, "txt", GROUP_TEXT_SEARCH_USER_SECONDS):
+                return
+            if not rate_ok(cid, "txt_grupo", GROUP_TEXT_SEARCH_CHAT_SECONDS):
+                return
+            await busca_por_texto(update, context, text, grupo=True)
             return
+        return
 
     # Em grupos, só reage aos botões do menu — nunca responde "acesso bloqueado" no meio do papo.
     if chat.type in ("group", "supergroup", "channel"):
@@ -2804,27 +3234,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await executar_menu(context, cid, text)
 
 async def enviar_escolhas(context, chat_id, resultados, is_tv, query):
+    for r in resultados or []:
+        r.setdefault("media_type", "tv" if is_tv else "movie")
     if not resultados:
         tipo = "Série" if is_tv else "Filme"
         await enviar(context, chat_id, text=f"😕 {tipo} não encontrado: <b>{html.escape(query)}</b>")
         return
-    if len(resultados) == 1:
-        await send_item(context, chat_id, resultados[0], is_tv=is_tv, tipo="tv" if is_tv else "movie")
-        return
-    botoes = []
-    kind = "tv" if is_tv else "movie"
-    for item in resultados[:5]:
-        title = item.get("name") if is_tv else item.get("title", "?")
-        year = (item.get("first_air_date") if is_tv else item.get("release_date") or "")[:4]
-        label = f"{title} ({year})" if year else (title or "?")
-        if len(label) > 60:
-            label = label[:57] + "…"
-        botoes.append([InlineKeyboardButton(label, callback_data=f"pick:{kind}:{item.get('id')}")])
-    await enviar(
-        context, chat_id,
-        text=f"🔍 Encontrei estes títulos para <b>{html.escape(query)}</b>. Qual você quer?",
-        markup=InlineKeyboardMarkup(botoes),
-    )
+    await responder_busca(context, chat_id, query, resultados)
 
 async def callback_start(update, context, acao):
     q = update.callback_query
@@ -2841,7 +3257,8 @@ async def callback_start(update, context, acao):
             return
         d = tmdb("movie/now_playing", {"region": "BR"})
         if d and d.get("results"):
-            await enviar_lista(context, cid, d.get("results", []), tipo="now_playing")
+            await enviar_vitrine(context, cid, d.get("results", []),
+                                 categoria="🎬 LANÇAMENTO", titulo="🎬 Em cartaz agora")
         else:
             await avisar_tmdb_vazio(context, cid)
         return
@@ -3006,8 +3423,10 @@ async def cmd_ator(update: Update, context: ContextTypes.DEFAULT_TYPE):
     filmes   = sorted(filmes_d.get("cast",[]) if filmes_d else [], key=lambda x: x.get("popularity",0), reverse=True)
     if not filmes:
         await enviar(context, cid, text=f"😕 Nenhum filme encontrado para <b>{html.escape(nome)}</b>"); return
-    await enviar(context, cid, text=f"🌟 <b>Filmes de {html.escape(nome)}:</b>")
-    await enviar_lista(context, cid, filmes[:10], tipo="movie", limite=3)
+    for f in filmes:
+        f.setdefault("media_type", "movie")
+    await enviar_vitrine(context, cid, filmes[:18], titulo=f"🌟 Filmes com {nome}",
+                         destacar=True, por_pagina=6, dedupe=False)
 
 async def cmd_top10(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _guard_busca(update, context):
@@ -3016,16 +3435,8 @@ async def cmd_top10(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d   = tmdb("trending/all/week")
     if not d or not d.get("results"):
         await enviar(context, cid, text="😕 Não foi possível buscar o Top 10."); return
-    itens  = d["results"][:10]
-    linhas = ["🏆 <b>Mais vistos da semana:</b>\n"]
-    for i, item in enumerate(itens, 1):
-        is_tv = item.get("media_type") == "tv"
-        name  = item.get("name") if is_tv else item.get("title","?")
-        ano   = (item.get("first_air_date","") if is_tv else item.get("release_date",""))[:4]
-        nota  = item.get("vote_average",0)
-        tipo  = "📺" if is_tv else "🎬"
-        linhas.append(f"{i}. {tipo} {html.escape(name)} ({ano}) — ⭐{nota:.1f}")
-    await enviar(context, cid, text="\n".join(linhas), markup=markup_cta_app())
+    await enviar_vitrine(context, cid, d["results"][:10], titulo="🏆 Top 10 da semana",
+                         categoria="🏆 TOP 10", destacar=True, por_pagina=10, dedupe=False)
 
 def texto_tutorial(bot_username=None):
     uname = bot_username or _bot_username or "StreamFlixVip_Bot"
@@ -3034,13 +3445,16 @@ def texto_tutorial(bot_username=None):
         ia_bloco = (
             "\n🤖 <b>Assistente</b>\n"
             "<code>/ia um filme de comédia para hoje</code>\n"
+            "No privado, é só perguntar (ex.: <i>qual filme de terror vale a pena?</i>)\n"
             f"Ou me mencione no grupo: <code>@{html.escape(uname)} indica um terror</code>\n"
         )
     return (
         "👋 <b>Como usar o StreamFlix VIP</b>\n\n"
         "1️⃣ No privado, toque nos botões do menu (Em Cartaz, Séries, Sugestão…).\n"
         "Você recebe um card bonito e mais títulos para abrir. Toque em <b>Mais ▶️</b> para ver o resto.\n\n"
-        "2️⃣ Para buscar um nome específico:\n"
+        "2️⃣ Para buscar, digite só o nome (no privado ou no grupo):\n"
+        "<code>Duna</code> · <code>The Last of Us</code>\n"
+        "Se preferir comandos:\n"
         "<code>/filme Duna</code>\n"
         "<code>/serie The Last of Us</code>\n"
         "<code>/ator Zendaya</code>\n"

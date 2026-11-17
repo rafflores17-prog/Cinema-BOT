@@ -94,3 +94,16 @@ async def anon():
     await bot.handle_text(mkupdate("Duna","supergroup",-100,sender_chat=types.SimpleNamespace(id=-200),user_is_bot=True),ctx)
     print("outro canal:", sent); assert not sent
 asyncio.run(anon())
+async def adm():
+    bot.AI_ENABLED=False; bot._rate_bucket.clear(); sent.clear()
+    anon=lambda: mkupdate("Duna","supergroup",-100,sender_chat=types.SimpleNamespace(id=-100),user_is_bot=True)
+    await bot.handle_text(anon(),ctx); n1=len(sent)
+    bot._rate_bucket[(-100,"txt_adm")]-=9   # passou o limite de 8s do grupo
+    await bot.handle_text(anon(),ctx)
+    print("anônimo 2x em 9s:", n1, len(sent)); assert len(sent) > n1 > 0
+    sent.clear(); bot._rate_bucket.clear()
+    await bot.handle_text(mkupdate("Duna","supergroup",-100),ctx); n1=len(sent)
+    bot._rate_bucket[(-100,"txt_grupo")]-=21; bot._rate_bucket[(7,"txt")]-=9
+    await bot.handle_text(mkupdate("Duna","supergroup",-100),ctx)
+    print("usuário comum 2x em 9s:", n1, len(sent)); assert len(sent) == n1
+asyncio.run(adm())

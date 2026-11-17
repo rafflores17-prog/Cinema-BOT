@@ -108,7 +108,8 @@ AI_TITLE_BUTTONS          = env_bool("AI_TITLE_BUTTONS", True)  # botões dos t�
 # Busca só digitando o nome (sem /filme). No grupo, só textos com cara de título.
 TEXT_SEARCH                    = env_bool("TEXT_SEARCH", True)
 GROUP_TEXT_SEARCH              = env_bool("GROUP_TEXT_SEARCH", True)
-GROUP_TEXT_SEARCH_USER_SECONDS = env_int("GROUP_TEXT_SEARCH_USER_SECONDS", 60)
+GROUP_TEXT_SEARCH_USER_SECONDS = env_int("GROUP_TEXT_SEARCH_USER_SECONDS", 25)
+GROUP_TEXT_SEARCH_ADMIN_SECONDS = env_int("GROUP_TEXT_SEARCH_ADMIN_SECONDS", 8)   # admins/anônimo: só por grupo
 GROUP_TEXT_SEARCH_CHAT_SECONDS = env_int("GROUP_TEXT_SEARCH_CHAT_SECONDS", 20)
 SEM_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
@@ -3435,6 +3436,28 @@ def parece_titulo(texto, grupo=False):
         return 2 <= len(t) <= 40 and len(n.split()) <= 6 and len(n) >= 3
     return 2 <= len(t) <= 60
 
+_admins_cache = {}   # chat_id -> (expira, set(user_ids))
+
+async def eh_admin_grupo(context, cid, uid):
+    """Dono/admin do grupo (lista em cache por 10 min; ADMIN_ID sempre conta)."""
+    if not uid:
+        return False
+    if ADMIN_ID and uid == ADMIN_ID:
+        return True
+    agora = time.time()
+    c = _admins_cache.get(cid)
+    if not c or c[0] < agora:
+        ids = set()
+        try:
+            for m in await context.bot.get_chat_administrators(cid):
+                if m.user:
+                    ids.add(m.user.id)
+        except Exception as e:
+            logging.info(f"admins {cid}: {type(e).__name__}")
+        c = (agora + 600, ids)
+        _admins_cache[cid] = c
+    return uid in c[1]
+
 def _log_ignorado(motivo, texto):
     logging.info(f"Grupo: texto ignorado ({motivo}): {(texto or '')[:40]!r}")
     return None
@@ -3463,6 +3486,31 @@ def variantes_busca(query):
         else:
             add("a " + nv)
     return vs[:4]
+
+def buscar_multi(query, lang="pt-BR", paginas=2):
+    """search/multi (filmes, séries e pessoas) em 1-2 páginas."""
+    out = []
+    for page in range(1, paginas + 1):
+        d = tmdb("search/multi", {"query": query, "include_adult": "false",
+                                  "language": lang, "page": page}) or {}
+        out += [r for r in d.get("results") or [] if r.get("id")]
+        if (d.get("total_pages") or 1) <= page:
+            break
+    return out
+
+def _so_titulos(res):
+    return [r for r in res if r.get("media_type") in ("movie", "tv")]
+
+def item_recente(r, dias=400):
+    """Lançado há até ~1 ano, ou ainda vai lançar (precisa ter pôster)."""
+    if not r.get("poster_path"):
+        return False
+    data = (r.get("release_date") or r.get("first_air_date") or "")[:10]
+    try:
+        d = datetime.strptime(data, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return d >= datetime.utcnow() - timedelta(days=dias)
 
 def buscar_titulos(query, lang="pt-BR"):
     """search/multi só com filmes e séries, na ordem de relevância do TMDB."""
@@ -3498,8 +3546,105 @@ def item_decente(r):
     return bool(r.get("poster_path") or (r.get("overview") or "").strip())
 
 def item_forte(r):
-    """Bom o bastante para ir direto como card: tem pôster ou sinopse e algum público."""
-    return item_decente(r) and ((r.get("vote_count") or 0) >= 15 or (r.get("popularity") or 0) >= 8)
+    """Bom o bastante para ir direto como card: tem pôster ou sinopse e algum público
+    (ou é lançamento recente/futuro com pôster)."""
+    return item_decente(r) and ((r.get("vote_count") or 0) >= 15 or (r.get("popularity") or 0) >= 8
+                                or item_recente(r))
+
+def _nome_pt(r):
+    tv = item_is_tv(r)
+    return normalizar_busca(r.get("name" if tv else "title") or "")
+
+def _nome_orig(r):
+    tv = item_is_tv(r)
+    return normalizar_busca(r.get("original_name" if tv else "original_title") or "")
+
+def _bate_parcial(alvo, r):
+    return any(n and (n.startswith(alvo + " ") or (" " + alvo + " ") in (" " + n + " "))
+               for n in (_nome_pt(r), _nome_orig(r)))
+
+def _pessoa_bate(alvo, p, grupo=False):
+    nome = normalizar_busca(p.get("name") or "")
+    if not nome or not p.get("known_for"):
+        return False
+    pop = p.get("popularity") or 0
+    if pop < (3 if grupo else 1):
+        return False
+    if nome == alvo:
+        return True
+    # nome de uma palavra só vale exato ("zendaya"); com 2+ palavras, todas precisam estar no nome
+    return len(alvo.split()) >= 2 and set(alvo.split()) <= set(nome.split())
+
+def planejar_busca(query, grupo=False):
+    """Decide o que mostrar para um texto digitado. Devolve:
+    ('card', item) | ('lista', itens, rotulo) | ('pessoa', pessoa) | (None,)."""
+    alvo = normalizar_busca(query)
+    if not alvo:
+        return (None,)
+    res = buscar_multi(query, "pt-BR")
+    titulos = _so_titulos(res)
+    pessoas = [r for r in res if r.get("media_type") == "person"]
+
+    # 1) título exato: nome em pt-BR primeiro, depois original
+    pop = lambda r: r.get("popularity") or 0
+    exatos = sorted([r for r in titulos if _nome_pt(r) == alvo and item_forte(r)], key=pop, reverse=True)
+    exatos += sorted([r for r in titulos if _nome_orig(r) == alvo and r not in exatos and item_forte(r)],
+                     key=pop, reverse=True)
+    pessoa = next((p for p in pessoas if _pessoa_bate(alvo, p, grupo)), None)
+    if exatos:
+        top = exatos[0]
+        pop_top = top.get("popularity") or 0
+        if pessoa and normalizar_busca(pessoa.get("name") or "") == alvo \
+                and (pessoa.get("popularity") or 0) >= 10 and pop_top * 2 < (pessoa.get("popularity") or 0):
+            return ("pessoa", pessoa)
+        if len(exatos) >= 2:
+            seg = exatos[1]
+            if not (pop_top >= 3 * max(seg.get("popularity") or 0, 0.1) and (top.get("vote_count") or 0) >= 50):
+                outros = [r for r in titulos if r not in exatos and item_decente(r)]
+                return ("lista", exatos + outros, query)
+        # concorrente próximo: título parecido tão popular quanto
+        rivais = [r for r in titulos if r not in exatos and item_decente(r) and _bate_parcial(alvo, r)
+                  and (r.get("popularity") or 0) >= 0.8 * max(pop_top, 0.1)]
+        if rivais:
+            return ("lista", [top] + rivais + [r for r in exatos[1:] if r not in rivais], query)
+        return ("card", top)
+
+    # 2) pessoa com nome que bate
+    if pessoa:
+        return ("pessoa", pessoa)
+
+    # 3) sem exato
+    if grupo:
+        bons = match_relevante(alvo, titulos)
+        if bons:
+            if len(bons) == 1 and item_forte(bons[0]):
+                return ("card", bons[0])
+            return ("lista", bons, query)
+    else:
+        decentes = [r for r in titulos if item_decente(r)]
+        if decentes:
+            fortes = [r for r in decentes if item_forte(r)]
+            if len(decentes) == 1 and fortes:
+                return ("card", decentes[0])
+            return ("lista", decentes, query)
+
+    # 4) último recurso: variantes (diminutivo/artigo) e en-US, só com nome exato
+    for v, lang in [(v, "pt-BR") for v in variantes_busca(query)[1:]] + [(query, "en-US")]:
+        nv = normalizar_busca(v)
+        tv_res = _so_titulos(buscar_multi(v, lang, paginas=1))
+        ex = [r for r in tv_res if nv in (_nome_pt(r), _nome_orig(r)) and item_forte(r)]
+        if grupo:
+            ex = [r for r in ex if (r.get("vote_count") or 0) >= 20 or (r.get("popularity") or 0) >= 5
+                  or item_recente(r)]
+        if len(ex) == 1:
+            return ("card", ex[0])
+        if ex:
+            return ("lista", ex, v)
+        if not grupo:
+            dec = [r for r in tv_res if item_decente(r)]
+            if dec:
+                return ("lista", dec, v)
+    return (None,)
 
 # Gênero digitado -> lista organizada do gênero (filmes; ou séries com "séries de X")
 GENEROS_TEXTO = {
@@ -3596,7 +3741,8 @@ def match_relevante(query, resultados):
     bons = []
     for r in resultados[:10]:
         nomes = _nomes_item(r)
-        populares = (r.get("vote_count") or 0) >= 20 or (r.get("popularity") or 0) >= 5
+        populares = (r.get("vote_count") or 0) >= 20 or (r.get("popularity") or 0) >= 5 \
+            or (alvo in nomes and item_recente(r))
         bate = alvo in nomes or any(n.startswith(alvo + " ") or (" " + alvo) in (" " + n) for n in nomes)
         if bate and populares:
             bons.append(r)
@@ -3649,10 +3795,78 @@ async def busca_por_texto(update, context, texto, *, grupo=False):
             await context.bot.send_chat_action(cid, "typing")
         except Exception:
             pass
-    resultados, usada = await asyncio.to_thread(buscar_com_variantes, query, grupo)
-    if not resultados:
+    plano = await asyncio.to_thread(planejar_busca, query, grupo)
+    return await executar_plano(context, cid, plano)
+
+async def executar_plano(context, cid, plano):
+    if not plano or plano[0] is None:
         return False                          # grupo: silêncio; privado: quem chamou decide
-    return await responder_busca(context, cid, usada, resultados, silencioso=grupo)
+    if plano[0] == "card":
+        item = plano[1]
+        tv = item_is_tv(item)
+        await send_item(context, cid, item, is_tv=tv, tipo="tv" if tv else "movie",
+                        categoria=categoria_padrao(tv))
+        return True
+    if plano[0] == "pessoa":
+        return await enviar_pessoa(context, cid, plano[1])
+    itens, rotulo = plano[1], plano[2]
+    await enviar_vitrine(context, cid, itens[:18], titulo=f"🔍 Resultados para “{rotulo[:40]}”",
+                         destacar=False, por_pagina=6, dedupe=False, avisar_vazio=False)
+    return True
+
+AUTO_APARICAO = ("self", "himself", "herself", "themselves", "ele mesmo", "ela mesma", "si mesmo",
+                 "narrator", "narrador", "host", "apresentador", "apresentadora")
+
+def carregar_obras_pessoa(pid, departamento=""):
+    """Filmes e séries de uma pessoa (atuação; direção se for diretor), por popularidade."""
+    d = tmdb(f"person/{pid}/combined_credits") or {}
+    brutos = list(d.get("cast") or [])
+    if (departamento or "").lower() in ("directing", "writing") or not brutos:
+        brutos += [c for c in d.get("crew") or [] if c.get("job") in ("Director", "Creator", "Screenplay")]
+    vistos, itens = set(), []
+    for c in brutos:
+        mt = c.get("media_type")
+        if mt not in ("movie", "tv") or not c.get("id"):
+            continue
+        if set(c.get("genre_ids") or []) & GENEROS_EXCLUIR_ALEATORIO:
+            continue
+        papel = (c.get("character") or "").strip().lower()
+        if papel and any(papel == k or papel.startswith(k + " ") or papel.startswith(k + "(")
+                         or f"({k})" in papel for k in AUTO_APARICAO):
+            continue
+        if mt == "tv" and (c.get("episode_count") or 99) <= 1:
+            continue                          # participação de 1 episódio
+        if not item_decente(c) or (mt, c["id"]) in vistos:
+            continue
+        vistos.add((mt, c["id"]))
+        itens.append(c)
+    itens.sort(key=lambda c: (c.get("popularity") or 0), reverse=True)
+    return itens
+
+async def enviar_pessoa(context, cid, pessoa):
+    """Cabeçalho com foto e nome + lista organizada das obras (botões abrem o card)."""
+    nome = pessoa.get("name") or "?"
+    pid = pessoa.get("id")
+    dep = pessoa.get("known_for_department") or ""
+    itens = await asyncio.to_thread(carregar_obras_pessoa, pid, dep)
+    if not itens:
+        return False
+    funcao = {"Acting": "Atuação", "Directing": "Direção", "Writing": "Roteiro"}.get(dep, dep or "Cinema")
+    conhecidos = [(k.get("title") or k.get("name")) for k in (pessoa.get("known_for") or [])
+                  if (k.get("title") or k.get("name"))][:3]
+    cap = f"🎭 <b>{html.escape(nome)}</b>\n<i>{html.escape(funcao)}</i>"
+    if conhecidos:
+        cap += "\n\nConhecido(a) por: " + html.escape(", ".join(conhecidos))
+    foto = f"https://image.tmdb.org/t/p/h632{pessoa['profile_path']}" if pessoa.get("profile_path") else None
+    if foto:
+        r = await enviar(context, cid, photo=foto, caption=cap)
+        if r is None and not chat_morto(cid):
+            await enviar(context, cid, text=cap)
+    else:
+        await enviar(context, cid, text=cap)
+    await enviar_vitrine(context, cid, itens[:30], titulo=f"🎬 Filmes e séries com {nome}",
+                         destacar=False, por_pagina=6, dedupe=False, avisar_vazio=False)
+    return True
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -3745,21 +3959,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return _log_ignorado("bot/encaminhada", text)
             if msg.reply_to_message:
                 return _log_ignorado("resposta a outra pessoa", text)
-            quem = cid if anonimo else uid     # anônimo: limite por grupo
-            if genero and GROUP_TEXT_SEARCH:
-                if rate_ok(quem, "txt", GROUP_TEXT_SEARCH_USER_SECONDS) and \
-                        rate_ok(cid, "txt_grupo", GROUP_TEXT_SEARCH_CHAT_SECONDS):
-                    await enviar_genero(context, cid, genero)
-                else:
-                    _log_ignorado("limite de tempo", text)
-                return
-            if not parece_titulo(text, grupo=True):
+            if not genero and not parece_titulo(text, grupo=True):
                 return _log_ignorado("não parece título", text)
-            # anti-spam: por pessoa e por grupo (silencioso)
-            if not rate_ok(quem, "txt", GROUP_TEXT_SEARCH_USER_SECONDS):
-                return _log_ignorado("limite por pessoa", text)
-            if not rate_ok(cid, "txt_grupo", GROUP_TEXT_SEARCH_CHAT_SECONDS):
-                return _log_ignorado("limite do grupo", text)
+            admin = anonimo or await eh_admin_grupo(context, cid, uid)
+            # anti-spam silencioso: admins/anônimo só têm limite curto por grupo
+            if admin:
+                if not rate_ok(cid, "txt_adm", GROUP_TEXT_SEARCH_ADMIN_SECONDS):
+                    return _log_ignorado("limite do grupo (admin)", text)
+            else:
+                if not rate_ok(uid, "txt", GROUP_TEXT_SEARCH_USER_SECONDS):
+                    return _log_ignorado("limite por pessoa", text)
+                if not rate_ok(cid, "txt_grupo", GROUP_TEXT_SEARCH_CHAT_SECONDS):
+                    return _log_ignorado("limite do grupo", text)
+            if genero and GROUP_TEXT_SEARCH:
+                await enviar_genero(context, cid, genero)
+                return
             if not await busca_por_texto(update, context, text, grupo=True):
                 _log_ignorado("sem resultado forte no TMDB", text)
             return
@@ -3981,15 +4195,9 @@ async def cmd_ator(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pessoas = d.get("results",[]) if d else []
     if not pessoas:
         await enviar(context, cid, text=f"😕 Ator não encontrado: <b>{html.escape(q)}</b>"); return
-    pessoa   = pessoas[0]; nome = pessoa.get("name",""); pid = pessoa.get("id")
-    filmes_d = await atmdb(f"person/{pid}/movie_credits")
-    filmes   = sorted(filmes_d.get("cast",[]) if filmes_d else [], key=lambda x: x.get("popularity",0), reverse=True)
-    if not filmes:
-        await enviar(context, cid, text=f"😕 Nenhum filme encontrado para <b>{html.escape(nome)}</b>"); return
-    for f in filmes:
-        f.setdefault("media_type", "movie")
-    await enviar_vitrine(context, cid, filmes[:18], titulo=f"🌟 Filmes com {nome}",
-                         destacar=True, por_pagina=6, dedupe=False)
+    pessoa = pessoas[0]
+    if not await enviar_pessoa(context, cid, pessoa):
+        await enviar(context, cid, text=f"😕 Nenhum filme encontrado para <b>{html.escape(pessoa.get('name',''))}</b>")
 
 async def cmd_top10(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _guard_busca(update, context):

@@ -108,7 +108,8 @@ Para desligar um recurso: `WELCOME_ENABLED=0`, `APP_PROMO_ENABLED=0`, `POLL_ENAB
 | `HANDLER_SLOW_MS` | `3000` | Acima disso o tempo do handler vira WARNING no log |
 | `TEXT_SEARCH` | `1` | Buscar digitando só o nome do filme/série (sem /filme) |
 | `GROUP_TEXT_SEARCH` | `1` | Também no grupo (só textos curtos com cara de título; sem resultado = silêncio) |
-| `GROUP_TEXT_SEARCH_USER_SECONDS` | `60` | Intervalo mínimo por pessoa na busca por texto no grupo |
+| `GROUP_TEXT_SEARCH_USER_SECONDS` | `25` | Intervalo mínimo por pessoa na busca por texto no grupo |
+| `GROUP_TEXT_SEARCH_ADMIN_SECONDS` | `8` | Admins, dono e envio anônimo: só este intervalo, por grupo |
 | `GROUP_TEXT_SEARCH_CHAT_SECONDS` | `20` | Intervalo mínimo por grupo na busca por texto |
 | `PROPAGANDA_HOURS_UTC` | `18` | Horários UTC da propaganda, separados por vírgula. Antes: `13,18,22` |
 | `INLINE_MODE` | `1` | Responde a buscas inline (`@bot nome`). O modo inline precisa estar ligado no BotFather |

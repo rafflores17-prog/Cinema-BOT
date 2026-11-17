@@ -31,11 +31,63 @@ DATABASE_URL  = os.environ.get("DATABASE_URL", "")
 SITE_URL      = os.environ.get("SITE_URL",     "https://www.streamflixvip.online")
 APP_URL       = os.environ.get("APP_URL",      "https://www.streamflixvip.online/downloads/app-latest.apk")
 ADMIN_ID      = int(os.environ.get("ADMIN_ID", "0"))   # Seu user_id do Telegram (não chat_id do canal)
-GRUPO_ID      = int(os.environ.get("GRUPO_ID", "0"))   # Seu canal principal (streamflixofc)
+GRUPO_ID      = int(os.environ.get("GRUPO_ID", "0"))   # Grupo principal (atual: -1004378949622)
 CANAL_VIP     = int(os.environ.get("CANAL_VIP", "0"))    # Canal VIP (streamflixvip)
-ADMIN_CONTATO = os.environ.get("ADMIN_CONTATO", "@RaffDimitri")  # Contato para propagandas
+ADMIN_CONTATO = os.environ.get("ADMIN_CONTATO", "@RaffDimitri")  # Contato para propagandas ({contato}); se for o antigo @streamflixofc, usa o suporte do WhatsApp
 TOPIC_ID      = int(os.environ.get("TOPIC_ID", "0"))
-CANAL_SUPORTE = "https://t.me/streamflixofc"
+def _url_sem_rastreio(u):
+    """Tira ?s=... e #... (parâmetros de rastreio do link de convite)."""
+    u = (u or "").strip()
+    return u.split("#", 1)[0].split("?", 1)[0].rstrip("/") if u else u
+
+# Suporte: grupo do StreamFlix no WhatsApp (o antigo t.me/streamflixofc não funciona mais)
+SUPORTE_URL_PADRAO = "https://chat.whatsapp.com/HwROmfEeCgk3IqDfeB5iEm"
+SUPORTE_URL   = _url_sem_rastreio(os.environ.get("SUPORTE_URL") or SUPORTE_URL_PADRAO) or SUPORTE_URL_PADRAO
+CANAL_SUPORTE = SUPORTE_URL
+_SUPORTE_WPP  = "whatsapp" in SUPORTE_URL.lower()
+SUPORTE_LABEL = "💬 Suporte no WhatsApp" if _SUPORTE_WPP else "💬 Suporte"
+SUPORTE_BOTAO = "💬 Suporte (WhatsApp)" if _SUPORTE_WPP else "💬 Suporte"
+
+def suporte_html(label=None):
+    """Link curto (sem URL crua) para mensagens em HTML."""
+    return f'<a href="{html.escape(SUPORTE_URL, quote=True)}">{label or SUPORTE_LABEL}</a>'
+
+# Links antigos que não funcionam mais -> suporte atual.
+# Mantidos: t.me/streamflixvipfilmes (grupo atual) e www.streamflixvip.online.
+_LINKS_ANTIGOS = (
+    r"(?:https?://)?(?:www\.)?(?:t|telegram)\.me/streamflixofc\b[^\s\"'<>]*",
+    r"(?:https?://)?(?:www\.)?(?:t|telegram)\.me/(?:\+|joinchat/)jPjv75TOACplMmYx[^\s\"'<>]*",
+    r"(?:https?://)?(?:www\.)?(?:t|telegram)\.me/streamflixvip(?![A-Za-z0-9_])[^\s\"'<>]*",
+)
+_RE_LINK_ANTIGO = re.compile("|".join(_LINKS_ANTIGOS), re.I)
+_RE_ARROBA_ANTIGO = re.compile(r"(?<![\w/])@streamflixofc\b", re.I)
+
+def contato_eh_antigo(c):
+    c = (c or "").strip()
+    return not c or bool(_RE_LINK_ANTIGO.fullmatch(c) or _RE_ARROBA_ANTIGO.fullmatch(c))
+
+def contato_html():
+    """{contato} das propagandas: ADMIN_CONTATO, ou o suporte se ele for o antigo @streamflixofc."""
+    return suporte_html() if contato_eh_antigo(ADMIN_CONTATO) else html.escape(ADMIN_CONTATO.strip())
+
+def trocar_links_antigos(texto):
+    """Troca links mortos (t.me/streamflixofc, convite antigo, canal antigo) pelo suporte atual,
+    sem deixar URL crua: dentro de href vira a URL nova; solto vira o link curto."""
+    if not texto:
+        return texto or ""
+    t = re.sub(r'(href=["\'])(' + "|".join(_LINKS_ANTIGOS) + r')(["\'])',
+               lambda m: m.group(1) + html.escape(SUPORTE_URL, quote=True) + m.group(m.lastindex),
+               texto, flags=re.I)
+    partes = re.split(r"(<a\b[^>]*>.*?</a>)", t, flags=re.I | re.S)   # não mexe dentro de <a>…</a>
+    for i in range(0, len(partes), 2):
+        partes[i] = _RE_LINK_ANTIGO.sub(lambda m: suporte_html(), partes[i])
+        partes[i] = _RE_ARROBA_ANTIGO.sub(lambda m: suporte_html(), partes[i])
+    for i in range(1, len(partes), 2):                                 # texto visível de <a> antigo
+        partes[i] = _RE_ARROBA_ANTIGO.sub(SUPORTE_LABEL, partes[i])
+    return "".join(partes)
+
+def markup_suporte():
+    return InlineKeyboardMarkup([[InlineKeyboardButton(SUPORTE_BOTAO, url=SUPORTE_URL)]])
 MP_TOKEN      = os.environ.get("MP_ACCESS_TOKEN", "")  # Mercado Pago Access Token
 BOT_PUBLIC_URL = os.environ.get("BOT_PUBLIC_URL", "")  # URL pública do bot no Koyeb
 DIAS_SEM_REPETIR = 30  # recarregado abaixo com env, depois de env_int()
@@ -277,7 +329,8 @@ def _texto_painel(cmd, prefixo, body_json):
     return unquote(resto).strip() if resto else ""
 
 def _aplicar_contato_seguro(texto):
-    return (texto or "").replace("{contato}", ADMIN_CONTATO)
+    return trocar_links_antigos((texto or "").replace("{contato}", contato_html())
+                                .replace("{suporte}", suporte_html()))
 
 class AdminHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -512,7 +565,9 @@ class AdminHandler(BaseHTTPRequestHandler):
                             "usa_personalizadas": PROPAGANDA_USE_DB,
                             "automatico": auto, "horarios": horas if auto else [],
                             "promo_diaria": APP_PROMO_ENABLED,
-                            "promo_hora": f"{(APP_PROMO_HOUR_UTC - 3) % 24}h"}); return
+                            "promo_hora": f"{(APP_PROMO_HOUR_UTC - 3) % 24}h",
+                            "contato_html": contato_html(), "suporte_html": suporte_html(),
+                            "suporte_url": SUPORTE_URL}); return
 
             if cmd.startswith("propaganda_add"):
                 texto = _texto_painel(cmd, "propaganda_add:", body_json)
@@ -551,6 +606,7 @@ class AdminHandler(BaseHTTPRequestHandler):
                 msg = _texto_painel(cmd, "broadcast:", body_json)
                 if not msg:
                     self._json({"ok": False, "error": "Mensagem vazia"}); return
+                msg = _aplicar_contato_seguro(msg)   # {contato}/{suporte} e links antigos -> suporte
                 c = db(); cur = c.cursor()
                 cur.execute("SELECT chat_id FROM clientes WHERE ativo=TRUE AND validade > NOW()")
                 chats = [r[0] for r in cur.fetchall()]; cur.close(); c.close()
@@ -2139,7 +2195,7 @@ async def verificar_acesso(update: Update, context, *, silent=False) -> bool:
         await update.message.reply_text(
             "🔒 <b>Acesso bloqueado!</b>\n\n"
             "Seu plano não está ativo ou expirou.\n\n"
-            f"Para ativar ou renovar:\n{CANAL_SUPORTE}",
+            f"Para ativar ou renovar: {suporte_html()}",
             parse_mode="HTML"
         )
     return False
@@ -2177,7 +2233,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if payload.lower() in ("saas", "canal", "bot"):
         bot_info = await context.bot.get_me()
         saas_kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💬 Suporte", url=CANAL_SUPORTE)],
+            [InlineKeyboardButton(SUPORTE_BOTAO, url=SUPORTE_URL)],
             [InlineKeyboardButton("⬅️ Voltar", callback_data="start:home")],
         ])
         await update.message.reply_text(
@@ -2239,7 +2295,7 @@ async def cmd_ativar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = context.args[0].strip().upper()
     if not token_valido(token):
         await update.message.reply_text(
-            "❌ Token inválido ou já utilizado.\n\nAdquira um novo em: " + CANAL_SUPORTE)
+            "❌ Token inválido ou já utilizado.\n\nAdquira um novo: " + suporte_html(), parse_mode="HTML")
         return
     topic    = int(context.args[1]) if len(context.args) > 1 else 0
     validade = usar_token(token, cid, topic)
@@ -2261,7 +2317,7 @@ async def cmd_ativar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"/ator Nome — filmes de um ator\n"
             f"/top10 — top 10 da semana\n"
             f"/meuplano — ver validade do plano\n\n"
-            f"❓ Suporte: {CANAL_SUPORTE}",
+            f"❓ Dúvidas? {suporte_html()}",
             parse_mode="HTML"
         )
         # Avisa o admin
@@ -2271,7 +2327,7 @@ async def cmd_ativar(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML")
         except: pass
     else:
-        await update.message.reply_text("❌ Erro ao ativar. Contate: " + CANAL_SUPORTE)
+        await update.message.reply_text("❌ Erro ao ativar. Fale com o " + suporte_html(), parse_mode="HTML")
 
 async def cmd_meuplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
@@ -2284,7 +2340,7 @@ async def cmd_meuplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "ℹ️ Este comando é para quem usa o bot no próprio canal.\n\n"
             "Para o app StreamFlix, use /indique (ganhe +7 dias VIP) ou /credito.\n"
-            f"Suporte: {CANAL_SUPORTE}")
+            f"{suporte_html()}", parse_mode="HTML")
         return
     ativo, validade = r
     dias_rest = (validade - datetime.utcnow()).days if validade else 0
@@ -2294,7 +2350,7 @@ async def cmd_meuplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Status: {status}\n"
         f"📅 Vence em: <b>{validade.strftime('%d/%m/%Y') if validade else '—'}</b>\n"
         f"⏳ Dias restantes: <b>{max(dias_rest, 0)}</b>\n\n"
-        f"Para renovar: {CANAL_SUPORTE}",
+        f"Para renovar: {suporte_html()}",
         parse_mode="HTML"
     )
 
@@ -2370,7 +2426,7 @@ async def cmd_revogar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Acesso de <code>{cid}</code> revogado.", parse_mode="HTML")
         try:
             await _send_ativo(context.bot, cid,
-                f"⚠️ Seu acesso foi cancelado.\n\nPara reativar: {CANAL_SUPORTE}")
+                f"⚠️ Seu acesso foi cancelado.\n\nPara reativar: {suporte_html()}", parse_mode="HTML")
         except: pass
     else:
         await update.message.reply_text("❌ Erro ao revogar.")
@@ -2496,7 +2552,7 @@ async def job_verificar_vencimentos(context: ContextTypes.DEFAULT_TYPE):
         try:
             await _send_ativo(context.bot, cid,
                 f"⚠️ <b>Seu plano vence em 3 dias!</b>\n\n"
-                f"Renove agora para continuar assistindo:\n{CANAL_SUPORTE}",
+                f"Renove agora para continuar assistindo: {suporte_html()}",
                 parse_mode="HTML")
             marcar_aviso_3d(cid)
             await context.bot.send_message(ADMIN_ID,
@@ -2511,7 +2567,7 @@ async def job_verificar_vencimentos(context: ContextTypes.DEFAULT_TYPE):
             await _send_ativo(context.bot, cid,
                 f"🔴 <b>Seu plano expirou!</b>\n\n"
                 f"O bot foi suspenso automaticamente.\n\n"
-                f"Para renovar e reativar:\n{CANAL_SUPORTE}",
+                f"Para renovar e reativar: {suporte_html()}",
                 parse_mode="HTML")
             await context.bot.send_message(ADMIN_ID,
                 f"🔴 Cliente <code>{cid}</code> bloqueado automaticamente (plano vencido).", parse_mode="HTML")
@@ -2679,10 +2735,10 @@ def texto_indique():
     )
 
 def aplicar_contato(texto):
-    try:
-        return (texto or "").format(contato=ADMIN_CONTATO, site=ensure_https(SITE_URL))
-    except (KeyError, IndexError, ValueError):
-        return texto or ""
+    # replace (não .format): textos do painel podem ter { } soltos
+    t = (texto or "").replace("{contato}", contato_html()).replace("{suporte}", suporte_html())
+    t = t.replace("{site}", html.escape(ensure_https(SITE_URL)))
+    return trocar_links_antigos(t)
 
 def textos_propaganda_app():
     site = html.escape(ensure_https(SITE_URL))
@@ -2737,7 +2793,7 @@ def markup_start_privado():
          InlineKeyboardButton("🌐 Site", url=ensure_https(SITE_URL))],
         [InlineKeyboardButton("🎬 Ver lançamentos", callback_data="start:lancamentos"),
          InlineKeyboardButton("🎁 Indique e ganhe", callback_data="start:indique")],
-        [InlineKeyboardButton("💬 Suporte", url=CANAL_SUPORTE)],
+        [InlineKeyboardButton(SUPORTE_BOTAO, url=SUPORTE_URL)],
     ])
 
 def texto_start_app(first_name, payload=""):
@@ -2758,7 +2814,7 @@ def texto_saas(bot_username):
     return (
         "📋 <b>QUERO O BOT NO MEU CANAL</b>\n\n"
         "<b>1️⃣ Adquira seu plano:</b>\n"
-        f"👉 {CANAL_SUPORTE}\n\n"
+        f"👉 {suporte_html()}\n\n"
         "<b>2️⃣ Adicione o bot ao seu canal:</b>\n"
         "• Abra seu canal no Telegram\n"
         "• Toque nos 3 pontos (⋮) no canto superior\n"
@@ -2770,7 +2826,7 @@ def texto_saas(bot_username):
         "<b>3️⃣ Ative seu plano no canal:</b>\n"
         "Digite no seu canal:\n"
         "<code>/ativar SEU_TOKEN</code>\n\n"
-        f"❓ Dúvidas? {CANAL_SUPORTE}"
+        f"❓ Dúvidas? {suporte_html()}"
     )
 
 def teclado_em_linhas(botoes, por_linha=2):
@@ -2858,7 +2914,8 @@ async def enviar_boas_vindas(context, chat_id, users):
         f"👋 Bem-vindo(a), {quem}!\n\n"
         "🎬 Filmes, séries e TV no StreamFlix\n"
         f"🌐 {html.escape(ensure_https(SITE_URL))}\n\n"
-        f"{texto_indique()}"
+        f"{texto_indique()}\n\n"
+        f"{suporte_html()}"
     )
     msg = await enviar(context, chat_id, text=texto, markup=markup_cta_app())
     if msg and WELCOME_DELETE_SECONDS > 0 and context.job_queue:
@@ -3185,6 +3242,8 @@ def ai_system_prompt():
         "- 6 meses: R$ 49,90\n"
         "- Anual: R$ 89,90\n"
         "- Ingresso 24h: R$ 2,50\n\n"
+        "- Suporte (pagamento, ativação, problemas no app): é pelo grupo do StreamFlix no WhatsApp; "
+        "diga só 'fale com o suporte no WhatsApp' (o bot mostra o link). Não escreva links do Telegram para suporte.\n\n"
         "Não invente preços, códigos, lojas, passos de instalação, login ou promoções que não estejam acima. "
         "Não ajude com pirataria, cracks, contas compartilhadas ilegais, ofensas ou qualquer pedido ilegal ou perigoso. "
         "Recuse com educação e redirecione para o app oficial. "
@@ -3528,8 +3587,11 @@ async def _entregar_ia(update, context, pergunta):
         except Exception as e:
             logging.warning(f"IA botões: {type(e).__name__}")
     corpo = limpar_frases_botao(corpo)
+    corpo = _RE_ARROBA_ANTIGO.sub("suporte no WhatsApp", _RE_LINK_ANTIGO.sub("suporte no WhatsApp", corpo))
     if markup:
         corpo += "\n\n👇 Toque para abrir o card completo."
+    elif re.search(r"suporte|whatsapp", corpo, re.I):
+        markup = markup_suporte()
     if not msg:
         return
     try:
@@ -4431,7 +4493,7 @@ async def callback_start(update, context, acao):
         await q.message.reply_text(
             texto_saas(bot_info.username), parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("💬 Suporte", url=CANAL_SUPORTE)],
+                [InlineKeyboardButton(SUPORTE_BOTAO, url=SUPORTE_URL)],
             ]))
         return
     if acao == "home":
@@ -4633,7 +4695,7 @@ def texto_tutorial(bot_username=None):
         f"{ia_bloco}\n"
         "🔎 Em qualquer conversa você também pode digitar\n"
         f"<code>@{html.escape(uname)} nome do filme</code>\n\n"
-        f"💬 Suporte: {CANAL_SUPORTE}"
+        f"{suporte_html()}"
     )
 
 async def cmd_ajuda_fn(context, cid, bot_username=None):

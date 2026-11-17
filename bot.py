@@ -5,6 +5,7 @@
 #   ✅ Promo do app e propaganda das 15h no mesmo visual do grupo
 # =================================================================================
 
+import asyncio
 import os, html, time, random, logging, threading, secrets, string, unicodedata
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer

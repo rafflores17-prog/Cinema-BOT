@@ -3563,17 +3563,64 @@ def _bate_parcial(alvo, r):
     return any(n and (n.startswith(alvo + " ") or (" " + alvo + " ") in (" " + n + " "))
                for n in (_nome_pt(r), _nome_orig(r)))
 
+def _distancia(a, b, limite=2):
+    """Levenshtein com corte (para nomes curtos)."""
+    if abs(len(a) - len(b)) > limite:
+        return limite + 1
+    ant = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        atual = [i]
+        for j, cb in enumerate(b, 1):
+            atual.append(min(ant[j] + 1, atual[j - 1] + 1, ant[j - 1] + (ca != cb)))
+        if min(atual) > limite:
+            return limite + 1
+        ant = atual
+    return ant[-1]
+
+def _palavra_bate(w, n):
+    if w == n:
+        return True
+    if len(w) >= 4 and n.startswith(w):          # jack -> jackie, scarlet -> scarlett
+        return True
+    if len(w) >= 4:
+        return _distancia(w, n, 2) <= (1 if len(w) <= 5 else 2)
+    return False
+
+def nome_pessoa_bate(alvo, nome):
+    """Cada palavra digitada casa com uma palavra diferente do nome (prefixo ou erro de 1-2 letras)."""
+    ws, ns = alvo.split(), nome.split()
+    if not ws or not ns:
+        return False
+    if len(ws) == 1:
+        # uma palavra só: nome artístico de uma palavra ("Zendaya"), com no máximo 1 letra errada
+        w = ws[0]
+        return len(ns) == 1 and (w == ns[0] or (len(w) >= 5 and _distancia(w, ns[0], 1) <= 1))
+    livres = list(ns)
+    for w in ws:
+        achou = next((n for n in livres if _palavra_bate(w, n)), None)
+        if achou is None:
+            return False
+        livres.remove(achou)
+    return True
+
 def _pessoa_bate(alvo, p, grupo=False):
     nome = normalizar_busca(p.get("name") or "")
     if not nome or not p.get("known_for"):
         return False
     pop = p.get("popularity") or 0
-    if pop < (3 if grupo else 1):
+    exato = nome == alvo
+    minimo = (3 if grupo else 1) if exato else (8 if grupo else 2)   # grupo: mais exigente
+    if pop < minimo:
         return False
-    if nome == alvo:
-        return True
-    # nome de uma palavra só vale exato ("zendaya"); com 2+ palavras, todas precisam estar no nome
-    return len(alvo.split()) >= 2 and set(alvo.split()) <= set(nome.split())
+    return exato or nome_pessoa_bate(alvo, nome)
+
+def buscar_pessoa(query, grupo=False):
+    """Plano B: search/person quando o multi não trouxe nada bom."""
+    d = tmdb("search/person", {"query": query, "include_adult": "false"}) or {}
+    alvo = normalizar_busca(query)
+    cands = [p for p in (d.get("results") or [])[:8] if _pessoa_bate(alvo, p, grupo)]
+    cands.sort(key=lambda p: p.get("popularity") or 0, reverse=True)
+    return cands[0] if cands else None
 
 def planejar_busca(query, grupo=False):
     """Decide o que mostrar para um texto digitado. Devolve:
@@ -3590,7 +3637,10 @@ def planejar_busca(query, grupo=False):
     exatos = sorted([r for r in titulos if _nome_pt(r) == alvo and item_forte(r)], key=pop, reverse=True)
     exatos += sorted([r for r in titulos if _nome_orig(r) == alvo and r not in exatos and item_forte(r)],
                      key=pop, reverse=True)
-    pessoa = next((p for p in pessoas if _pessoa_bate(alvo, p, grupo)), None)
+    cand_p = [p for p in pessoas[:8] if _pessoa_bate(alvo, p, grupo)]
+    cand_p.sort(key=lambda p: (normalizar_busca(p.get("name") or "") == alvo, p.get("popularity") or 0),
+                reverse=True)
+    pessoa = cand_p[0] if cand_p else None
     if exatos:
         top = exatos[0]
         pop_top = top.get("popularity") or 0
@@ -3609,7 +3659,9 @@ def planejar_busca(query, grupo=False):
             return ("lista", [top] + rivais + [r for r in exatos[1:] if r not in rivais], query)
         return ("card", top)
 
-    # 2) pessoa com nome que bate
+    # 2) pessoa com nome que bate (no multi; se não, busca só de pessoas para 2-4 palavras)
+    if not pessoa and 2 <= len(alvo.split()) <= 4:
+        pessoa = buscar_pessoa(query, grupo)
     if pessoa:
         return ("pessoa", pessoa)
 

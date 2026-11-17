@@ -45,6 +45,14 @@ CREDITS = {"cast": [
     {"id": 9, "media_type": "tv", "name": "Série X", "poster_path": "/s.jpg", "popularity": 200, "episode_count": 1, "character": "Guest"},
     {"id": 10, "media_type": "movie", "title": "Gladiador II", "poster_path": "/g.jpg", "popularity": 70, "character": "Marcus"},
 ]}
+JACKIE = {"id": 18897, "media_type": "person", "name": "Jackie Chan", "popularity": 45, "known_for_department": "Acting",
+          "profile_path": "/jc.jpg", "known_for": [{"title": "A Hora do Rush"}]}
+JACK_RUIM = {"id": 777, "media_type": "person", "name": "Jack Chandler", "popularity": 0.5, "known_for": [{"title": "X"}]}
+SCARLETT = {"id": 1245, "media_type": "person", "name": "Scarlett Johansson", "popularity": 60, "known_for_department": "Acting",
+            "profile_path": "/sj.jpg", "known_for": [{"title": "Viúva Negra"}]}
+DB["jackie chan"] = [JACKIE]
+DB["jack chan"] = [JACK_RUIM, {"id": 900, "media_type": "movie", "title": "Jack", "poster_path": "/j.jpg", "vote_count": 500, "popularity": 9}]
+PESSOAS = {"jack chan": [JACK_RUIM, JACKIE], "scarlet johanson": [SCARLETT], "scarlet johansson": [SCARLETT]}
 calls = []
 def fake_tmdb(ep, params=None):
     calls.append((ep, (params or {}).get("query")))
@@ -53,6 +61,8 @@ def fake_tmdb(ep, params=None):
         if params.get("page", 1) > 1:
             return {"results": [], "total_pages": 1}
         return {"results": DB.get(q, []), "total_pages": 1}
+    if ep == "search/person":
+        return {"results": PESSOAS.get(bot.normalizar_busca(params["query"]), [])}
     if ep.endswith("/combined_credits"):
         return CREDITS
     return {}
@@ -78,6 +88,16 @@ obras = bot.carregar_obras_pessoa(50, "Acting")
 print("obras:", [o.get("name") or o.get("title") for o in obras])
 assert [o["id"] for o in obras] == [100088, 82856, 10]
 assert bot.planejar_busca("xyzzy qwerty")[0] is None
+for q, esperado in [("Jack Chan", 18897), ("Jackie Chan", 18897), ("jackie chan", 18897), ("Pedro Pascal", 50),
+                    ("Scarlet Johansson", 1245), ("Scarlet Johanson", 1245)]:
+    for g in (False, True):
+        p = bot.planejar_busca(q, grupo=g)
+        print(q, "grupo" if g else "privado", "->", p[0], p[1].get("name") if p[0] == "pessoa" else "")
+        assert p[0] == "pessoa" and p[1]["id"] == esperado, (q, g)
+assert bot.nome_pessoa_bate("jack chan", "jackie chan") and bot.nome_pessoa_bate("scarlet johanson", "scarlett johansson")
+assert not bot.nome_pessoa_bate("jack", "jackie chan") and not bot.nome_pessoa_bate("pedro", "pedro pascal")
+assert bot.nome_pessoa_bate("zendya", "zendaya") and not bot.nome_pessoa_bate("bom dia", "bomani diaz")
+assert not bot.nome_pessoa_bate("ana", "anabelle")
 
 sent = []
 class FakeBot:

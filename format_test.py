@@ -66,3 +66,38 @@ print(bot.md_para_texto(corpo))
 long = bot.md_para_html("**Título**\n" + ("palavra " * 400))
 assert len(long) < 1300 and long.endswith("…")
 print("OK: todos os testes passaram")
+
+# ---- botões dos títulos citados pela IA (TMDB simulado, pt-BR e en-US) ----
+FAKE = {
+    "pt-BR": [
+        {"id": 493922, "media_type": "movie", "title": "Hereditário", "original_title": "Hereditary", "release_date": "2018-06-07", "vote_count": 9000},
+        {"id": 310131, "media_type": "movie", "title": "A Bruxa", "original_title": "The Witch", "release_date": "2015-01-27", "vote_count": 7000},
+        {"id": 346364, "media_type": "movie", "title": "It: A Coisa", "original_title": "It", "release_date": "2017-09-06", "vote_count": 20000},
+        {"id": 474350, "media_type": "movie", "title": "It: Capítulo Dois", "original_title": "It Chapter Two", "release_date": "2019-09-04", "vote_count": 9000},
+        {"id": 19614, "media_type": "tv", "name": "It: Uma Obra-Prima do Medo", "original_name": "It", "first_air_date": "1990-11-18", "vote_count": 1500},
+        {"id": 496243, "media_type": "movie", "title": "Parasita", "original_title": "기생충", "release_date": "2019-05-30", "vote_count": 18000},
+    ],
+}
+FAKE["en-US"] = [dict(r, title={"Hereditário": "Hereditary", "A Bruxa": "The Witch", "It: A Coisa": "It",
+                                "It: Capítulo Dois": "It Chapter Two", "Parasita": "Parasite"}.get(r.get("title"), r.get("title")))
+                 for r in FAKE["pt-BR"]]
+def fake_tmdb(ep, params=None):
+    q = bot.normalizar_busca(params["query"])
+    out = []
+    for r in FAKE[params.get("language", "pt-BR")]:
+        nomes = {bot.normalizar_busca(r.get(k) or "") for k in ("title", "original_title", "name", "original_name")}
+        if any(q and (q in n or n in q) for n in nomes if n):
+            out.append(r)
+    return {"results": out}
+bot.tmdb = fake_tmdb
+casos = [("Hereditary", "2018", 493922), ("Hereditário", "", 493922), ("The Witch", "2015", 310131),
+         ("A Bruxa", "2015", 310131), ("It", "2017", 346364), ("It: A Coisa", "2017", 346364),
+         ("It Chapter Two", "2019", 474350), ("Parasite", "2019", 496243)]
+for nome, ano, esperado in casos:
+    achado = bot._match_titulo_tmdb(nome, ano)
+    print(nome, ano, "->", achado)
+    assert achado and achado[1] == esperado, nome
+mk = bot.ai_botoes_titulos([("Hereditary", "2018"), ("The Witch", "2015"), ("It", "2017"), ("Parasite", "2019"), ("Duna", "2021")])
+print([b[0].text for b in mk.inline_keyboard])
+assert len(mk.inline_keyboard) == 4
+print("OK: botões da IA")

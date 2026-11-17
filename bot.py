@@ -17,6 +17,7 @@ from telegram import (
     BotCommand, BotCommandScopeDefault, BotCommandScopeAllPrivateChats,
     BotCommandScopeAllGroupChats, BotCommandScopeChat,
     InlineQueryResultArticle, InlineQueryResultPhoto, InputTextMessageContent,
+    InlineQueryResultsButton,
 )
 from telegram.ext import (Application, CommandHandler, MessageHandler,
                           filters, ContextTypes, CallbackQueryHandler,
@@ -2627,7 +2628,12 @@ def ai_system_prompt():
     return (
         "Você é o assistente do StreamFlix VIP, um app de filmes e séries. "
         "Responda sempre em português do Brasil, de forma curta, amigável e organizada. "
-        "Ajude a recomendar filmes e séries, a usar o bot (digitar o nome do filme, /filme, /serie, /top10, /indique) e a instalar o app.\n\n"
+        "Ajude a recomendar filmes e séries, a usar o bot e a instalar o app.\n\n"
+        "COMO O USUÁRIO VÊ UM TÍTULO: aqui no Telegram ele só digita o nome do filme ou série para o bot "
+        "(ou toca nos botões que aparecem abaixo da sua resposta) e recebe o card com sinopse e trailer. "
+        "Para assistir, ele abre o app StreamFlix e procura o título lá. "
+        "NUNCA diga para digitar comandos (/filme, /serie etc.) dentro do app; o app não tem comandos. "
+        "Ao recomendar, termine com algo como 'Toque no botão abaixo para ver o card' ou 'Digite o nome aqui para ver mais'.\n\n"
         "FORMATO DA RESPOSTA (obrigatório):\n"
         "- Comece com uma linha curta de título em **negrito** (pode ter 1 emoji).\n"
         "- Depois use frases curtas ou tópicos com '- ' (no máximo 5 tópicos). Passos de instalação em lista numerada '1. '.\n"
@@ -2635,7 +2641,8 @@ def ai_system_prompt():
         "- Emojis com moderação (no máximo 3). Sem tabelas, sem títulos com #, sem blocos de código.\n"
         "- No máximo 900 caracteres.\n"
         "- Se citar filmes ou séries específicos, termine com uma última linha exatamente assim: "
-        "TITULOS: Nome 1 (ano); Nome 2 (ano) — no máximo 5, com o nome mais conhecido no Brasil. "
+        "TITULOS: Título original 1 (ano); Título original 2 (ano) — no máximo 5, com o TÍTULO ORIGINAL "
+        "(geralmente em inglês, ex.: Hereditary (2018); The Witch (2015); It (2017)) e o ano de lançamento. "
         "Se não citar nenhum título, não escreva essa linha.\n\n"
         "O app NÃO está na Play Store, Samsung ou LG. Ele é instalado pelo site ou pelo app Downloader. Como instalar:\n"
         f"- Celular Android: abra {site}/downloads/app-latest.apk no navegador e instale o APK (permita 'instalar apps desconhecidos'), "
@@ -2806,32 +2813,110 @@ def md_para_texto(texto, limite=AI_RESPOSTA_MAX):
     t = _re.sub(r"^\s*[-*+]\s+", "• ", t, flags=_re.M)
     return t
 
-def _match_titulo_tmdb(nome, ano):
-    """Procura um título citado pela IA no TMDB. Devolve (kind, id, rótulo) ou None."""
-    d = tmdb("search/multi", {"query": nome, "include_adult": "false"}) or {}
-    res = [r for r in d.get("results") or [] if r.get("media_type") in ("movie", "tv")]
-    if not res:
-        return None
+def _variantes_nome(nome):
+    """'It: A Coisa' -> ['it a coisa', 'it', 'a coisa']; sem acento/pontuação."""
+    base = normalizar_busca(nome)
+    vs = [base] if base else []
+    for sep in (":", " - ", " – ", " — ", "("):
+        if sep in nome:
+            for parte in nome.split(sep):
+                p = normalizar_busca(parte)
+                if p and len(p) >= 2 and p not in vs:
+                    vs.append(p)
+    for art in ("the ", "a ", "o ", "os ", "as ", "le ", "la ", "el "):
+        if base.startswith(art) and base[len(art):] not in vs and len(base) > len(art) + 2:
+            vs.append(base[len(art):])
+    return vs
+
+def _nomes_resultado(r):
+    tv = r.get("media_type") == "tv"
+    nomes = set()
+    for campo in (("name", "original_name") if tv else ("title", "original_title")):
+        n = normalizar_busca(r.get(campo) or "")
+        if n:
+            nomes.add(n)
+            for v in _variantes_nome(r.get(campo) or ""):
+                nomes.add(v)
+    return nomes
+
+def _pontuar_resultado(r, nome, ano):
     alvo = normalizar_busca(nome)
-    def _ok(r):
-        tv = r.get("media_type") == "tv"
-        nomes = {normalizar_busca(r.get("name" if tv else "title") or ""),
+    variantes = set(_variantes_nome(nome))
+    nomes = _nomes_resultado(r)
+    tv = r.get("media_type") == "tv"
+    principal = {normalizar_busca(r.get("name" if tv else "title") or ""),
                  normalizar_busca(r.get("original_name" if tv else "original_title") or "")}
-        r_ano = ((r.get("first_air_date") if tv else r.get("release_date")) or "")[:4]
-        return alvo in nomes and (not ano or not r_ano or abs(int(ano) - int(r_ano)) <= 1)
-    escolhido = next((r for r in res[:8] if _ok(r)), None)
-    if not escolhido:
+    principal |= set(r.get("_alt") or ())
+    principal.discard("")
+    if alvo in principal:
+        pts = 6
+    elif variantes & principal:
+        pts = 4
+    elif alvo in nomes or variantes & nomes:
+        pts = 3
+    elif any(alvo and (n.startswith(alvo + " ") or alvo.startswith(n + " ")) for n in principal if n):
+        pts = 2
+    else:
+        return -99
+    r_ano = ((r.get("first_air_date") if tv else r.get("release_date")) or "")[:4]
+    if ano and r_ano.isdigit():
+        dif = abs(int(ano) - int(r_ano))
+        pts += 3 if dif == 0 else (1 if dif == 1 else -3)
+    pts += min((r.get("vote_count") or 0) / 2000.0, 1.0)   # desempate por popularidade
+    return pts
+
+def _match_titulo_tmdb(nome, ano):
+    """Procura um título citado pela IA no TMDB (pt-BR e en-US, com e sem subtítulo).
+    Devolve (kind, id, rótulo) ou None."""
+    consultas = []
+    for v in [nome] + [p.strip() for p in nome.replace(" – ", ":").replace(" - ", ":").split(":")]:
+        if v and v not in consultas:
+            consultas.append(v)
+    candidatos = {}
+    for consulta in consultas[:3]:
+        for lang in ("pt-BR", "en-US"):
+            params = {"query": consulta, "include_adult": "false", "language": lang}
+            d = tmdb("search/multi", params) or {}
+            for r in (d.get("results") or [])[:10]:
+                if r.get("media_type") not in ("movie", "tv") or not r.get("id"):
+                    continue
+                chave = (r["media_type"], r["id"])
+                atual = candidatos.get(chave)
+                if atual is None:
+                    candidatos[chave] = dict(r, _alt=set())
+                    atual = candidatos[chave]
+                # guarda o nome no outro idioma como alternativo
+                tv = r["media_type"] == "tv"
+                atual["_alt"].add(normalizar_busca(r.get("name" if tv else "title") or ""))
+                if lang == "pt-BR":
+                    for k in ("title", "name", "release_date", "first_air_date", "poster_path"):
+                        if r.get(k):
+                            atual[k] = r[k]
+        # achou um bom já na 1ª consulta? para por aqui
+        if any(_pontuar_resultado(c, nome, ano) >= 6 for c in candidatos.values()):
+            break
+    melhor, melhor_pts = None, 0
+    for c in candidatos.values():
+        pts = _pontuar_resultado(c, nome, ano)
+        if pts > melhor_pts:
+            melhor, melhor_pts = c, pts
+    if not melhor or melhor_pts < 3:
         return None
-    kind = escolhido["media_type"]
-    return kind, escolhido["id"], rotulo_item(escolhido, kind == "tv")
+    kind = melhor["media_type"]
+    return kind, melhor["id"], rotulo_item(melhor, kind == "tv")
 
 def ai_botoes_titulos(titulos):
-    botoes, vistos = [], set()
-    for nome, ano in titulos[:5]:
+    from concurrent.futures import ThreadPoolExecutor
+    lista = titulos[:5]
+    def _busca(t):
         try:
-            achado = _match_titulo_tmdb(nome, ano)
+            return _match_titulo_tmdb(t[0], t[1])
         except Exception:
-            achado = None
+            return None
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        achados = list(ex.map(_busca, lista))
+    botoes, vistos = [], set()
+    for achado in achados:
         if achado and (achado[0], achado[1]) not in vistos:
             vistos.add((achado[0], achado[1]))
             botoes.append([InlineKeyboardButton(achado[2], callback_data=f"ver:{achado[0]}:{achado[1]}")])
@@ -3643,8 +3728,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(q) < 2:
         await iq.answer(
             [], cache_time=10, is_personal=False,
-            switch_pm_text="Abrir o StreamFlix Bot",
-            switch_pm_parameter="inline",
+            button=InlineQueryResultsButton(text="Abrir o StreamFlix Bot", start_parameter="inline"),
         )
         return
     if not rate_ok(uid, "inline", 2):
@@ -3699,8 +3783,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
             break
     await iq.answer(
         resultados, cache_time=30, is_personal=False,
-        switch_pm_text="Abrir o StreamFlix Bot",
-        switch_pm_parameter="inline",
+        button=InlineQueryResultsButton(text="Abrir o StreamFlix Bot", start_parameter="inline"),
     )
 
 

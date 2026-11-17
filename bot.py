@@ -8,7 +8,7 @@
 import asyncio
 import os, html, time, random, logging, threading, secrets, string, unicodedata
 from datetime import datetime, timedelta
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from urllib.parse import urlparse, quote
 import requests, psycopg2
 from telegram import (
@@ -536,6 +536,15 @@ class AdminHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *a, **k): pass
 
+_health_iniciado = threading.Event()
+
+def iniciar_health_uma_vez():
+    """Sobe o servidor de health/painel uma única vez por processo."""
+    if _health_iniciado.is_set():
+        return
+    _health_iniciado.set()
+    threading.Thread(target=start_health, daemon=True, name="health").start()
+
 def start_health():
     porta = int(os.environ.get("PORT", "8000"))
     # Durante rolling deploy do Koyeb, a instância antiga pode ainda estar
@@ -543,7 +552,7 @@ def start_health():
     # vezes com espera curta em vez de morrer direto com OSError.
     for tentativa in range(10):
         try:
-            HTTPServer(("0.0.0.0", porta), AdminHandler).serve_forever()
+            ThreadingHTTPServer(("0.0.0.0", porta), AdminHandler).serve_forever()
             return
         except OSError as e:
             logging.warning(f"start_health: porta {porta} ocupada ({e}), tentando de novo em 3s...")
@@ -558,6 +567,54 @@ def db():
         dbname=r.path[1:], user=r.username, password=r.password,
         host=r.hostname, port=r.port, connect_timeout=10
     )
+
+_SENT_UPSERT_OK = [False]   # True quando existe índice único (chat_id,item_id,item_type)
+
+def migrar_sent_items(c):
+    """Ajusta a tabela sent_items antiga sem apagar nada:
+    backup único, colunas que faltam (aditivo) e índice único para o ON CONFLICT."""
+    cur = c.cursor()
+    try:
+        cur.execute("""SELECT column_name, data_type, is_nullable, column_default
+                       FROM information_schema.columns
+                       WHERE table_schema = current_schema() AND table_name = 'sent_items'
+                       ORDER BY ordinal_position""")
+        cols = cur.fetchall()
+        nomes = [r[0] for r in cols]
+        logging.info("sent_items colunas: " + ", ".join(
+            f"{r[0]}:{r[1]}{'' if r[2] == 'YES' else ' not null'}" for r in cols))
+        if not nomes:
+            cur.close(); return
+        extras = [r[0] for r in cols if r[0] not in ("chat_id", "item_id", "item_type", "sent_at")
+                  and r[2] == "NO" and r[3] is None]
+        if extras:
+            logging.warning(f"sent_items: colunas obrigatórias sem padrão que o bot não preenche: {extras}")
+        precisa = [n for n in ("item_type", "sent_at") if n not in nomes]
+        if precisa:
+            # backup uma única vez, antes de qualquer ALTER
+            cur.execute("CREATE TABLE IF NOT EXISTS sent_items_bak_20261117 AS SELECT * FROM sent_items")
+            c.commit()
+            logging.info(f"sent_items: backup em sent_items_bak_20261117; adicionando {precisa}")
+        if "item_type" not in nomes:
+            cur.execute("ALTER TABLE sent_items ADD COLUMN IF NOT EXISTS item_type TEXT NOT NULL DEFAULT 'movie'")
+        if "sent_at" not in nomes:
+            cur.execute("ALTER TABLE sent_items ADD COLUMN IF NOT EXISTS sent_at TIMESTAMP NOT NULL DEFAULT NOW()")
+        c.commit()
+        try:
+            cur.execute("""CREATE UNIQUE INDEX IF NOT EXISTS sent_items_uniq_chat_item_type
+                           ON sent_items (chat_id, item_id, item_type)""")
+            c.commit()
+            _SENT_UPSERT_OK[0] = True
+        except Exception as e:
+            c.rollback()
+            _SENT_UPSERT_OK[0] = False
+            logging.warning(f"sent_items: sem índice único ({type(e).__name__}); usando UPDATE/INSERT simples")
+    except Exception as e:
+        c.rollback()
+        logging.error(f"sent_items migração: {e}")
+    finally:
+        try: cur.close()
+        except Exception: pass
 
 def setup_db():
     try:
@@ -613,6 +670,15 @@ def setup_db():
             item_type TEXT NOT NULL,
             sent_at   TIMESTAMP NOT NULL,
             PRIMARY KEY (chat_id, item_id, item_type)
+        );""")
+
+        c.commit()
+        migrar_sent_items(c)
+        # Pequena tabela chave/valor (flags de execução única, etc.)
+        cur.execute("""CREATE TABLE IF NOT EXISTS bot_kv (
+            chave      TEXT PRIMARY KEY,
+            valor      TEXT,
+            atualizado TIMESTAMP DEFAULT NOW()
         );""")
 
         # Sistema de créditos
@@ -1455,14 +1521,35 @@ def ja_enviados(chat_id, tipo):
 def marcar_enviado(chat_id, item_id, tipo):
     if chat_id and item_id:
         _enviados_mem[(chat_id, item_id)] = datetime.utcnow()
+    tipo = tipo or "movie"
+    agora = datetime.utcnow()
+    c = None
     try:
         c = db(); cur = c.cursor()
-        cur.execute("""INSERT INTO sent_items VALUES(%s,%s,%s,%s)
-            ON CONFLICT(chat_id,item_id,item_type) DO UPDATE SET sent_at=EXCLUDED.sent_at""",
-            (chat_id, item_id, tipo, datetime.utcnow()))
-        c.commit(); cur.close(); c.close()
+        if _SENT_UPSERT_OK[0]:
+            cur.execute("""INSERT INTO sent_items (chat_id, item_id, item_type, sent_at)
+                VALUES (%s,%s,%s,%s)
+                ON CONFLICT (chat_id, item_id, item_type) DO UPDATE SET sent_at=EXCLUDED.sent_at""",
+                (chat_id, item_id, tipo, agora))
+        else:
+            cur.execute("""UPDATE sent_items SET sent_at=%s
+                WHERE chat_id=%s AND item_id=%s AND item_type=%s""", (agora, chat_id, item_id, tipo))
+            if cur.rowcount == 0:
+                try:
+                    cur.execute("""INSERT INTO sent_items (chat_id, item_id, item_type, sent_at)
+                        VALUES (%s,%s,%s,%s)""", (chat_id, item_id, tipo, agora))
+                except psycopg2.IntegrityError:
+                    # chave antiga (chat_id,item_id) já existe com outro tipo: só atualiza a data
+                    c.rollback()
+                    cur.execute("UPDATE sent_items SET sent_at=%s WHERE chat_id=%s AND item_id=%s",
+                                (agora, chat_id, item_id))
+        c.commit(); cur.close()
     except Exception as e:
-        logging.error(e)
+        logging.error(f"sent_items: {e}")
+    finally:
+        if c is not None:
+            try: c.close()
+            except Exception: pass
 
 def filtrar(chat_id, itens, tipo, permitir_repetir=True):
     env   = ids_enviados(chat_id)
@@ -1472,8 +1559,37 @@ def filtrar(chat_id, itens, tipo, permitir_repetir=True):
     return list(itens) if permitir_repetir else []
 
 # ── Envio ──────────────────────────────────────────────────────────────────
+_chats_mortos = {}     # chat_id -> motivo (só em memória; não mexe no banco)
+_topicos_ruins = set() # chat_id cujo message_thread_id não existe mais
+
+ERROS_CHAT_MORTO = (
+    "chat not found", "chat_restricted", "bot was kicked", "bot was blocked",
+    "bot is not a member", "user is deactivated", "group chat was upgraded",
+    "have no rights to send", "not enough rights to send", "chat_write_forbidden",
+    "need administrator rights", "peer_id_invalid",
+)
+
+def chat_morto(chat_id):
+    return chat_id in _chats_mortos
+
+def erro_thread(e):
+    return "thread not found" in str(e).lower() or "topic_closed" in str(e).lower()
+
+def registrar_erro_chat(chat_id, e, contexto="Envio"):
+    """Marca o chat como inacessível (log uma vez). Devolve True se for erro de chat morto."""
+    msg = str(e).lower()
+    if any(k in msg for k in ERROS_CHAT_MORTO) or type(e).__name__ == "Forbidden":
+        if chat_id not in _chats_mortos:
+            _chats_mortos[chat_id] = str(e)[:120]
+            logging.warning(f"{contexto}: chat {chat_id} inacessível ({e}); "
+                            "pulando este chat até reiniciar.")
+        return True
+    return False
+
 async def enviar(context, chat_id, text=None, photo=None, caption=None, markup=None, parse_mode="HTML"):
-    topic = get_topic_id(chat_id)
+    if chat_morto(chat_id):
+        return None
+    topic = 0 if chat_id in _topicos_ruins else get_topic_id(chat_id)
     kw = {"parse_mode": parse_mode}
     if topic:  kw["message_thread_id"] = topic
     if markup: kw["reply_markup"] = markup
@@ -1481,12 +1597,21 @@ async def enviar(context, chat_id, text=None, photo=None, caption=None, markup=N
         if photo:  return await context.bot.send_photo(chat_id, photo, caption=caption, **kw)
         elif text: return await context.bot.send_message(chat_id, text, **kw)
     except Exception as e:
-        logging.error(f"Envio: {e}")
+        if registrar_erro_chat(chat_id, e):
+            return None
+        if "message_thread_id" in kw and erro_thread(e):
+            if chat_id not in _topicos_ruins:
+                logging.warning(f"Envio: tópico {topic} não existe em {chat_id}; enviando sem tópico.")
+            _topicos_ruins.add(chat_id)
+        else:
+            logging.error(f"Envio {chat_id}: {e}")
         kw.pop("message_thread_id", None)
         try:
             if photo:  return await context.bot.send_photo(chat_id, photo, caption=caption, **kw)
             elif text: return await context.bot.send_message(chat_id, text, **kw)
-        except Exception as e2: logging.error(f"Fallback: {e2}")
+        except Exception as e2:
+            if not registrar_erro_chat(chat_id, e2):
+                logging.error(f"Fallback {chat_id}: {e2}")
 
 def item_is_tv(item, default=False):
     if not item:
@@ -1953,15 +2078,11 @@ async def job_propaganda(context: ContextTypes.DEFAULT_TYPE):
         markup = markup_cta_app()
 
     for cid in canais:
-        try:
-            kw = {}
-            if cid == GRUPO_ID and TOPIC_ID:
-                kw["message_thread_id"] = TOPIC_ID
-            await context.bot.send_message(
-                chat_id=cid, text=texto, parse_mode="HTML",
-                reply_markup=markup, **kw
-            )
-        except Exception as e: logging.error(f"Propaganda {cid}: {e}")
+        if chat_morto(cid):
+            continue
+        r = await enviar(context, cid, text=texto, markup=markup)
+        if r is None and not chat_morto(cid):
+            logging.error(f"Propaganda {cid}: falhou")
 
 async def enviar_propaganda_agora(context, texto_custom=None):
     """Disparo manual de propaganda pelo painel."""
@@ -1975,13 +2096,8 @@ async def enviar_propaganda_agora(context, texto_custom=None):
         texto = textos_propaganda_app()[0]
     enviados = 0
     for cid in canais:
-        try:
-            await context.bot.send_message(
-                chat_id=cid, text=texto, parse_mode="HTML",
-                reply_markup=markup_cta_app()
-            )
+        if await enviar(context, cid, text=texto, markup=markup_cta_app()):
             enviados += 1
-        except Exception as e: logging.error(f"Propaganda manual {cid}: {e}")
     return enviados
 
 async def job_verificar_vencimentos(context: ContextTypes.DEFAULT_TYPE):
@@ -1995,7 +2111,9 @@ async def job_verificar_vencimentos(context: ContextTypes.DEFAULT_TYPE):
             marcar_aviso_3d(cid)
             await context.bot.send_message(ADMIN_ID,
                 f"🟡 Aviso enviado → <code>{cid}</code> (vence em 3 dias)", parse_mode="HTML")
-        except Exception as e: logging.error(f"Aviso 3d {cid}: {e}")
+        except Exception as e:
+            if not registrar_erro_chat(cid, e, "Aviso 3d"):
+                logging.error(f"Aviso 3d {cid}: {e}")
 
     for cid in clientes_vencidos():
         try:
@@ -2007,7 +2125,9 @@ async def job_verificar_vencimentos(context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML")
             await context.bot.send_message(ADMIN_ID,
                 f"🔴 Cliente <code>{cid}</code> bloqueado automaticamente (plano vencido).", parse_mode="HTML")
-        except Exception as e: logging.error(f"Bloqueio {cid}: {e}")
+        except Exception as e:
+            if not registrar_erro_chat(cid, e, "Bloqueio"):
+                logging.error(f"Bloqueio {cid}: {e}")
 
 async def job_diario_todos(context: ContextTypes.DEFAULT_TYPE, turno="manha"):
     """Posta conteúdo para TODOS os clientes ativos, com tema e cards novos."""
@@ -2149,7 +2269,7 @@ def chats_destinatarios():
         chats.append(GRUPO_ID)
     if CANAL_VIP and CANAL_VIP not in chats:
         chats.append(CANAL_VIP)
-    return chats
+    return [c for c in chats if not chat_morto(c)]
 
 def label_botao_assistir():
     return "▶️ Assista no StreamFlix" if BUTTON_ASSISTA else "🌐 VER NO SITE / APP"
@@ -2419,18 +2539,27 @@ async def job_enquete_semanal(context: ContextTypes.DEFAULT_TYPE):
     )
     destinos = chats_destinatarios() if POLL_INCLUDE_CLIENTS else [c for c in (GRUPO_ID, CANAL_VIP) if c]
     for cid in destinos:
+        if chat_morto(cid):
+            continue
+        kw = {}
+        topic = 0 if cid in _topicos_ruins else get_topic_id(cid)
+        if topic:
+            kw["message_thread_id"] = topic
         try:
-            kw = {}
-            topic = get_topic_id(cid)
-            if topic:
-                kw["message_thread_id"] = topic
-            await context.bot.send_poll(
-                chat_id=cid, question=question, options=opcoes,
-                is_anonymous=True, **kw
-            )
+            try:
+                await context.bot.send_poll(chat_id=cid, question=question, options=opcoes,
+                                            is_anonymous=True, **kw)
+            except Exception as e:
+                if kw and erro_thread(e) and not registrar_erro_chat(cid, e):
+                    _topicos_ruins.add(cid)
+                    await context.bot.send_poll(chat_id=cid, question=question, options=opcoes,
+                                                is_anonymous=True)
+                else:
+                    raise
             await enviar(context, cid, text=cta, markup=markup_cta_app())
         except Exception as e:
-            logging.error(f"Enquete {cid}: {e}")
+            if not registrar_erro_chat(cid, e, "Enquete"):
+                logging.error(f"Enquete {cid}: {e}")
 
 # ── Handlers de texto ──────────────────────────────────────────────────────
 # ── Vitrine (card + títulos com paginação) e dicas ─────────────────────────
@@ -3669,8 +3798,39 @@ async def configurar_perfil(bot):
     if desc:
         await bot.set_my_description(desc[:512])
 
+KEYBOARD_CLEAN_VERSION = (os.environ.get("CLEAR_GROUP_KEYBOARD_VERSION") or "v1-20261117").strip()
+
+def kv_get(chave):
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("SELECT valor FROM bot_kv WHERE chave=%s", (chave,))
+        r = cur.fetchone(); cur.close(); c.close()
+        return r[0] if r else None
+    except Exception as e:
+        logging.warning(f"bot_kv leitura: {type(e).__name__}")
+        raise
+
+def kv_set(chave, valor):
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("""INSERT INTO bot_kv (chave, valor, atualizado) VALUES (%s,%s,NOW())
+                       ON CONFLICT (chave) DO UPDATE SET valor=EXCLUDED.valor, atualizado=NOW()""",
+                    (chave, valor))
+        c.commit(); cur.close(); c.close()
+    except Exception as e:
+        logging.warning(f"bot_kv gravação: {type(e).__name__}")
+
 async def limpar_teclado_grupos(bot):
-    """Remove o teclado fixo antigo dos grupos (a mensagem some sozinha em seguida)."""
+    """Remove o teclado fixo antigo dos grupos (a mensagem some sozinha em seguida).
+    Roda só uma vez por KEYBOARD_CLEAN_VERSION (flag em bot_kv), para não postar a cada reinício."""
+    try:
+        if kv_get("teclado_limpo") == KEYBOARD_CLEAN_VERSION:
+            logging.info("Limpeza do teclado já feita nesta versão; pulando.")
+            return
+    except Exception:
+        logging.info("Sem acesso ao banco para a flag do teclado; pulando a limpeza por segurança.")
+        return
+    kv_set("teclado_limpo", KEYBOARD_CLEAN_VERSION)
     for cid in chats_destinatarios():
         try:
             chat = await bot.get_chat(cid)
@@ -3693,7 +3853,8 @@ async def limpar_teclado_grupos(bot):
                 pass
             logging.info(f"Teclado removido no chat {cid}")
         except Exception as e:
-            logging.warning(f"Limpar teclado falhou em {cid}: {e}")
+            if not registrar_erro_chat(cid, e, "Limpar teclado"):
+                logging.warning(f"Limpar teclado falhou em {cid}: {e}")
 
 async def post_init(application):
     try:
@@ -3790,7 +3951,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Main ───────────────────────────────────────────────────────────────────
 def main():
     setup_db()
-    threading.Thread(target=start_health, daemon=True).start()
+    iniciar_health_uma_vez()
     app = Application.builder().token(TOKEN).post_init(post_init).build()
 
     # Comandos de cliente
@@ -3863,12 +4024,21 @@ def main():
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
+    import sys
+    falhas = 0
     while True:
+        # run_polling fecha o event loop ao sair; cada tentativa precisa de um loop novo.
+        asyncio.set_event_loop(asyncio.new_event_loop())
         try:
             main()
+            break   # saída normal (SIGTERM do Koyeb): encerra o processo
         except Exception as e:
-            # Espera mais tempo antes de tentar de novo — dá tempo da
-            # instância antiga (rolling deploy do Koyeb) sair de vez e
-            # liberar o getUpdates, em vez de entrar em loop de conflito.
-            logging.error(f"💥 Reiniciando em 30s: {e}")
+            falhas += 1
+            if falhas >= 5:
+                # Deixa o Koyeb reiniciar o container do zero.
+                logging.error(f"💥 {falhas} falhas seguidas ({e}); saindo para o Koyeb reiniciar.")
+                sys.exit(1)
+            # Espera antes de tentar de novo — dá tempo da instância antiga
+            # (rolling deploy do Koyeb) sair e liberar o getUpdates.
+            logging.error(f"💥 Reiniciando em 30s ({falhas}/5): {e}")
             time.sleep(30)

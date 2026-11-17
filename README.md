@@ -1,4 +1,4 @@
-# 🎬 Cinema BOT v8.2 — StreamFlix SaaS Edition
+# 🎬 Cinema BOT v8.3 — StreamFlix SaaS Edition
 
 Bot de cinema para Telegram (multi-tenant): posts automáticos, tokens de ativação, painel web e divulgação do StreamFlix.
 
@@ -28,13 +28,25 @@ Os horários dos jobs, como já era no bot, são definidos em **UTC**. America/F
 
 O bot **não** altera nome, foto ou descrição automaticamente. A descrição só muda se `SET_BOT_PROFILE=1` (e o texto tiver sido aprovado).
 
-## Postagens automáticas
+## O que há de novo na v8.3
 
-- **8h America/Fortaleza** (11:00 UTC) — filmes em cartaz (2 cards)
-- **15h America/Fortaleza** (18:00 UTC) — 1 propaganda rotativa (antes era 3x ao dia; para voltar: `PROPAGANDA_HOURS_UTC=13,18,22`)
-- **17h America/Fortaleza** (20:00 UTC) — post curto do app
-- **20h America/Fortaleza** (23:00 UTC) — trending da semana (2 cards)
-- **Sexta 18h America/Fortaleza** (21:00 UTC) — enquete + CTA
+- Cards de filme/série com layout limpo: categoria (LANÇAMENTO, SUGESTÃO DA NOITE, SÉRIE), título em negrito + ano, nota/duração/gêneros, sinopse e hashtags (#Filme #Acao).
+- Botões do card: **▶️ Assista no StreamFlix** + **🎞 Trailer** na primeira linha, **📲 Baixar app** na segunda. Pôster em w780.
+- Agenda temática nos mesmos horários de antes: 8h = lançamentos (1 filme + 1 série); 20h = sugestão da noite com tema do dia (comédia, ação, terror, romance/drama, família, séries, clássicos).
+- Propaganda das 15h e o post do app às 17h no mesmo visual (site + códigos do Downloader + Indique e ganhe).
+- Menu do grupo: um card de destaque + títulos em botões, com **Mais ▶️**. O teclado fixo sai do grupo (fica só no privado). Guia em `/comandos` (também `/tutorial` e `/ajuda`).
+- Assistente opcional (`/ia`, menção ou resposta ao bot), desligado por padrão. Use um endpoint compatível com OpenAI; o recomendado é o Groq (veja abaixo).
+
+## Postagens automáticas (America/Fortaleza)
+
+- **8h** (11:00 UTC) — 🌅 Lançamentos de hoje: 1 filme em cartaz + 1 série (ou 2 filmes)
+- **15h** (18:00 UTC) — 1 post curto do app (site, Downloader, Indique e ganhe)
+- **17h** (20:00 UTC) — post diário do app
+- **20h** (23:00 UTC) — 🌙 Sugestão da noite (tema do dia, se `THEMED_NIGHTS=1`):
+  - seg comédia · ter ação · qua terror · qui romance/drama · sex família/animação · sáb séries · dom clássicos
+- **Sexta 18h** (21:00 UTC) — enquete + CTA
+
+Evita repetir o mesmo título do TMDB no chat por 30 dias (tabela `sent_items` já existente + memória). Horários da manhã/noite: `MANHA_HOUR_UTC` e `NOITE_HOUR_UTC`.
 
 ## ⚙️ Variáveis de ambiente (Koyeb)
 
@@ -96,6 +108,28 @@ Para desligar um recurso: `WELCOME_ENABLED=0`, `APP_PROMO_ENABLED=0`, `POLL_ENAB
 | `SET_BOT_PROFILE` | `0` | Se `1`, aplica descrição/descrição curta na inicialização (não mexe em nome nem foto) |
 | `BOT_SHORT_DESCRIPTION` | (texto padrão) | Descrição curta (até 120 caracteres), só usada se `SET_BOT_PROFILE=1` |
 | `BOT_DESCRIPTION` | (texto padrão) | Texto de "O que este bot faz?" (até 512 caracteres), só se `SET_BOT_PROFILE=1` |
+
+### Novas (v8.3) — todas opcionais
+
+| Variável | Padrão | Descrição |
+|---|---|---|
+| `THEMED_NIGHTS` | `1` | Tema da sugestão da noite por dia da semana. `0` = populares variados |
+| `MANHA_HOUR_UTC` | `11` | Hora UTC dos lançamentos (11 = 8h America/Fortaleza) |
+| `NOITE_HOUR_UTC` | `23` | Hora UTC da sugestão da noite (23 = 20h America/Fortaleza) |
+| `MANHA_INCLUIR_SERIE` | `1` | `1` = 1 filme + 1 série de manhã; `0` = 2 filmes |
+| `MANHA_HEADER` / `NOITE_HEADER` | (textos padrão) | Cabeçalhos curtos das postagens de 8h e 20h |
+| `DIAS_SEM_REPETIR` | `30` | Dias sem repetir o mesmo título no mesmo chat |
+| `TMDB_POSTER_SIZE` | `w780` | Tamanho do pôster no TMDB (`w500`, `w780`, `w1280`) |
+| `PROPAGANDA_USE_DB` | `0` | `1` = usa os textos de propaganda salvos no painel (senão, os textos novos do app) |
+| `AI_ENABLED` | `0` | Liga o assistente (`/ia`, menção ou resposta ao bot, e texto no privado) |
+| `AI_BASE_URL` | `https://api.groq.com/openai/v1` | Endpoint compatível com OpenAI `/chat/completions` |
+| `AI_API_KEY` | (vazio) | Chave do provedor (não aparece nos logs) |
+| `AI_MODEL` | `openai/gpt-oss-20b` | Modelo no provedor (padrão Groq) |
+| `AI_RATE_SECONDS` | `20` | Intervalo mínimo entre perguntas do mesmo usuário |
+| `AI_DAILY_CAP` | `15` | Máximo de perguntas por usuário por dia (Fortaleza) |
+| `AI_MAX_TOKENS` | `350` | Teto de tokens da resposta |
+
+Para ligar a IA no Groq (recomendado, plano gratuito): crie uma chave em https://console.groq.com/keys e no Koyeb defina `AI_ENABLED=1` e `AI_API_KEY` com essa chave. Os outros valores já vêm no padrão. Limites publicados: https://console.groq.com/docs/rate-limits
 
 ## 📦 Instalação
 

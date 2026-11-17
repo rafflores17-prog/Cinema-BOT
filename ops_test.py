@@ -5,62 +5,92 @@ import psycopg2
 import bot
 
 class FakeCur:
-    def __init__(self, db): self.db = db; self.rowcount = 0; self._rows = []
+    def __init__(self, db): self.db = db; self.rowcount = 0; self._rows = []; self._one = None
     def execute(self, sql, params=None):
         s = " ".join(sql.split())
-        self.db.log.append(s)
+        self.db.log.append((s, params))
+        d = self.db
         if "information_schema.columns" in s:
-            self._rows = self.db.cols
-        elif s.startswith("CREATE UNIQUE INDEX") and self.db.dup:
-            raise psycopg2.IntegrityError("could not create unique index")
+            self._rows = [(c, "x", "NO", None) for c in d.cols]
+        elif "to_regclass" in s:
+            self._one = (d.bak,)
+        elif s.startswith("CREATE TABLE IF NOT EXISTS sent_items_bak"):
+            d.bak = True
+        elif s.startswith("SELECT COUNT(*)"):
+            self._one = (42,)
+        elif s.startswith("ALTER TABLE sent_items ADD COLUMN"):
+            col = s.split("IF NOT EXISTS ")[1].split()[0]
+            if col in d.alter_fail:
+                raise psycopg2.ProgrammingError("permission denied")
+            d.cols.append(col)
+        elif s.startswith("CREATE UNIQUE INDEX"):
+            if d.dup or not {"chat_id", "item_id", "item_type"} <= set(d.cols):
+                raise psycopg2.IntegrityError("could not create unique index")
         elif s.startswith("UPDATE sent_items"):
             self.rowcount = 0
-        elif s.startswith("INSERT INTO sent_items") and self.db.pk_old:
+        elif s.startswith("INSERT INTO sent_items") and d.pk_old:
             raise psycopg2.IntegrityError("duplicate key")
+        elif s.startswith("SELECT item_id FROM sent_items"):
+            self._rows = [(1,), (2,)]
     def fetchall(self): return self._rows
-    def fetchone(self): return None
+    def fetchone(self): return self._one
     def close(self): pass
 class FakeConn:
-    def __init__(self, cols, dup=False, pk_old=False):
-        self.cols, self.dup, self.pk_old, self.log = cols, dup, pk_old, []
+    def __init__(self, cols, dup=False, pk_old=False, alter_fail=()):
+        self.cols, self.dup, self.pk_old, self.log = list(cols), dup, pk_old, []
+        self.bak, self.alter_fail = False, set(alter_fail)
     def cursor(self): return FakeCur(self)
-    def commit(self): self.log.append("COMMIT")
-    def rollback(self): self.log.append("ROLLBACK")
+    def commit(self): self.log.append(("COMMIT", None))
+    def rollback(self): self.log.append(("ROLLBACK", None))
     def close(self): pass
+    def sql(self): return "\n".join(x[0] for x in self.log)
 
-# 1) tabela antiga só com (chat_id, item_id)
-old = [("chat_id", "bigint", "NO", None), ("item_id", "bigint", "NO", None)]
-c = FakeConn(old)
+# 1) produção: sem chat_id
+prod = ["item_id", "item_type", "sent_at"]
+c = FakeConn(prod, dup=True)
 bot.migrar_sent_items(c)
-joined = "\n".join(c.log)
-assert "CREATE TABLE IF NOT EXISTS sent_items_bak_20261117 AS SELECT * FROM sent_items" in joined
-assert joined.index("sent_items_bak_20261117") < joined.index("ADD COLUMN IF NOT EXISTS item_type")
-assert "ADD COLUMN IF NOT EXISTS sent_at" in joined and "CREATE UNIQUE INDEX" in joined
-assert bot._SENT_UPSERT_OK[0] is True and "DROP" not in joined.upper()
-print("migração antiga OK")
+j = c.sql()
+assert j.index("sent_items_bak_20261117 AS SELECT") < j.index("ADD COLUMN IF NOT EXISTS chat_id BIGINT NOT NULL DEFAULT 0")
+assert "DROP" not in j.upper() and "chat_id" in bot._SENT_COLS and bot._SENT_UPSERT_OK[0] is False
+bot.db = lambda: c
+c.log.clear()
+assert bot.ids_enviados(-5) >= {1, 2}
+sel = [x for x in c.log if x[0].startswith("SELECT item_id")][0]
+assert "(chat_id=%s OR chat_id=0)" in sel[0] and sel[1][0] == -5
+c.log.clear(); bot.marcar_enviado(-5, 99, "movie")
+assert "INSERT INTO sent_items (chat_id, item_id, item_type, sent_at)" in c.sql()
+print("produção sem chat_id (com duplicatas) OK")
 
-# 2) tabela nova: sem backup nem ALTER
-new = old + [("item_type", "text", "NO", None), ("sent_at", "timestamp", "NO", None)]
-c = FakeConn(new)
+# 2) ALTER falha: continua sem chat_id, sem quebrar
+c = FakeConn(prod, alter_fail={"chat_id"})
 bot.migrar_sent_items(c)
-assert "bak" not in "\n".join(c.log) and "ALTER" not in "\n".join(c.log)
-print("tabela nova OK")
+assert "chat_id" not in bot._SENT_COLS and bot._SENT_UPSERT_OK[0] is False
+bot.db = lambda: c
+c.log.clear(); bot.ids_enviados(-5)
+sel = [x for x in c.log if x[0].startswith("SELECT item_id")][0]
+assert "chat_id" not in sel[0]
+c.log.clear(); bot.marcar_enviado(-5, 99, "tv")
+j = c.sql()
+assert "INSERT INTO sent_items (item_id, item_type, sent_at)" in j and "chat_id" not in j
+print("ALTER falhou -> funciona sem chat_id OK")
 
-# 3) índice bloqueado por duplicatas -> fallback UPDATE/INSERT, e PK antiga -> UPDATE só por chat/item
-c = FakeConn(old, dup=True)
+# 3) sem duplicatas: índice criado -> ON CONFLICT
+c = FakeConn(prod)
 bot.migrar_sent_items(c)
-assert bot._SENT_UPSERT_OK[0] is False
-c2 = FakeConn(old, pk_old=True)
-bot.db = lambda: c2
-bot.marcar_enviado(-1, 99, "movie")
-j = "\n".join(c2.log)
-assert "INSERT INTO sent_items (chat_id, item_id, item_type, sent_at)" in j and "ROLLBACK" in j
-assert "UPDATE sent_items SET sent_at=%s WHERE chat_id=%s AND item_id=%s" in j
-print("fallback sem índice OK")
-bot._SENT_UPSERT_OK[0] = True
-c3 = FakeConn(new); bot.db = lambda: c3
-bot.marcar_enviado(-1, 99, "tv")
-assert "ON CONFLICT (chat_id, item_id, item_type)" in "\n".join(c3.log)
+assert bot._SENT_UPSERT_OK[0] is True
+bot.db = lambda: c; c.log.clear(); bot.marcar_enviado(-5, 7, "movie")
+assert "ON CONFLICT (chat_id, item_id, item_type)" in c.sql()
+# 4) tabela já nova: sem backup nem ALTER
+c = FakeConn(["chat_id", "item_id", "item_type", "sent_at"])
+bot.migrar_sent_items(c)
+assert "bak" not in c.sql() and "ALTER" not in c.sql()
+# 5) PK antiga curta -> rollback e UPDATE por item_id
+bot._SENT_UPSERT_OK[0] = False
+c = FakeConn(["chat_id", "item_id", "item_type", "sent_at"], pk_old=True)
+bot._SENT_COLS.clear(); bot._SENT_COLS.update(c.cols)
+bot.db = lambda: c; bot.marcar_enviado(-1, 99, "movie")
+assert "ROLLBACK" in c.sql() and "UPDATE sent_items SET sent_at=%s WHERE item_id=%s" in c.sql()
+print("migração/fallbacks OK")
 
 # 4) envio: tópico inexistente -> reenvia sem tópico; chat não encontrado -> pula depois
 class BadRequest(Exception): pass

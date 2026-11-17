@@ -569,46 +569,75 @@ def db():
     )
 
 _SENT_UPSERT_OK = [False]   # True quando existe índice único (chat_id,item_id,item_type)
+_SENT_COLS = set()          # colunas que existem de fato em sent_items (detectadas no início)
+
+def _colunas_sent_items(cur):
+    cur.execute("""SELECT column_name, data_type, is_nullable, column_default
+                   FROM information_schema.columns
+                   WHERE table_schema = current_schema() AND table_name = 'sent_items'
+                   ORDER BY ordinal_position""")
+    return cur.fetchall()
 
 def migrar_sent_items(c):
     """Ajusta a tabela sent_items antiga sem apagar nada:
-    backup único, colunas que faltam (aditivo) e índice único para o ON CONFLICT."""
+    backup único, colunas que faltam (aditivo) e índice único para o ON CONFLICT.
+    Funciona mesmo se algum passo falhar: o bot usa só as colunas que existem."""
     cur = c.cursor()
     try:
-        cur.execute("""SELECT column_name, data_type, is_nullable, column_default
-                       FROM information_schema.columns
-                       WHERE table_schema = current_schema() AND table_name = 'sent_items'
-                       ORDER BY ordinal_position""")
-        cols = cur.fetchall()
+        cols = _colunas_sent_items(cur)
         nomes = [r[0] for r in cols]
-        logging.info("sent_items colunas: " + ", ".join(
-            f"{r[0]}:{r[1]}{'' if r[2] == 'YES' else ' not null'}" for r in cols))
+        logging.info("sent_items colunas (antes): " + (", ".join(
+            f"{r[0]}:{r[1]}{'' if r[2] == 'YES' else ' not null'}" for r in cols) or "tabela não existe"))
         if not nomes:
             cur.close(); return
         extras = [r[0] for r in cols if r[0] not in ("chat_id", "item_id", "item_type", "sent_at")
                   and r[2] == "NO" and r[3] is None]
         if extras:
             logging.warning(f"sent_items: colunas obrigatórias sem padrão que o bot não preenche: {extras}")
-        precisa = [n for n in ("item_type", "sent_at") if n not in nomes]
-        if precisa:
-            # backup uma única vez, antes de qualquer ALTER
-            cur.execute("CREATE TABLE IF NOT EXISTS sent_items_bak_20261117 AS SELECT * FROM sent_items")
-            c.commit()
-            logging.info(f"sent_items: backup em sent_items_bak_20261117; adicionando {precisa}")
-        if "item_type" not in nomes:
-            cur.execute("ALTER TABLE sent_items ADD COLUMN IF NOT EXISTS item_type TEXT NOT NULL DEFAULT 'movie'")
-        if "sent_at" not in nomes:
-            cur.execute("ALTER TABLE sent_items ADD COLUMN IF NOT EXISTS sent_at TIMESTAMP NOT NULL DEFAULT NOW()")
-        c.commit()
-        try:
-            cur.execute("""CREATE UNIQUE INDEX IF NOT EXISTS sent_items_uniq_chat_item_type
-                           ON sent_items (chat_id, item_id, item_type)""")
-            c.commit()
-            _SENT_UPSERT_OK[0] = True
-        except Exception as e:
-            c.rollback()
+        faltam = [n for n in ("chat_id", "item_type", "sent_at") if n not in nomes]
+        if faltam:
+            try:
+                cur.execute("SELECT to_regclass('sent_items_bak_20261117') IS NOT NULL")
+                ja_tinha = bool(cur.fetchone()[0])
+                cur.execute("CREATE TABLE IF NOT EXISTS sent_items_bak_20261117 AS SELECT * FROM sent_items")
+                c.commit()
+                cur.execute("SELECT COUNT(*) FROM sent_items_bak_20261117")
+                n_bak = cur.fetchone()[0]
+                logging.info(f"sent_items: backup sent_items_bak_20261117 "
+                             f"{'já existia' if ja_tinha else 'criado'} ({n_bak} linhas)")
+            except Exception as e:
+                c.rollback()
+                logging.error(f"sent_items: backup falhou ({type(e).__name__}: {e}); não altero a tabela")
+                faltam = []
+            ddl = {
+                "chat_id":   "ALTER TABLE sent_items ADD COLUMN IF NOT EXISTS chat_id BIGINT NOT NULL DEFAULT 0",
+                "item_type": "ALTER TABLE sent_items ADD COLUMN IF NOT EXISTS item_type TEXT NOT NULL DEFAULT 'movie'",
+                "sent_at":   "ALTER TABLE sent_items ADD COLUMN IF NOT EXISTS sent_at TIMESTAMP NOT NULL DEFAULT NOW()",
+            }
+            for col in faltam:
+                try:
+                    cur.execute(ddl[col]); c.commit()
+                    logging.info(f"sent_items: coluna {col} adicionada")
+                except Exception as e:
+                    c.rollback()
+                    logging.error(f"sent_items: não consegui adicionar {col} ({type(e).__name__}: {e})")
+        cols = _colunas_sent_items(cur)
+        _SENT_COLS.clear(); _SENT_COLS.update(r[0] for r in cols)
+        logging.info("sent_items colunas (depois): " + ", ".join(r[0] for r in cols))
+        if {"chat_id", "item_id", "item_type"} <= _SENT_COLS:
+            try:
+                cur.execute("""CREATE UNIQUE INDEX IF NOT EXISTS sent_items_uniq_chat_item_type
+                               ON sent_items (chat_id, item_id, item_type)""")
+                c.commit()
+                _SENT_UPSERT_OK[0] = True
+                logging.info("sent_items: índice único (chat_id,item_id,item_type) OK; usando ON CONFLICT")
+            except Exception as e:
+                c.rollback()
+                _SENT_UPSERT_OK[0] = False
+                logging.warning(f"sent_items: sem índice único ({type(e).__name__}); usando UPDATE/INSERT simples")
+        else:
             _SENT_UPSERT_OK[0] = False
-            logging.warning(f"sent_items: sem índice único ({type(e).__name__}); usando UPDATE/INSERT simples")
+            logging.warning("sent_items: faltam colunas para o índice; usando UPDATE/INSERT simples")
     except Exception as e:
         c.rollback()
         logging.error(f"sent_items migração: {e}")
@@ -1496,19 +1525,35 @@ def build_caption(details, is_tv=False, categoria=None):
 # ── Itens enviados por cliente ─────────────────────────────────────────────
 _enviados_mem = {}  # (chat_id, item_id) -> datetime
 
+def _sent_cols():
+    # Antes da detecção (ou sem banco), assume o esquema novo.
+    return _SENT_COLS or {"chat_id", "item_id", "item_type", "sent_at"}
+
 def ids_enviados(chat_id, dias=None):
-    """IDs já postados neste chat na janela (tabela sent_items + memória)."""
+    """IDs já postados neste chat na janela (tabela sent_items + memória).
+    Linhas com chat_id=0 (histórico antigo, sem chat) valem para todos os chats."""
     janela = DIAS_SEM_REPETIR if dias is None else dias
     corte = datetime.utcnow() - timedelta(days=janela)
     ids = set()
+    cols = _sent_cols()
+    where, params = [], []
+    if "chat_id" in cols:
+        where.append("(chat_id=%s OR chat_id=0)"); params.append(chat_id)
+    if "sent_at" in cols:
+        where.append("sent_at>%s"); params.append(corte)
+    sql = "SELECT item_id FROM sent_items" + (" WHERE " + " AND ".join(where) if where else "")
+    c = None
     try:
         c = db(); cur = c.cursor()
-        cur.execute("SELECT item_id FROM sent_items WHERE chat_id=%s AND sent_at>%s",
-                    (chat_id, corte))
+        cur.execute(sql, tuple(params))
         ids = {r[0] for r in cur.fetchall()}
-        cur.close(); c.close()
-    except Exception:
-        pass
+        cur.close()
+    except Exception as e:
+        logging.warning(f"sent_items leitura: {type(e).__name__}")
+    finally:
+        if c is not None:
+            try: c.close()
+            except Exception: pass
     for (cid, iid), ts in list(_enviados_mem.items()):
         if cid == chat_id and ts >= corte:
             ids.add(iid)
@@ -1523,29 +1568,38 @@ def marcar_enviado(chat_id, item_id, tipo):
         _enviados_mem[(chat_id, item_id)] = datetime.utcnow()
     tipo = tipo or "movie"
     agora = datetime.utcnow()
+    cols = _sent_cols()
+    # Só usa as colunas que existem de verdade
+    valores = {"chat_id": chat_id, "item_id": item_id, "item_type": tipo, "sent_at": agora}
+    usar = [k for k in ("chat_id", "item_id", "item_type", "sent_at") if k in cols]
+    if "item_id" not in usar:
+        return
+    chave = [k for k in ("chat_id", "item_id", "item_type") if k in usar]
     c = None
     try:
         c = db(); cur = c.cursor()
-        if _SENT_UPSERT_OK[0]:
-            cur.execute("""INSERT INTO sent_items (chat_id, item_id, item_type, sent_at)
-                VALUES (%s,%s,%s,%s)
-                ON CONFLICT (chat_id, item_id, item_type) DO UPDATE SET sent_at=EXCLUDED.sent_at""",
-                (chat_id, item_id, tipo, agora))
+        ins = (f"INSERT INTO sent_items ({', '.join(usar)}) VALUES ({', '.join(['%s'] * len(usar))})")
+        ins_vals = tuple(valores[k] for k in usar)
+        if _SENT_UPSERT_OK[0] and "sent_at" in usar:
+            cur.execute(ins + " ON CONFLICT (chat_id, item_id, item_type) DO UPDATE SET sent_at=EXCLUDED.sent_at",
+                        ins_vals)
         else:
-            cur.execute("""UPDATE sent_items SET sent_at=%s
-                WHERE chat_id=%s AND item_id=%s AND item_type=%s""", (agora, chat_id, item_id, tipo))
-            if cur.rowcount == 0:
+            atualizou = 0
+            if "sent_at" in usar:
+                cur.execute("UPDATE sent_items SET sent_at=%s WHERE " + " AND ".join(f"{k}=%s" for k in chave),
+                            (agora,) + tuple(valores[k] for k in chave))
+                atualizou = cur.rowcount
+            if not atualizou:
                 try:
-                    cur.execute("""INSERT INTO sent_items (chat_id, item_id, item_type, sent_at)
-                        VALUES (%s,%s,%s,%s)""", (chat_id, item_id, tipo, agora))
+                    cur.execute(ins, ins_vals)
                 except psycopg2.IntegrityError:
-                    # chave antiga (chat_id,item_id) já existe com outro tipo: só atualiza a data
+                    # chave antiga mais curta (ex.: só item_id) já existe: só atualiza a data
                     c.rollback()
-                    cur.execute("UPDATE sent_items SET sent_at=%s WHERE chat_id=%s AND item_id=%s",
-                                (agora, chat_id, item_id))
+                    if "sent_at" in usar:
+                        cur.execute("UPDATE sent_items SET sent_at=%s WHERE item_id=%s", (agora, item_id))
         c.commit(); cur.close()
     except Exception as e:
-        logging.error(f"sent_items: {e}")
+        logging.error(f"sent_items: {type(e).__name__}: {e}")
     finally:
         if c is not None:
             try: c.close()
@@ -2762,7 +2816,9 @@ def ai_system_prompt():
         "(ou toca nos botões que aparecem abaixo da sua resposta) e recebe o card com sinopse e trailer. "
         "Para assistir, ele abre o app StreamFlix e procura o título lá. "
         "NUNCA diga para digitar comandos (/filme, /serie etc.) dentro do app; o app não tem comandos. "
-        "Ao recomendar, termine com algo como 'Toque no botão abaixo para ver o card' ou 'Digite o nome aqui para ver mais'.\n\n"
+        "Não escreva frases sobre botões ou cards (o bot coloca os botões sozinho quando houver). "
+        "Em perguntas que não são recomendação de títulos (instalação, preço, VIP, ajuda), não cite filmes, "
+        "não fale de cards e não escreva a linha TITULOS.\n\n"
         "FORMATO DA RESPOSTA (obrigatório):\n"
         "- Comece com uma linha curta de título em **negrito** (pode ter 1 emoji).\n"
         "- Depois use frases curtas ou tópicos com '- ' (no máximo 5 tópicos). Passos de instalação em lista numerada '1. '.\n"
@@ -2846,6 +2902,20 @@ def ai_perguntar(pergunta):
 import re as _re
 
 AI_RESPOSTA_MAX = 1200   # caracteres do texto bruto (antes de virar HTML)
+
+_FRASE_BOTAO = _re.compile(
+    r"[^.!?\n]*\b(toque|clique|aperte|use)\b[^.!?\n]*\b(bot[aã]o|bot[õo]es|card|abaixo)\b[^.!?\n]*[.!?]?",
+    flags=_re.I)
+
+def limpar_frases_botao(texto):
+    """Tira frases do modelo sobre 'toque no botão abaixo / ver o card' (o bot põe o rodapé certo)."""
+    out = []
+    for ln in (texto or "").split("\n"):
+        novo = _FRASE_BOTAO.sub("", ln).strip()
+        if ln.strip() and not _re.sub(r"[\W_]+", "", novo):
+            continue                      # a linha era só essa frase
+        out.append(novo if novo != ln.strip() else ln.rstrip())
+    return _re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
 
 def ai_separar_titulos(texto):
     """Tira a linha final 'TITULOS: A (2020); B' e devolve (texto, [(nome, ano)])."""
@@ -3114,6 +3184,7 @@ async def _entregar_ia(update, context, pergunta):
             markup = await asyncio.to_thread(ai_botoes_titulos, titulos)
         except Exception as e:
             logging.warning(f"IA botões: {type(e).__name__}")
+    corpo = limpar_frases_botao(corpo)
     if markup:
         corpo += "\n\n👇 Toque para abrir o card completo."
     if not msg:
@@ -3272,17 +3343,92 @@ def _nomes_item(r):
     return {normalizar_busca(r.get("name" if tv else "title") or ""),
             normalizar_busca(r.get("original_name" if tv else "original_title") or "")} - {""}
 
+def item_decente(r):
+    return bool(r.get("poster_path") or (r.get("overview") or "").strip())
+
+def item_forte(r):
+    """Bom o bastante para ir direto como card: tem pôster ou sinopse e algum público."""
+    return item_decente(r) and ((r.get("vote_count") or 0) >= 15 or (r.get("popularity") or 0) >= 8)
+
+# Gênero digitado -> lista organizada do gênero (filmes; ou séries com "séries de X")
+GENEROS_TEXTO = {
+    # palavra normalizada: (nome, id filme, id série)
+    "terror": ("👻 Terror", 27, 9648), "horror": ("👻 Terror", 27, 9648),
+    "acao": ("🔥 Ação", 28, 10759), "comedia": ("🤡 Comédia", 35, 35),
+    "romance": ("💖 Romance", 10749, 18), "romantico": ("💖 Romance", 10749, 18),
+    "romanticos": ("💖 Romance", 10749, 18), "drama": ("📚 Drama", 18, 18),
+    "animacao": ("🧸 Animação", 16, 16), "desenho": ("🧸 Animação", 16, 16),
+    "desenhos": ("🧸 Animação", 16, 16), "anime": ("🧸 Animação", 16, 16),
+    "animes": ("🧸 Animação", 16, 16),
+    "ficcao": ("🛸 Ficção Científica", 878, 10765), "ficcao cientifica": ("🛸 Ficção Científica", 878, 10765),
+    "sci fi": ("🛸 Ficção Científica", 878, 10765), "scifi": ("🛸 Ficção Científica", 878, 10765),
+    "suspense": ("🕵️ Suspense", 53, 9648), "thriller": ("🕵️ Suspense", 53, 9648),
+    "misterio": ("🧩 Mistério", 9648, 9648), "documentario": ("🎥 Documentário", 99, 99),
+    "documentarios": ("🎥 Documentário", 99, 99), "crime": ("🚔 Crime", 80, 80),
+    "policial": ("🚔 Crime", 80, 80), "policiais": ("🚔 Crime", 80, 80),
+    "aventura": ("🗺️ Aventura", 12, 10759), "fantasia": ("🧙 Fantasia", 14, 10765),
+    "guerra": ("🎖️ Guerra", 10752, 10768), "faroeste": ("🤠 Faroeste", 37, 37),
+    "western": ("🤠 Faroeste", 37, 37), "familia": ("👨‍👩‍👧 Família", 10751, 10751),
+    "infantil": ("🧸 Infantil", 10751, 10762), "infantis": ("🧸 Infantil", 10751, 10762),
+    "kids": ("🧸 Infantil", 10751, 10762), "musical": ("🎵 Musical", 10402, 10402),
+    "historia": ("🏛️ História", 36, 10768), "historico": ("🏛️ História", 36, 10768),
+}
+
+def detectar_genero(texto):
+    """'terror', 'filmes de terror', 'séries de comédia' -> (nome, genre_id, is_tv) ou None."""
+    n = normalizar_busca(texto)
+    if not n or len(n.split()) > 4:
+        return None
+    is_tv = False
+    for pre in ("um ", "uma ", "uns ", "umas "):
+        if n.startswith(pre):
+            n = n[len(pre):]
+    for pre, tv in (("filmes de ", False), ("filme de ", False), ("series de ", True),
+                    ("serie de ", True), ("filmes ", False), ("filme ", False),
+                    ("series ", True), ("serie ", True), ("de ", False)):
+        if n.startswith(pre):
+            n = n[len(pre):]
+            is_tv = tv
+            break
+    info = GENEROS_TEXTO.get(n.strip())
+    if not info:
+        return None
+    nome, gid_filme, gid_serie = info
+    return (nome, gid_serie if is_tv else gid_filme, is_tv)
+
+async def enviar_genero(context, cid, genero):
+    nome, gid, is_tv = genero
+    tipo = "tv" if is_tv else "movie"
+    params = {"with_genres": gid, "sort_by": "popularity.desc", "vote_count.gte": 80,
+              "page": random.randint(1, 3)}
+    if gid == 10762 or (gid == 16 and not is_tv):
+        params["vote_count.gte"] = 40
+    d = await asyncio.to_thread(tmdb, f"discover/{tipo}", params)
+    itens = [i for i in (d or {}).get("results") or [] if item_decente(i)]
+    for i in itens:
+        i.setdefault("media_type", tipo)
+    titulo = f"{nome} — {'séries' if is_tv else 'filmes'}"
+    await enviar_vitrine(context, cid, itens, is_tv=is_tv,
+                         categoria="📺 SÉRIE" if is_tv else "🎬 FILME", titulo=titulo)
+
 def escolher_resultado(query, resultados):
     """Devolve ('card', item) se houver um match forte, ('lista', itens) se vários,
     ou (None, []) se nada. Também diz se há algum título que bate com o texto."""
     if not resultados:
         return None, []
     alvo = normalizar_busca(query)
-    exatos = [r for r in resultados if alvo in _nomes_item(r)]
-    if len(resultados) == 1:
+    # títulos sem pôster e sem sinopse vão para o fim (ou saem, se houver opções boas)
+    bons = [r for r in resultados if item_decente(r)]
+    ruins = [r for r in resultados if not item_decente(r)]
+    resultados = bons + (ruins if len(bons) < 3 else [])
+    exatos = [r for r in resultados if alvo in _nomes_item(r) and item_forte(r)]
+    if len(resultados) == 1 and item_forte(resultados[0]):
         return "card", resultados[0]
     if len(exatos) == 1:
-        return "card", exatos[0]
+        outros_exatos = [r for r in resultados if alvo in _nomes_item(r) and r is not exatos[0]]
+        if not outros_exatos or (exatos[0].get("popularity") or 0) >= 3 * max(
+                max((r.get("popularity") or 0) for r in outros_exatos), 0.1):
+            return "card", exatos[0]
     if len(exatos) > 1:
         a, b = exatos[0], exatos[1]
         if (a.get("popularity") or 0) >= 3 * max(b.get("popularity") or 0, 0.1) \
@@ -3379,6 +3525,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text not in MENU_BOTOES:
         ia_on = AI_ENABLED and AI_API_KEY
         para_bot, pergunta_ia = mensagem_para_o_bot(update)
+        genero = detectar_genero(text) if TEXT_SEARCH else None
+        if genero and chat.type == "private" and (acesso_conteudo(cid) or PUBLIC_SEARCH):
+            if not rate_ok(uid, "search", COMMAND_RATE_SECONDS):
+                await avisar_aguarde(update)
+                return
+            await enviar_genero(context, cid, genero)
+            return
         if chat.type == "private":
             if TEXT_SEARCH and parece_titulo(text) and (acesso_conteudo(cid) or PUBLIC_SEARCH):
                 if not rate_ok(uid, "search", COMMAND_RATE_SECONDS):
@@ -3401,6 +3554,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if chat.type in ("group", "supergroup"):
             if para_bot:
                 q_txt = pergunta_ia or ""
+                g_bot = detectar_genero(q_txt) if TEXT_SEARCH else None
+                if g_bot and acesso_conteudo(cid):
+                    if rate_ok(uid, "txt", GROUP_SEARCH_RATE_SECONDS):
+                        await enviar_genero(context, cid, g_bot)
+                    return
                 # "@bot Duna" ou resposta ao bot com um nome -> busca; senão IA
                 if TEXT_SEARCH and q_txt and parece_titulo(q_txt, grupo=True) and acesso_conteudo(cid):
                     if rate_ok(uid, "txt", GROUP_SEARCH_RATE_SECONDS) and \
@@ -3415,6 +3573,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             if msg.reply_to_message:
                 return                        # resposta a outra pessoa = conversa
+            if genero and GROUP_TEXT_SEARCH:
+                if rate_ok(uid, "txt", GROUP_TEXT_SEARCH_USER_SECONDS) and \
+                        rate_ok(cid, "txt_grupo", GROUP_TEXT_SEARCH_CHAT_SECONDS):
+                    await enviar_genero(context, cid, genero)
+                return
             if not parece_titulo(text, grupo=True):
                 return
             # anti-spam: por pessoa e por grupo (silencioso)

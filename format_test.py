@@ -31,9 +31,9 @@ for t, grupo, esperado in [
     assert r == esperado, t
 
 # escolha de resultado
-res = [{"id": 10, "title": "Duna", "original_title": "Dune", "media_type": "movie", "popularity": 90, "vote_count": 9000},
-       {"id": 11, "title": "Duna", "original_title": "Dune", "media_type": "movie", "popularity": 10, "vote_count": 900, "release_date": "1984"},
-       {"id": 12, "title": "Duna: Parte Dois", "media_type": "movie", "popularity": 80, "vote_count": 5000}]
+res = [{"id": 10, "title": "Duna", "original_title": "Dune", "media_type": "movie", "popularity": 90, "vote_count": 9000, "poster_path": "/a.jpg"},
+       {"id": 11, "title": "Duna", "original_title": "Dune", "media_type": "movie", "popularity": 10, "vote_count": 900, "release_date": "1984", "poster_path": "/b.jpg"},
+       {"id": 12, "title": "Duna: Parte Dois", "media_type": "movie", "popularity": 80, "vote_count": 5000, "poster_path": "/c.jpg"}]
 assert bot.escolher_resultado("duna", res) == ("card", res[0])
 assert bot.escolher_resultado("dun", res)[0] == "lista"
 assert [r["id"] for r in bot.match_relevante("duna", res)] == [10, 11, 12]
@@ -101,3 +101,21 @@ mk = bot.ai_botoes_titulos([("Hereditary", "2018"), ("The Witch", "2015"), ("It"
 print([b[0].text for b in mk.inline_keyboard])
 assert len(mk.inline_keyboard) == 4
 print("OK: botões da IA")
+
+# ---- gêneros digitados, match forte e frases de botão ----
+assert bot.detectar_genero("terror") == ("👻 Terror", 27, False)
+assert bot.detectar_genero("Filmes de Ação") == ("🔥 Ação", 28, False)
+assert bot.detectar_genero("séries de comédia") == ("🤡 Comédia", 35, True)
+assert bot.detectar_genero("um filme de terror")[1] == 27
+assert bot.detectar_genero("ficção científica")[1] == 878
+assert bot.detectar_genero("Duna") is None and bot.detectar_genero("quero um terror bem assustador") is None
+lixo = [{"id": 5, "name": "Terror", "media_type": "tv", "popularity": 0.6, "vote_count": 0}]
+assert bot.escolher_resultado("terror", lixo)[0] == "lista"
+bom = [{"id": 6, "title": "Duna", "media_type": "movie", "poster_path": "/x.jpg", "popularity": 50, "vote_count": 9000}]
+assert bot.escolher_resultado("duna", bom + lixo)[0] == "card"
+t = "**Como instalar na TV**\n1. Abra o Downloader\n2. Digite 3422972\nToque no botão abaixo para ver o card."
+limpo = bot.limpar_frases_botao(t)
+print(limpo)
+assert "botão" not in limpo and "3422972" in limpo
+assert bot.limpar_frases_botao("Pronto! Clique no card abaixo para ver mais. Bom filme!") == "Pronto! Bom filme!"
+print("OK: gêneros/match/frases")

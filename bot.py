@@ -1,4 +1,4 @@
-# ================= BOT DE CINEMA v8.0 — StreamFlix SaaS Edition =================
+# ================= BOT DE CINEMA v8.1 — StreamFlix SaaS Edition =================
 # Novidades v8:
 #   ✅ Sistema multi-tenant (vários clientes, um bot)
 #   ✅ Aluguel de 30 dias com renovação automática
@@ -16,7 +16,8 @@ from urllib.parse import urlparse, quote
 import requests, psycopg2
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import (Application, CommandHandler, MessageHandler,
-                          filters, ContextTypes, CallbackQueryHandler)
+                          filters, ContextTypes, CallbackQueryHandler,
+                          ChatMemberHandler)
 
 # ── Variáveis de ambiente ──────────────────────────────────────────────────
 TOKEN         = os.environ.get("TOKEN",        os.environ.get("BOT_TOKEN", ""))
@@ -34,6 +35,35 @@ MP_TOKEN      = os.environ.get("MP_ACCESS_TOKEN", "")  # Mercado Pago Access Tok
 BOT_PUBLIC_URL = os.environ.get("BOT_PUBLIC_URL", "")  # URL pública do bot no Koyeb
 DIAS_SEM_REPETIR = 21
 DIAS_PLANO       = 30
+
+def env_bool(name, default=True):
+    v = os.environ.get(name)
+    if v is None or str(v).strip() == "":
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "on", "sim")
+
+def env_int(name, default):
+    try:
+        return int(str(os.environ.get(name, default)).strip())
+    except (TypeError, ValueError):
+        return default
+
+# Painel: origens extras (vírgula). Sempre libera o painel oficial e localhost.
+PANEL_CORS_ORIGINS = os.environ.get("PANEL_CORS_ORIGINS", "")
+
+# Engajamento (todos ligados por padrão; desligue com 0/false/off)
+WELCOME_ENABLED         = env_bool("WELCOME_ENABLED", True)
+WELCOME_DELETE_SECONDS  = env_int("WELCOME_DELETE_SECONDS", 180)  # 0 = não apaga
+WELCOME_RATE_SECONDS    = env_int("WELCOME_RATE_SECONDS", 45)
+WELCOME_INCLUDE_CLIENTS = env_bool("WELCOME_INCLUDE_CLIENTS", False)
+BUTTON_ASSISTA          = env_bool("BUTTON_ASSISTA", True)
+APP_PROMO_ENABLED       = env_bool("APP_PROMO_ENABLED", True)
+APP_PROMO_HOUR_UTC      = env_int("APP_PROMO_HOUR_UTC", 20)   # 17h America/Fortaleza
+POLL_ENABLED            = env_bool("POLL_ENABLED", True)
+POLL_WEEKDAY            = env_int("POLL_WEEKDAY", 4)          # 0=seg ... 4=sexta
+POLL_HOUR_UTC           = env_int("POLL_HOUR_UTC", 21)        # 18h America/Fortaleza
+DOWNLOADER_CELULAR      = os.environ.get("DOWNLOADER_CELULAR", "6085325")
+DOWNLOADER_TV           = os.environ.get("DOWNLOADER_TV", "3422972")
 
 IMG_BASE  = "https://image.tmdb.org/t/p/w500"
 TMDB_BASE = "https://api.themoviedb.org/3"
@@ -66,9 +96,13 @@ class AdminHandler(BaseHTTPRequestHandler):
         self.send_response(404); self.end_headers()
 
     def _cors(self):
-        self.send_header("Access-Control-Allow-Origin",  "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        origin = (self.headers.get("Origin") or "").strip()
+        if cors_origin_allowed(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Admin-Pass")
+        self.send_header("Access-Control-Max-Age", "86400")
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -81,13 +115,39 @@ class AdminHandler(BaseHTTPRequestHandler):
         self._cors(); self.end_headers()
         self.wfile.write(body)
 
-    def _handle_admin(self, parsed):
+    def _read_json_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            return None
+        if length <= 0 or length > 1_000_000:
+            return None
+        raw = self.rfile.read(length)
+        try:
+            import json
+            data = json.loads(raw.decode("utf-8"))
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def _admin_pw_and_cmd(self, parsed, body_json=None):
+        """Senha: header X-Admin-Pass, depois JSON, depois query (legado, transição)."""
         from urllib.parse import parse_qs
         params = parse_qs(parsed.query)
-        pw  = params.get("pass",  [""])[0]
-        cmd = params.get("cmd",   [""])[0]
+        cmd = params.get("cmd", [""])[0]
+        pw = self.headers.get("X-Admin-Pass") or ""
+        if body_json:
+            if not pw:
+                pw = str(body_json.get("pass") or body_json.get("password") or "")
+            cmd = str(body_json.get("cmd") or cmd or "")
+        if not pw:
+            pw = params.get("pass", [""])[0]
+        return pw, cmd
 
-        if not PANEL_PASS or pw != PANEL_PASS:
+    def _handle_admin(self, parsed, body_json=None):
+        pw, cmd = self._admin_pw_and_cmd(parsed, body_json)
+
+        if not PANEL_PASS or not pw or not secrets.compare_digest(str(pw), str(PANEL_PASS)):
             self._json({"error": "Senha incorreta."}, 403); return
 
         try:
@@ -366,9 +426,13 @@ class AdminHandler(BaseHTTPRequestHandler):
 
 
     def do_POST(self):
-        """Webhook do Mercado Pago."""
+        """API do painel (POST /admin) e webhook do Mercado Pago."""
+        parsed = urlparse(self.path)
+        if parsed.path == "/admin":
+            body_json = self._read_json_body()
+            self._handle_admin(parsed, body_json)
+            return
         try:
-            parsed = urlparse(self.path)
             if parsed.path == "/webhook/mp":
                 length = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(length)
@@ -1310,9 +1374,12 @@ async def send_item(context, chat_id, item, is_tv=False, tipo="movie"):
     # Principal = site (landing); Baixar = APK no oficial
     assist_url = link_streamflix(iid, is_tv=is_tv, site=site)
     baixar_url = link_app_download() if "streamflixvip.online" in ensure_https(site) else ensure_https(site)
+    label_assist = "▶️ Assista no StreamFlix" if BUTTON_ASSISTA else (
+        "🎬 VER NO SITE / APP" if modo == "simples" else "🌐 VER NO SITE / APP"
+    )
     if modo == "simples":
         keyboard = [
-            [InlineKeyboardButton("🎬 VER NO SITE / APP", url=assist_url)],
+            [InlineKeyboardButton(label_assist, url=assist_url)],
             [InlineKeyboardButton("📱 Baixar APK", url=baixar_url)],
         ]
     else:
@@ -1321,7 +1388,7 @@ async def send_item(context, chat_id, item, is_tv=False, tipo="movie"):
             row2.append(InlineKeyboardButton("🎬 Ver Trailer", url=url_trl))
         row2.append(InlineKeyboardButton("📱 Baixar APK", url=baixar_url))
         keyboard = [
-            [InlineKeyboardButton("🌐 VER NO SITE / APP", url=assist_url)],
+            [InlineKeyboardButton(label_assist, url=assist_url)],
             row2
         ]
     post = details.get("poster_path") or item.get("poster_path")
@@ -1715,6 +1782,199 @@ async def job_diario_todos(context: ContextTypes.DEFAULT_TYPE, turno="manha"):
 async def job_diario_manha(context): await job_diario_todos(context, "manha")
 async def job_diario_noite(context): await job_diario_todos(context, "noite")
 
+def chats_destinatarios():
+    """Clientes ativos + grupo principal e canal VIP, sem duplicar."""
+    try:
+        c = db(); cur = c.cursor()
+        cur.execute("SELECT chat_id FROM clientes WHERE ativo=TRUE AND validade > NOW()")
+        chats = [r[0] for r in cur.fetchall()]; cur.close(); c.close()
+    except Exception:
+        chats = []
+    if GRUPO_ID and GRUPO_ID not in chats:
+        chats.append(GRUPO_ID)
+    if CANAL_VIP and CANAL_VIP not in chats:
+        chats.append(CANAL_VIP)
+    return chats
+
+def label_botao_assistir():
+    return "▶️ Assista no StreamFlix" if BUTTON_ASSISTA else "🌐 VER NO SITE / APP"
+
+def markup_cta_app():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label_botao_assistir(), url=ensure_https(SITE_URL))],
+        [InlineKeyboardButton("📱 Baixar APK", url=link_app_download())],
+    ])
+
+def texto_indique():
+    return (
+        "📲 Downloader — Indique e ganhe: +7 dias VIP\n"
+        f"📱 Celular: <code>{html.escape(str(DOWNLOADER_CELULAR))}</code>\n"
+        f"📺 TV: <code>{html.escape(str(DOWNLOADER_TV))}</code>"
+    )
+
+# ── Boas-vindas a novos membros ────────────────────────────────────────────
+_welcome_last = {}  # chat_id -> timestamp, anti-flood
+
+def cors_origin_allowed(origin):
+    if not origin:
+        return False
+    allowed = {
+        "https://cinema-bot-painel.vercel.app",
+    }
+    for extra in (PANEL_CORS_ORIGINS or "").split(","):
+        extra = extra.strip()
+        if extra:
+            allowed.add(extra.rstrip("/"))
+    if origin in allowed:
+        return True
+    try:
+        u = urlparse(origin)
+    except Exception:
+        return False
+    if u.scheme not in ("http", "https"):
+        return False
+    host = (u.hostname or "").lower()
+    return host in ("localhost", "127.0.0.1")
+
+def chats_boas_vindas():
+    chats = set()
+    if GRUPO_ID:
+        chats.add(GRUPO_ID)
+    if CANAL_VIP:
+        chats.add(CANAL_VIP)
+    for part in os.environ.get("WELCOME_CHAT_IDS", "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            chats.add(int(part))
+        except ValueError:
+            logging.warning(f"WELCOME_CHAT_IDS inválido: {part}")
+    if WELCOME_INCLUDE_CLIENTS:
+        for cid in chats_destinatarios():
+            chats.add(cid)
+    return chats
+
+async def _apagar_mensagem(context):
+    data = context.job.data or {}
+    try:
+        await context.bot.delete_message(data["chat_id"], data["message_id"])
+    except Exception:
+        pass
+
+async def enviar_boas_vindas(context, chat_id, users):
+    if not WELCOME_ENABLED or not users:
+        return
+    if chat_id not in chats_boas_vindas():
+        return
+    now = time.time()
+    last = _welcome_last.get(chat_id, 0)
+    if WELCOME_RATE_SECONDS > 0 and (now - last) < WELCOME_RATE_SECONDS:
+        logging.info(f"Boas-vindas: rate-limit no chat {chat_id}, pulando.")
+        return
+    _welcome_last[chat_id] = now
+    nomes = []
+    for u in users:
+        if getattr(u, "is_bot", False):
+            continue
+        nomes.append(html.escape(u.first_name or "aí"))
+    if not nomes:
+        return
+    quem = ", ".join(nomes[:5])
+    if len(nomes) > 5:
+        quem += f" e mais {len(nomes) - 5}"
+    texto = (
+        f"👋 Bem-vindo(a), {quem}!\n\n"
+        "🎬 Filmes, séries e TV no StreamFlix\n"
+        f"🌐 {html.escape(ensure_https(SITE_URL))}\n\n"
+        f"{texto_indique()}"
+    )
+    msg = await enviar(context, chat_id, text=texto, markup=markup_cta_app())
+    if msg and WELCOME_DELETE_SECONDS > 0 and context.job_queue:
+        context.job_queue.run_once(
+            _apagar_mensagem,
+            when=WELCOME_DELETE_SECONDS,
+            data={"chat_id": chat_id, "message_id": msg.message_id},
+            name=f"wdel-{chat_id}-{msg.message_id}",
+        )
+
+async def on_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg or not msg.new_chat_members:
+        return
+    await enviar_boas_vindas(context, update.effective_chat.id, msg.new_chat_members)
+
+async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cmu = update.chat_member
+    if not cmu:
+        return
+    old, new = cmu.old_chat_member, cmu.new_chat_member
+    if not new or not new.user:
+        return
+    was_out = old.status in ("left", "kicked") if old else True
+    is_in = new.status in ("member", "administrator", "restricted", "creator")
+    if was_out and is_in:
+        await enviar_boas_vindas(context, update.effective_chat.id, [new.user])
+
+# ── Post diário do app e enquete semanal ───────────────────────────────────
+async def job_app_promo(context: ContextTypes.DEFAULT_TYPE):
+    if not APP_PROMO_ENABLED:
+        return
+    texto = (
+        "📱 <b>Assista no app StreamFlix</b>\n\n"
+        "Filmes, séries e TV ao vivo.\n"
+        f"🌐 {html.escape(ensure_https(SITE_URL))}\n\n"
+        f"{texto_indique()}"
+    )
+    for cid in chats_destinatarios():
+        try:
+            await enviar(context, cid, text=texto, markup=markup_cta_app())
+        except Exception as e:
+            logging.error(f"App promo {cid}: {e}")
+
+async def job_enquete_semanal(context: ContextTypes.DEFAULT_TYPE):
+    if not POLL_ENABLED:
+        return
+    d = tmdb("trending/all/week") or {}
+    itens = list(d.get("results") or [])
+    filmes = [i for i in itens if i.get("media_type") in ("movie", None) and i.get("title")]
+    if len(filmes) < 2:
+        filmes = [i for i in itens if (i.get("title") or i.get("name"))]
+    random.shuffle(filmes)
+    opcoes = []
+    for item in filmes:
+        title = (item.get("title") or item.get("name") or "").strip()
+        year = (item.get("release_date") or item.get("first_air_date") or "")[:4]
+        label = f"{title} ({year})" if year else title
+        if len(label) > 100:
+            label = label[:97] + "…"
+        if label and label not in opcoes:
+            opcoes.append(label)
+        if len(opcoes) >= 4:
+            break
+    if len(opcoes) < 2:
+        logging.warning("Enquete: poucos títulos no TMDB, pulando.")
+        return
+    question = os.environ.get("POLL_QUESTION") or "🎬 Qual filme você quer ver no fim de semana?"
+    cta = (
+        "🗳️ Vote e assista no StreamFlix!\n"
+        f"🌐 {html.escape(ensure_https(SITE_URL))}\n"
+        f"{texto_indique()}"
+    )
+    for cid in chats_destinatarios():
+        try:
+            kw = {}
+            topic = get_topic_id(cid)
+            if topic:
+                kw["message_thread_id"] = topic
+            await context.bot.send_poll(
+                chat_id=cid, question=question, options=opcoes,
+                is_anonymous=True, **kw
+            )
+            await enviar(context, cid, text=cta, markup=markup_cta_app())
+        except Exception as e:
+            logging.error(f"Enquete {cid}: {e}")
+
 # ── Handlers de texto ──────────────────────────────────────────────────────
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await verificar_acesso(update, context): return
@@ -1925,6 +2185,9 @@ def main():
     # Texto e callbacks
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(callback_handler))
+    # Boas-vindas (serviço + chat_member; rate-limit evita flood)
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_chat_members))
+    app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
 
     # Jobs automáticos
     jq = app.job_queue
@@ -1935,6 +2198,12 @@ def main():
         jq.run_daily(job_propaganda, time=datetime.strptime("13:00","%H:%M").time())  # 10h BRT
         jq.run_daily(job_propaganda, time=datetime.strptime("18:00","%H:%M").time())  # 15h BRT
         jq.run_daily(job_propaganda, time=datetime.strptime("22:00","%H:%M").time())  # 19h BRT
+        # Novos jobs (horários em UTC, iguais aos existentes: UTC = BRT+3)
+        promo_h = max(0, min(23, APP_PROMO_HOUR_UTC))
+        poll_h  = max(0, min(23, POLL_HOUR_UTC))
+        weekday = max(0, min(6, POLL_WEEKDAY))
+        jq.run_daily(job_app_promo, time=datetime.strptime(f"{promo_h:02d}:00","%H:%M").time())  # padrão 17h BRT
+        jq.run_daily(job_enquete_semanal, time=datetime.strptime(f"{poll_h:02d}:00","%H:%M").time(), days=(weekday,))  # padrão sexta 18h BRT
 
     # Handler de erro global: evita que um Conflict (comum durante rolling
     # deploy do Koyeb — duas instâncias tentando getUpdates por alguns
@@ -1949,8 +2218,8 @@ def main():
         logging.error(f"Erro não tratado: {err}")
     app.add_error_handler(_on_error)
 
-    logging.info(f"✅ Bot v8.0 SaaS Online — {SITE_URL}")
-    app.run_polling(drop_pending_updates=True)
+    logging.info(f"✅ Bot v8.1 SaaS Online — {SITE_URL}")
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     while True:
